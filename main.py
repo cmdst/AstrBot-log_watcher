@@ -447,6 +447,10 @@ class LogWatcherPlugin(Star):
             verdict = await self._classify(block, metrics)
             if not verdict.fingerprint:
                 verdict.fingerprint = fallback_fp
+            if verdict.source == "degraded":
+                # 判定层降级必须留痕：engine 用的是 stdlib logger，不在 AstrBot 日志管道里，
+                # 不在这里补一条就没有任何文件级痕迹（B14）。
+                logger.warning(f"{self._plat()}判定降级：{verdict.reason}")
             decision = self.gate.decide(
                 detect.AlertItem(
                     fingerprint=verdict.fingerprint,

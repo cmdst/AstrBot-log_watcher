@@ -322,6 +322,22 @@ def test_real_noise_family_needs_zero_llm_calls() -> None:
     assert stats["llm_calls"] == 0
 
 
+def test_agent_tool_path_miss_needs_zero_llm_calls() -> None:
+    """agent 工具 ENOENT 属调用方自伤：噪声短路后一次 LLM 都不该调。
+
+    修复前这一族走 LLM 判定（21:00 那次还撞上判定超时降级），按降级地板被抬成 MEDIUM 并推送。
+    """
+    context = FakeContext(text=_llm_text("CRITICAL"))
+    engine = ThreatEngine(context, cfg=dict(BASE_CFG))
+    verdict = asyncio.run(engine.classify(samples.agent_tool_path_miss_block()))
+
+    assert context.call_count == 0, "agent 自伤型噪声不应消耗 LLM 调用"
+    assert verdict.severity is Severity.LOW
+    assert verdict.route is Route.DIGEST
+    assert "noise-shortcut" in verdict.tags
+    assert engine.stats()["noise_shortcut"] == 1
+
+
 def test_noise_shortcut_can_be_disabled_for_llm_review() -> None:
     context = FakeContext(text=_llm_text("LOW"))
     engine = ThreatEngine(context, cfg={**BASE_CFG, "noise_shortcut": False})

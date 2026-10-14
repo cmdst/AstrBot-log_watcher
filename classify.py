@@ -241,6 +241,15 @@ NOISE_RULES: tuple[Rule, ...] = (
         r"failed to send \d+ message segment|发送日志提醒[^\n]{0,120}失败",
         0.85,
     ),
+    _rule(
+        "noise",
+        "agent-tool-path-miss",
+        Severity.LOW,
+        "agent 工具按猜出的路径访问不存在的位置（ENOENT），属调用方自伤："
+        "错误已回灌模型，可自行改路径重试，服务侧无副作用",
+        r"\[computer_tools\.[a-z_]+:\d+\]:[^\n]{0,200}?No such file or directory",
+        0.8,
+    ),
 )
 
 #: 可恢复抖动：没有噪声规则命中时按 MEDIUM 处理（提醒一次，不触发修复）。

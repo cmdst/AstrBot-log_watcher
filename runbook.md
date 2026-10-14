@@ -759,6 +759,21 @@ kill 并 `await` 回收子进程、补账（`ledger.finish(..., receipt_sent=rec
   已写下的取证不得改动）。要统一风格请单开一个纯格式提交，别和功能改动混在一起。
 - `python -m compileall -q *.py tests/*.py`：exit 0。
 - 生产代码真包导入：`sys.path` 加 `data/plugins` 后 9 个模块全部可导入（`star_manager.py` 同形路径）。
+
+### 10.6 本轮新增的两条已知边界（2026-10-14 巡检触发）
+
+- **摘录留存与 `alerts.excerpt_path` 不一致**：16 条告警里 6 条的 `excerpt_path` 已不存在
+  （含 21:00 那条 `outbox/astrbot-log-20261014-210102.txt`），而告警文案写的是「完整摘录见日志目录」。
+  投递成功的那几条会被清理、失败的那几条留在 `failed/`，所以「事后按记录回查原文」不总能做到。
+  复盘请从 `data/logs/astrbot.log` 按指纹/时间重取，或调大 `keep_excerpt_files`（当前 50）与
+  `outbox_max_age_hours`。
+- **`engine.py` 的日志器不在 AstrBot 日志管道里（本轮只修了一半）**：`engine.py:67` 的
+  `logging.getLogger("log_watcher.engine")` 产生的 INFO/WARN，在 `astrbot.log` 与 journald 里都是
+  **0 条命中**（`[log_watcher.engine]`），`engine.py:741` 的「LLM 判定超时（>20s）」因此在 21:00
+  那次告警里查无痕迹。本轮只在 `main.py` 补了「判定降级」一条 WARN；engine 其余日志（噪声短路、
+  知识库命中、调用预算）仍然不可见。彻底修法是让 engine 也走 `astrbot.api.logger` —— 注意 loguru
+  用 `{}` 占位，而 engine 现在是 `%s` 风格，必须逐条改，不能只换 logger 对象。
+
 ## 11. 本轮干跑与 provenance
 
 ### 11.1 `data/plugin_data/log_watcher/` 里的东西是谁产生的（captain 指派必须查清）

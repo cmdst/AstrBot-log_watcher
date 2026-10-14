@@ -134,6 +134,24 @@ def send_failed_block(*, stamp: str = "2026-10-13 07:59:11.780") -> LogBlock:
     )
 
 
+def agent_tool_path_miss_block(*, stamp: str = "2026-10-14 21:00:09.759") -> LogBlock:
+    """agent 把工作区文件猜成绝对路径导致的 ENOENT（真实样例：astrbot.log 27153 行原文，
+    个人账本文件名替换为中性名 ``example_ledger.md``）。
+
+    语义属调用方自伤：Core 只把错误回灌模型，模型可自行改路径重试，服务侧无副作用；
+    文件真实位置在会话工作区 ``data/workspaces/<umo>/``，而不是它猜的 ``data/`` 根下。
+    同一形态在 40 小时内出现 2 次（astrbot.log 10393 / 27153），修复前被判 MEDIUM 并推送。
+    """
+    return make_block(
+        [
+            f"[{stamp}] [Core] [INFO] [runners.tool_loop_agent_runner:1183]: 使用工具："
+            "astrbot_file_read_tool，参数：{'limit': 50, 'path': '/root/AstrBot/data/example_ledger.md'}",
+            f"[{stamp}] [Core] [ERRO] [v4.28.2] [computer_tools.fs:399]: Error reading file: "
+            "[Errno 2] No such file or directory: '/root/AstrBot/data/example_ledger.md'",
+        ]
+    )
+
+
 # ---------------------------------------------------------------- 真故障
 
 
@@ -196,6 +214,7 @@ BENIGN_NOISE_SAMPLES: dict[str, object] = {
     "asyncio_future": asyncio_future_block,
     "mcp_init_failed": mcp_init_block,
     "platform_send_failed": send_failed_block,
+    "agent_tool_path_miss": agent_tool_path_miss_block,
 }
 
 #: 真故障：判定后不得被 IGNORE 放行
@@ -320,7 +339,7 @@ def test_fingerprint_stable_across_time_session_and_line_number() -> None:
     first = make_block(
         [
             "[2026-10-13 09:15:44.512] [Core] [ERRO] [v4.28.2] [core.pipeline.scheduler:88]: 写入状态失败: "
-            "sqlite3.OperationalError: database is locked (session=<group_id>)"
+            "sqlite3.OperationalError: database is locked (session=9000000000)"
         ]
     )
     second = make_block(
@@ -369,6 +388,17 @@ def test_benign_noise_never_reaches_repair_levels(name: str) -> None:
     )
     assert verdict.route not in REPAIR_ROUTES
     assert verdict.tags[0].startswith("noise:")
+
+
+def test_agent_tool_path_miss_stays_quiet() -> None:
+    """agent 自伤的 ENOENT 必须停在 LOW+DIGEST：不推送、零 LLM、不进修复候选。"""
+    block = agent_tool_path_miss_block()
+    verdict = classify_block(block)
+
+    assert verdict.severity is Severity.LOW
+    assert verdict.route is Route.DIGEST
+    assert "noise:agent-tool-path-miss" in verdict.tags
+    assert classify.is_benign_noise(block) is True
 
 
 @pytest.mark.parametrize("name", sorted(TRUE_FAILURE_SAMPLES))

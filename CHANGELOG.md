@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+### 新增
+
+- **本地噪声规则 `agent-tool-path-miss`**（`classify.py`）：`computer_tools.*` 的
+  `No such file or directory`（agent 把工作区文件猜成绝对路径导致的 ENOENT）归入良性噪声族 ——
+  判定 `LOW` / 路由 `digest` / **整族零 LLM 调用**（`noise_shortcut`），不再按降级地板被抬成
+  `MEDIUM` 并即时推送。取证：同一形态在 `astrbot.log` 10393 行（10-13 09:00）与 27153 行
+  （10-14 21:00）各出现一次，两条修复前都是 `MEDIUM` + `notify`（即投进微信）
+- 回归测试两处：`tests/test_classify.py::test_agent_tool_path_miss_stays_quiet`（LOW+DIGEST+噪声闸）、
+  `tests/test_engine.py::test_agent_tool_path_miss_needs_zero_llm_calls`（`call_count == 0`），
+  样例已进 `BENIGN_NOISE_SAMPLES` 参与既有参数化门禁
+
+### 修复
+
+- **判定降级现在有文件级留痕**（`main.py`）：`verdict.source == "degraded"` 时补一条
+  `判定降级：<reason>` 的 WARN。此前 `engine.py` 用的是 stdlib logger
+  （`logging.getLogger("log_watcher.engine")`，见 `engine.py:67`），整层日志既不在 `astrbot.log`
+  也不在 journald（两边 `[log_watcher.engine]` 命中 0 条），于是 21:00 那次「LLM 判定超时（>20s）」
+  对应的 `engine.py:741` WARN 哪儿都搜不到，只剩告警正文那句「调用超过 20s 未返回」
+- **脱敏把一条指纹用例改成了必然失败**（`tests/test_classify.py`）：脱敏把 10 位群号替换成
+  `<group_id>`，而指纹归一化只抹纯数字（`<NUM>`）—— 同一故障的两种写法因此得出两个指纹
+  （`93a38500941f4924` vs `f7319243b2b71a68`，用 `normalize_for_fingerprint` 实测）。按
+  `SANITIZE.md` 规定的替换（10 位数字 → `9000000000`）改回纯数字后用例恢复通过。同类写法在
+  `tests/classify_cases.json:163` 仍存在（不影响门禁与本用例，**未改动**，已登记在案）
+
+### 测试
+
+`PATH=/root/AstrBot/.venv/bin:$PATH python -m pytest tests -q` → **298 passed / 0 failed**
+（在目录名为 `log_watcher` 的位置运行；HEAD 基线 `a4eeef4` 为 294 passed / 1 failed，丢的那条正是
+上面的脱敏用例）。注：`tests/test_engine.py::test_modules_import_without_astrbot[package]` 依赖
+所在目录名必须是 `log_watcher`（它 `import log_watcher.classify`），所以从
+`/root/AstrBot-log_watcher` 直接跑会多一条**环境性**失败，不是代码问题。
+运行副本（`data/plugins/log_watcher`，自带未脱敏测试集）**295 passed / 0 failed**：同步
+`classify.py` / `main.py` 之后仍然全绿。
+
 ## 2.0.0 — 2026-10-14
 
 v1 的定位是「按等级转发日志摘录」，v2 重建为**采集 → 分级 → 路由 → 投递 → 修复 → 回执**的闭环。
