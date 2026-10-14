@@ -1,0 +1,2 @@
+# 运行时仅依赖 AstrBot 运行时与 Python 标准库（不引入第三方依赖）。
+# 测试需要 pytest（开发依赖，不进运行环境）：python -m pytest tests -q

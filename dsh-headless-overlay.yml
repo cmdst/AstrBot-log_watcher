@@ -1,0 +1,53 @@
+# log_watcher 紧急修复通道自带的 dsh 路由 overlay —— 不改动任何 profile
+#
+# 为什么需要它（实测根因，证据见 .agent-teams/logwatch-ops/findings-dsh.md）：
+#   `dsh --profile headless` 在本机开箱不可用 → exit=1 / MISSING_CREDENTIAL，
+#   因为 headless profile 的 cordis.patch.yml 是空的 `[]`，既没有 agent-default-model
+#   也没有 llm-pi-ai.providers 配置，默认路由去找不存在的 DEEPSEEK_API_KEY。
+#
+# 本文件是「插件自带路由」的实现：调用 dsh 时用 `--patch <本文件>` 叠在 profile 之上，
+# 指向本机已配置且凭据齐备的 codecommand 通道（密钥经 apiKeyEnv 引用，不落盘明文）。
+# 好处：headless profile 保持原样、随时可停用、可审计、可回滚；删掉本文件即完全失效。
+#
+# 维护者注意：
+#   - 这里只应出现「路由」相关条目，不要塞业务配置。
+#   - apiKeyEnv 指向环境变量名；真实密钥由 ~/.dsh/.credentials.yaml 提供，禁止写入本文件。
+#   - 修改本文件后无需重启 AstrBot（每次修复调用都会重新读取）。
+
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: codecommand
+    model: deepseek/deepseek-v4.1-flash
+    reasoningEffort: max
+
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      codecommand:
+        apiKeyEnv: CODECOMMAND_API_KEY
+        api: openai-completions
+        baseURL: https://api.commandcode.ai/provider/v1
+        retryPolicy:
+          mode: normal
+          maxRetries: 5
+          retryableCodes:
+            - RATE_LIMIT
+            - SERVER
+            - TIMEOUT
+            - TRANSPORT
+            - EMPTY_RESPONSE
+            - INVALID_REQUEST
+        models:
+          - id: deepseek/deepseek-v4.1-flash
+            name: DeepSeek V4.1 Flash
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: null
+              low: low
+              high: high
+              max: max

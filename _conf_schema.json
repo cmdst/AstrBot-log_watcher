@@ -1,0 +1,656 @@
+{
+  "log_with_bot_id": {
+    "description": "日志区分机器人实例",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后插件日志会带 [platform:平台ID]，多 Bot 环境便于定位；平台 ID 取自提醒会话的 unified_msg_origin 前缀。误配后果：多 Bot 时日志分不清是哪个实例。日志详细程度请在 WebUI 插件详情页调整。"
+  },
+  "_主动提醒_section": {
+    "description": "=== 主动提醒 ===",
+    "type": "text",
+    "invisible": true
+  },
+  "target_sessions": {
+    "description": "主动提醒会话",
+    "type": "list",
+    "default": [],
+    "hint": "命中日志时把提醒主动发到这些会话。填 unified_msg_origin：群 BOT1:group:10001、私聊 BOT1:private:10002；可填多个。误配后果：留空 = 只扫描不发送（含修复回执也发不出）。"
+  },
+  "send_mode": {
+    "description": "提醒形态",
+    "type": "string",
+    "default": "auto",
+    "options": [
+      "auto",
+      "text",
+      "forward"
+    ],
+    "labels": [
+      "按通道自动（推荐）",
+      "纯文本分片",
+      "合并转发（支持时）"
+    ],
+    "hint": "auto = 按通道能力选（默认）；text = 只发纯文本分片；forward = 优先合并转发（通道不支持时自动退回文本）。注意：旧配置里的 file/txt 会被映射成 text —— weixin_oc 通道只有 Plain 文本能送达，File 会被服务端 prepare 失败、Node/Nodes 会被静默丢弃。误配后果：在 weixin_oc 上强指 forward 只会退化为文本（有 degradation 日志）。"
+  },
+  "prefer_forward": {
+    "description": "优先合并转发",
+    "type": "bool",
+    "default": false,
+    "hint": "通道同时支持文本与转发时优先用合并转发。误配后果：在 weixin_oc 上无效果（自动降级为文本）。"
+  },
+  "notify_min_severity": {
+    "description": "即时告警最低等级",
+    "type": "string",
+    "default": "MEDIUM",
+    "options": [
+      "IGNORE",
+      "LOW",
+      "MEDIUM",
+      "HIGH",
+      "CRITICAL"
+    ],
+    "labels": [
+      "IGNORE",
+      "LOW",
+      "MEDIUM",
+      "HIGH",
+      "CRITICAL"
+    ],
+    "hint": "即时告警的最低等级（五级）。低于它的判定只进摘要或静默。误配后果：设 LOW 噪声直灌聊天；设 CRITICAL 会漏掉真实故障。"
+  },
+  "include_excerpt": {
+    "description": "告警附带摘录",
+    "type": "bool",
+    "default": true,
+    "hint": "告警里是否附日志摘录正文。误配后果：关掉后只有告警头，现场无法定位。"
+  },
+  "max_excerpt_chars": {
+    "description": "单条摘录字符上限",
+    "type": "int",
+    "default": 6000,
+    "hint": "单条摘录字符上限（200-20000，代码夹紧）。误配后果：过大→分片变多；过小→堆栈被截。"
+  },
+  "max_chars_per_message": {
+    "description": "单条消息字符上限",
+    "type": "int",
+    "default": 0,
+    "hint": "覆盖通道分片长度；0 = 按通道能力表（推荐）。上限 8000（硬顶）。误配后果：超过 8000 无意义，填太小会把一条摘录切成很多片。"
+  },
+  "_日志扫描_section": {
+    "description": "=== 日志扫描 ===",
+    "type": "text",
+    "invisible": true
+  },
+  "log_dir": {
+    "description": "日志目录",
+    "type": "string",
+    "default": "",
+    "hint": "留空 = 用 AstrBot 自己的日志目录（跟随 log_file_path，默认 <data>/logs），一般不用改。误配后果：填错目录扫不到文件（每 10 分钟一条 warning）。"
+  },
+  "file_pattern": {
+    "description": "日志文件名匹配",
+    "type": "string",
+    "default": "*.log",
+    "hint": "目录里扫哪些文件，glob 写法。默认只读当前日志文件；填 astrbot.log* 会把轮转出来的历史文件也扫一遍。误配后果：通配过宽会重复提醒，且绝对路径/.. 会被拒绝（只允许目录内相对模式）。"
+  },
+  "levels": {
+    "description": "提醒的日志等级",
+    "type": "list",
+    "default": [
+      "ERROR",
+      "CRITICAL"
+    ],
+    "hint": "只提醒列表里的等级，可填 DEBUG/INFO/WARNING/ERROR/CRITICAL（也认短名 DBUG/WARN/ERRO/CRIT，内部统一规整为规范长名）。误配后果：加 WARNING 会引入每天上千条噪声洪流；全局 log_level 更高时该等级根本不写进文件，这里填了也收不到。"
+  },
+  "exclude_keywords": {
+    "description": "忽略关键字",
+    "type": "list",
+    "default": [],
+    "hint": "行里包含任一关键字就不算命中（仍会作为前后文出现在摘录里）。本插件自己的日志固定被忽略，避免自触发循环。误配后果：关键字写太宽会漏掉真故障。"
+  },
+  "poll_interval_seconds": {
+    "description": "扫描间隔（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "扫描间隔秒（5-86400）。也是「文件末尾的报错等不到后文」的最长等待时间。误配后果：过大→告警延迟；过小→空转与文件句柄压力。"
+  },
+  "start_from_end": {
+    "description": "只提醒启动后的新日志",
+    "type": "bool",
+    "default": true,
+    "hint": "开启（默认）= 跳过文件已有内容，不重放历史；关闭 = 从文件开头读。误配后果：关闭且文件很大时首轮会一次推送一大批。"
+  },
+  "context_before": {
+    "description": "附带前文行数",
+    "type": "int",
+    "default": 5,
+    "hint": "0-200。命中行前面带几行日志。误配后果：过大→摘录超长被截；过小→看不出前因。"
+  },
+  "context_after": {
+    "description": "附带后文行数",
+    "type": "int",
+    "default": 5,
+    "hint": "0-200。命中行后面带几行日志（堆栈就靠它带出来）；前后文连成一片的多条命中会合并成一段，不会重复前文。同样也是发出的延迟（见 poll_interval_seconds）。"
+  },
+  "max_lines_per_poll": {
+    "description": "每轮最多展开行数",
+    "type": "int",
+    "default": 200,
+    "hint": "20-5000。一轮最多展开多少行（含前后文），超出的只在汇总里计数。误配后果：过小→日志风暴时内容被丢。"
+  },
+  "_AI 威胁分级_section": {
+    "description": "=== AI 威胁分级 ===",
+    "type": "text",
+    "invisible": true
+  },
+  "classify_enable": {
+    "description": "启用 AI 威胁分级",
+    "type": "bool",
+    "default": true,
+    "hint": "分级总开关。关闭后按日志等级直接触发（噪声 8.9:1 会直灌聊天）。误配后果：关掉 = 退回旧行为。"
+  },
+  "classify_mode": {
+    "description": "分级模式",
+    "type": "string",
+    "default": "auto",
+    "options": [
+      "auto",
+      "local",
+      "llm"
+    ],
+    "labels": [
+      "自动（推荐）",
+      "只用本地规则",
+      "优先 LLM"
+    ],
+    "hint": "auto = 配了 provider 走 LLM、否则本地规则；local = 永不调 LLM（最省、可离线）；llm = LLM 优先、失败降级。误配后果：设 llm 但没配 provider → 每条都降级（source=degraded，等级 ≥ fallback_severity）。"
+  },
+  "classify_provider_id": {
+    "description": "分级用 Provider",
+    "type": "string",
+    "default": "",
+    "hint": "AstrBot 的 provider id，供 llm_generate 使用。误配后果：留空 = 永不调 LLM（auto 下等同 local）。"
+  },
+  "classify_timeout_seconds": {
+    "description": "单次分级超时（秒）",
+    "type": "int",
+    "default": 20,
+    "hint": "5-300，单次 LLM 判定超时。误配后果：过大→一轮被单个 provider 卡住；过小→频繁降级。"
+  },
+  "classify_system_prompt": {
+    "description": "分级系统提示词（覆盖）",
+    "type": "text",
+    "default": "",
+    "hint": "覆盖内置提示词（留空用 prompts/classify_system.md）。误配后果：写坏 JSON 约定会让全部判定降级为 LLMOutputError。"
+  },
+  "fallback_severity": {
+    "description": "降级最低等级",
+    "type": "string",
+    "default": "MEDIUM",
+    "options": [
+      "IGNORE",
+      "LOW",
+      "MEDIUM",
+      "HIGH",
+      "CRITICAL"
+    ],
+    "labels": [
+      "IGNORE",
+      "LOW",
+      "MEDIUM",
+      "HIGH",
+      "CRITICAL"
+    ],
+    "hint": "降级地板（五级）：LLM 不可用/超时/输出非法时取 max(本地判定, 该值)。误配后果：设 IGNORE 会被强制抬回 MEDIUM（不放行）；设 HIGH = provider 一抖就告警。"
+  },
+  "llm_max_block_lines": {
+    "description": "送分级模型的最大行数",
+    "type": "int",
+    "default": 80,
+    "hint": "5-500，送 LLM 的最大行数。误配后果：过大→token 成本与提示注入面增大。"
+  },
+  "llm_max_calls_per_round": {
+    "description": "单轮 LLM 调用上限",
+    "type": "int",
+    "default": 5,
+    "hint": "0-1000，单轮 LLM 调用上限（0 = 不限，不推荐）。误配后果：不限时一轮日志风暴会连续付费。"
+  },
+  "llm_max_calls_per_hour": {
+    "description": "每小时 LLM 调用上限",
+    "type": "int",
+    "default": 60,
+    "hint": "0-100000，每小时 LLM 调用上限（0 = 不限）。误配后果：不限时噪声会持续消耗额度。"
+  },
+  "noise_shortcut": {
+    "description": "已知噪声短路",
+    "type": "bool",
+    "default": true,
+    "hint": "已知噪声短路（asyncio 回调异常等直接判 IGNORE，不付 token）。误配后果：关掉后 88.9% 的噪声也要过一遍 LLM。"
+  },
+  "kb_enabled": {
+    "description": "启用指纹知识库",
+    "type": "bool",
+    "default": true,
+    "hint": "指纹知识库：同一指纹复用上次判定。误配后果：关掉后每条都重新判定（成本与噪声上升）。"
+  },
+  "kb_max_entries": {
+    "description": "知识库条数上限",
+    "type": "int",
+    "default": 500,
+    "hint": "50-100000，知识库条数上限（超出由 prune 清理）。误配后果：过小=反复失忆；过大=库膨胀。"
+  },
+  "new_pattern_escalate": {
+    "description": "新指纹升一级",
+    "type": "bool",
+    "default": false,
+    "hint": "新指纹升一级（见 architecture §4.3）。误配后果：开启后噪声也会升一级，不建议开。"
+  },
+  "route_map": {
+    "description": "路由覆写",
+    "type": "dict",
+    "default": {},
+    "hint": "等级→路由覆写，如 {\"MEDIUM\": \"digest\"}。非法值会被忽略并 warning；CRITICAL→store 被强制拒绝。误配后果：把 CRITICAL 改成静默类路由会被拒绝并回落到 emergency。"
+  },
+  "llm_provider_id": {
+    "description": "兼容：分级 Provider（旧键）",
+    "type": "string",
+    "default": "",
+    "invisible": true,
+    "hint": "兼容键：为空时用 classify_provider_id；非空时优先级更高（旧配置迁移用）。误配后果：两个都填且不一致时以本键为准。"
+  },
+  "chat_provider_id": {
+    "description": "兼容：分级 Provider（SDK 术语）",
+    "type": "string",
+    "default": "",
+    "invisible": true,
+    "hint": "兼容键：同 llm_provider_id，仅在前两者都为空时生效。一般不用改。"
+  },
+  "llm_timeout": {
+    "description": "兼容：分级超时（旧键）",
+    "type": "int",
+    "default": 20,
+    "invisible": true,
+    "hint": "兼容键：等同 classify_timeout_seconds（engine 内部别名，最低优先级）。一般不用改。"
+  },
+  "provider_id": {
+    "description": "兼容：分级 Provider（内部短名）",
+    "type": "string",
+    "default": "",
+    "invisible": true,
+    "hint": "兼容键：内部短名，最低优先级。一般不用改。"
+  },
+  "_通知预算 / 聚合 / 静默_section": {
+    "description": "=== 通知预算 / 聚合 / 静默 ===",
+    "type": "text",
+    "invisible": true
+  },
+  "dedupe_window_seconds": {
+    "description": "同指纹冷却窗口（秒）",
+    "type": "int",
+    "default": 900,
+    "hint": "0-604800，同指纹冷却窗口：窗口内重复命中不再单独告警。误配后果：0 = 同一故障每次都刷；过大 = 新故障被压。"
+  },
+  "digest_interval_seconds": {
+    "description": "摘要聚合间隔（秒）",
+    "type": "int",
+    "default": 1800,
+    "hint": "60-86400，LOW 级摘要聚合间隔。误配后果：过大=摘要很晚才到；过小=摘要刷屏。"
+  },
+  "digest_max_items": {
+    "description": "摘要桶条目上限",
+    "type": "int",
+    "default": 50,
+    "hint": "1-500，单个摘要桶最多条目数。误配后果：过大→单条摘要超长被分片。"
+  },
+  "max_alerts_per_round": {
+    "description": "单轮告警上限",
+    "type": "int",
+    "default": 5,
+    "hint": "0-100，单轮发送上限。误配后果：0 = 整轮全压制（含紧急告警）。"
+  },
+  "max_alerts_per_minute": {
+    "description": "每分钟告警上限",
+    "type": "int",
+    "default": 12,
+    "hint": "0-600，分钟预算。误配后果：0 = 每分钟不发送任何告警。"
+  },
+  "max_alerts_per_hour": {
+    "description": "每小时告警上限",
+    "type": "int",
+    "default": 80,
+    "hint": "0-5000，小时预算。误配后果：0 = 一小时不发送任何告警。"
+  },
+  "max_alerts_per_day": {
+    "description": "每日告警上限",
+    "type": "int",
+    "default": 300,
+    "hint": "0-50000，日预算（跨重启持久化）。误配后果：0 = 当天全压制（含紧急）。"
+  },
+  "burst_window_seconds": {
+    "description": "突发合并窗口（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "1-3600，突发窗口长度。误配后果：过小=合并不起来；过大=无关故障被并进一条。"
+  },
+  "burst_threshold": {
+    "description": "突发合并阈值",
+    "type": "int",
+    "default": 8,
+    "hint": "1-500，窗口内达到多少条告警就合并成一条突发消息。误配后果：设 1 = 永远合并。"
+  },
+  "burst_min_severity": {
+    "description": "突发合并最低等级",
+    "type": "string",
+    "default": "MEDIUM",
+    "options": [
+      "IGNORE",
+      "LOW",
+      "MEDIUM",
+      "HIGH",
+      "CRITICAL"
+    ],
+    "labels": [
+      "IGNORE",
+      "LOW",
+      "MEDIUM",
+      "HIGH",
+      "CRITICAL"
+    ],
+    "hint": "参与突发合并的最低等级（五级）。误配后果：设 LOW 会把摘要也卷进合并。"
+  },
+  "silence_ranges": {
+    "description": "静默时段",
+    "type": "list",
+    "default": [],
+    "hint": "静默时段（本机时区，支持跨夜），如 [\"23:00-07:00\"]。格式错会被忽略并 warning。误配后果：静默期间低于 silence_min_severity 的告警只入库不发送。"
+  },
+  "silence_min_severity": {
+    "description": "穿透静默的最低等级",
+    "type": "string",
+    "default": "HIGH",
+    "options": [
+      "IGNORE",
+      "LOW",
+      "MEDIUM",
+      "HIGH",
+      "CRITICAL"
+    ],
+    "labels": [
+      "IGNORE",
+      "LOW",
+      "MEDIUM",
+      "HIGH",
+      "CRITICAL"
+    ],
+    "hint": "≥ 此等级的告警可穿透静默时段（五级）。误配后果：设 IGNORE 会让静默彻底失效。"
+  },
+  "channel_overrides": {
+    "description": "通道能力覆盖",
+    "type": "dict",
+    "default": {},
+    "hint": "按通道覆盖能力，如 {\"weixin_oc\": {\"max_chars\": 1000}}。误配后果：覆盖成\"能发附件\"会导致整条消息（含文本）失败。"
+  },
+  "_投递重试_section": {
+    "description": "=== 投递重试 ===",
+    "type": "text",
+    "invisible": true
+  },
+  "delivery_max_attempts": {
+    "description": "最大重试次数",
+    "type": "int",
+    "default": 4,
+    "hint": "1-20，单条消息最多重试次数（失败进重试队列，绝不静默丢）。误配后果：过小=抖动即放弃。"
+  },
+  "delivery_base_delay_seconds": {
+    "description": "重试退避基数（秒）",
+    "type": "int",
+    "default": 5,
+    "hint": "1-600，重试退避基数（指数退避起点，秒）。误配后果：过大=延迟送达；过小=撞平台限流。"
+  },
+  "delivery_retry_batch": {
+    "description": "每轮重试条数",
+    "type": "int",
+    "default": 5,
+    "hint": "1-50，每轮最多重发多少条待重试消息。误配后果：过大=积压时一轮刷屏。"
+  },
+  "_状态 / 磁盘_section": {
+    "description": "=== 状态 / 磁盘 ===",
+    "type": "text",
+    "invisible": true
+  },
+  "state_db_path": {
+    "description": "状态库路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空 = <plugin_data>/log_watcher.sqlite3（推荐）。误配后果：指到不可写目录 = 启动即降级为只读内存态（有 error 日志，且修复被强制关闭）。"
+  },
+  "fingerprint_ttl_hours": {
+    "description": "指纹保留时长（小时）",
+    "type": "int",
+    "default": 72,
+    "hint": "1-720，指纹计数与知识库条目保留时长。误配后果：过小=反复失忆；过大=库膨胀。"
+  },
+  "history_retention_days": {
+    "description": "历史保留天数",
+    "type": "int",
+    "default": 30,
+    "hint": "1-3650，alerts / remediation_runs 保留天数。误配后果：过大→库膨胀；过小→审计断档。"
+  },
+  "history_max_rows": {
+    "description": "历史行数上限",
+    "type": "int",
+    "default": 20000,
+    "hint": "1000-1000000，alerts 行数硬上限（超出按最旧删除）。误配后果：同上。"
+  },
+  "outbox_max_bytes": {
+    "description": "摘录目录字节上限",
+    "type": "int",
+    "default": 33554432,
+    "hint": "1 MiB-1 GiB，摘录目录硬字节上限（与 keep_excerpt_files 同时生效，取更严）。误配后果：过大→磁盘被吃；过小→刚写的摘录被删（会记 released）。"
+  },
+  "excerpt_mode": {
+    "description": "摘录留存策略",
+    "type": "string",
+    "default": "ledger_only",
+    "options": [
+      "off",
+      "ledger_only",
+      "file"
+    ],
+    "labels": [
+      "不留存",
+      "单文件台账（推荐）",
+      "每轮一个文件（旧行为）"
+    ],
+    "hint": "ledger_only = 摘录进 alerts.excerpt_path 指向的单文件（推荐）；file = 每轮一个文件（旧行为）；off = 不留摘录。误配后果：file 会在失败轮次堆积（实测 59 个孤儿）。"
+  },
+  "keep_excerpt_files": {
+    "description": "摘录文件数上限",
+    "type": "int",
+    "default": 50,
+    "hint": "1-1000，摘录目录保留文件数。误配后果：语义已修正为硬上限，过大等于放宽磁盘上限。"
+  },
+  "outbox_max_age_hours": {
+    "description": "摘录最长留存（小时）",
+    "type": "int",
+    "default": 24,
+    "hint": "1-720，摘录最长留存小时。误配后果：过小→刚写的摘录被清（发送中文件仍受保护）。"
+  },
+  "disk_report_interval_hours": {
+    "description": "磁盘报告间隔（小时）",
+    "type": "int",
+    "default": 24,
+    "hint": "1-168，磁盘占用报告的间隔（日志一行 usage）。误配后果：过小=日志噪声。"
+  },
+  "_紧急修复（dsh headless，默认关）_section": {
+    "description": "=== 紧急修复（dsh headless，默认关） ===",
+    "type": "text",
+    "invisible": true
+  },
+  "remediation_enable": {
+    "description": "启用紧急修复",
+    "type": "bool",
+    "default": false,
+    "hint": "修复总开关，默认关。开启前必须先把 headless 凭据/路由配好（插件自带 dsh-headless-overlay.yml 已默认叠加），否则每次都是 unavailable（只发回执，不修）。"
+  },
+  "remediation_dsh_command": {
+    "description": "dsh 命令",
+    "type": "string",
+    "default": "dsh",
+    "hint": "dsh 可执行文件/绝对路径。误配后果：填错 = unavailable（回执会提示按运行手册配置）。"
+  },
+  "remediation_profile": {
+    "description": "dsh profile",
+    "type": "string",
+    "default": "headless",
+    "hint": "传给 dsh 的 --profile 值。误配后果：填错 = 子进程 exit=1 并带异常栈（回执正文可见）。"
+  },
+  "remediation_patch_overlay": {
+    "description": "dsh overlay（手动覆盖）",
+    "type": "string",
+    "default": "",
+    "hint": "留空 = 用插件自带的 dsh-headless-overlay.yml（与插件同目录，绝对路径解析，不依赖 cwd，以 --patch 叠加，不改任何 profile）。删除该文件即完全失效（可回滚）。填路径 = 手动覆盖。误配后果：指向坏 yaml → 子进程启动即失败（回执会写明）。"
+  },
+  "remediation_workdir": {
+    "description": "修复工作区",
+    "type": "string",
+    "default": "/root/AstrBot",
+    "hint": "子进程 cwd = 工作区根。误配后果：填错 = agent 只能在别的工作区里改文件（当前工作区内写成功、区外写被拦）。"
+  },
+  "remediation_timeout_seconds": {
+    "description": "修复超时（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "30-3600，看门狗超时（超时会 kill 整个进程组并回收）。误配后果：过大=卡住的 run 占并发闸；过小=正常修复被砍。"
+  },
+  "remediation_max_concurrency": {
+    "description": "修复并发数",
+    "type": "int",
+    "default": 1,
+    "hint": "1-4，并发闸；建议恒为 1。误配后果：>1 时 token 与 session 痕迹成倍。"
+  },
+  "remediation_cooldown_seconds": {
+    "description": "同指纹冷却（秒）",
+    "type": "int",
+    "default": 3600,
+    "hint": "0-86400，同指纹冷却，冷却期内不重复修复（会发 blocked 回执）。误配后果：过小=同一故障反复修。"
+  },
+  "remediation_daily_limit": {
+    "description": "每日修复上限",
+    "type": "int",
+    "default": 5,
+    "hint": "0-100，每日修复次数上限（跨重启持久）。误配后果：0 = 关闭修复（更细的闸）。"
+  },
+  "remediation_permission_mode": {
+    "description": "修复权限级别",
+    "type": "string",
+    "default": "workspace-write",
+    "options": [
+      "read-only",
+      "workspace-write"
+    ],
+    "labels": [
+      "只读（不改文件）",
+      "工作区可写（推荐）"
+    ],
+    "hint": "子进程权限级别，只允许 read-only / workspace-write（只改当前工作区）。danger-full-access 会被强制回落并 warning，本插件不提供该选项；子进程也不会携带任何sandbox_permissions 提权键（无头场景无人审批）。误配后果：写危险值不会生效。"
+  },
+  "remediation_env_refs": {
+    "description": "透传环境变量名",
+    "type": "list",
+    "default": [],
+    "hint": "额外传给子进程的环境变量名（值取自父进程 env）。误配后果：把含密钥的变量名加进来 = 子 agent 可读该密钥（且可能落在轨迹里）；推荐用 profile 侧凭据，保持为空。"
+  },
+  "remediation_inherit_env": {
+    "description": "继承全部环境变量",
+    "type": "bool",
+    "default": false,
+    "hint": "是否把父进程 os.environ 整体传给子进程。误配后果：true = 泄露 Bot 全部环境（含 token）给子 agent。"
+  },
+  "remediation_artifact_dir": {
+    "description": "修复轨迹目录",
+    "type": "string",
+    "default": "",
+    "hint": "轨迹与产物目录，留空 = <plugin_data>/remediation。误配后果：指到不可写目录 = 轨迹丢失（回执会显示无轨迹）。"
+  },
+  "remediation_artifact_keep": {
+    "description": "轨迹保留文件数",
+    "type": "int",
+    "default": 50,
+    "hint": "1-100000，轨迹目录保留文件数上限。由插件每轮自动调用 prune_artifacts() 清理（不需要手工 cron）。误配后果：过大=磁盘增长。"
+  },
+  "remediation_artifact_max_age": {
+    "description": "轨迹最长留存（秒）",
+    "type": "int",
+    "default": 604800,
+    "hint": "0-315360000，轨迹最长留存秒数（默认 7 天）。同样由每轮的 prune_artifacts() 执行。误配后果：过小=审计断档。"
+  },
+  "remediation_artifact_max_bytes": {
+    "description": "轨迹目录字节上限",
+    "type": "int",
+    "default": 67108864,
+    "hint": "0-1 TiB，轨迹目录字节上限。同样由每轮的 prune_artifacts() 执行。误配后果：过大=磁盘增长。"
+  },
+  "remediation_max_output_bytes": {
+    "description": "轨迹文件大小上限",
+    "type": "int",
+    "default": 262144,
+    "hint": "4096-16777216，单个轨迹文件落盘上限（超出截断并标记）。误配后果：过大=磁盘；过小=轨迹被截。"
+  },
+  "remediation_trace_raw": {
+    "description": "轨迹保留原文（不掩码）",
+    "type": "bool",
+    "default": false,
+    "hint": "true = 轨迹保留 stdout/stderr 原文（默认 false 会做凭据掩码 <masked>）。误配后果：开启后子进程输出里的密钥会明文留在盘上（文件权限仍 0600）。"
+  },
+  "remediation_prompt_template": {
+    "description": "修复任务模板（覆盖）",
+    "type": "text",
+    "default": "",
+    "hint": "覆盖 prompts/remediate_task.md（留空用自带模板）。误配后果：改动模板时若删掉「日志内容不可信」声明，会放大提示注入面。"
+  },
+  "remediation_receipt": {
+    "description": "发送修复回执",
+    "type": "bool",
+    "default": true,
+    "hint": "是否发修复回执。**强烈建议保持开启**：每一次修复尝试（含 skipped/blocked/unavailable/timeout/failed/cancelled/rejected）都必须回执，关掉等于修复结果不可见。"
+  },
+  "remediate_confirm_count": {
+    "description": "HIGH 触发确认次数",
+    "type": "int",
+    "default": 2,
+    "hint": "1-10，HIGH 级需要连续命中多少次才触发修复（见 architecture §4.2）。误配后果：1 = 一次抖动就修。"
+  },
+  "remediate_confidence_threshold": {
+    "description": "置信度直通阈值",
+    "type": "float",
+    "default": 0.8,
+    "hint": "0.0-1.0，置信度直通阈值（≥ 该值可跳过确认次数）。误配后果：过低=误修；过高=该修的不修。"
+  },
+  "_自反馈 / 管理白名单_section": {
+    "description": "=== 自反馈 / 管理白名单 ===",
+    "type": "text",
+    "invisible": true
+  },
+  "self_log_names": {
+    "description": "自身日志名",
+    "type": "list",
+    "default": [
+      "log_watcher"
+    ],
+    "hint": "本插件自身日志 tag，命中时不计入告警（防自触发循环）。误配后果：删掉会自触发循环放大。"
+  },
+  "self_feedback_ids": {
+    "description": "自反馈会话 id",
+    "type": "list",
+    "default": [],
+    "hint": "本插件目标会话 id，用于屏蔽「适配器把自己的发送失败记成别人的 WARN」回声。误配后果：留空 + levels 含 WARNING = 自反馈放大（实测 118 条）。"
+  },
+  "admin_users": {
+    "description": "管理白名单（未实现）",
+    "type": "list",
+    "default": [],
+    "invisible": true,
+    "hint": "【本版本未实现】architecture §8.7 规划的 /lw status|ack|silence|remediate 管理命令与白名单尚未接线：当前版本不注册任何命令处理器（零事件入口），填了也不会生效。保留该键只为配置前向兼容，详见 README「未实现的功能」。误配后果：填任何 id 都不会扩大命令面，因为命令不存在。"
+  }
+}
