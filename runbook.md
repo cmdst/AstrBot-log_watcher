@@ -284,7 +284,7 @@ sleep 35; grep -a "\[log_watcher\]" /root/AstrBot/data/logs/astrbot.log | tail -
   （按 `__file__` 解析为绝对路径，**不依赖 cwd**；`remediate.resolve_overlay`，remediate.py:259）。
 - 调用形态（真实 argv，来自本轮干跑记录）：
   ```
-  dsh --profile headless --json --patch /root/AstrBot/data/plugins/log_watcher/dsh-headless-overlay.yml -- -
+  dsh --profile headless --patch /root/AstrBot/data/plugins/log_watcher/dsh-headless-overlay.yml --json -- -
   ```
   即 `--patch` **叠加**在 profile 之上，**不修改任何 profile 文件**（`~/.dsh/profiles/` 保持原样）。
 - 配置 `remediation_patch_overlay` 留空 = 用自带 overlay（回执里来源写 `bundled`）；填路径 = 手动覆盖；
@@ -313,7 +313,7 @@ sleep 35; grep -a "\[log_watcher\]" /root/AstrBot/data/logs/astrbot.log | tail -
 # a) 不带 overlay：应当失败（证明「必须带 overlay」不是猜测）
 dsh --profile headless --json -- - <<< "只回复 OK" ; echo "exit=$?"      # 期望 exit=1，报 MISSING_CREDENTIAL
 # b) 带 overlay：应当成功
-dsh --profile headless --json --patch /root/AstrBot/data/plugins/log_watcher/dsh-headless-overlay.yml -- - <<< "只回复 OK" ; echo "exit=$?"
+dsh --profile headless --patch /root/AstrBot/data/plugins/log_watcher/dsh-headless-overlay.yml --json -- - <<< "只回复 OK" ; echo "exit=$?"
 #    期望 exit=0（约 10s），stdout 是 JSONL 事件流
 ```
 

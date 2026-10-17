@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### 修复（2026-10-18）
+
+- **`build_argv` 的 launcher/app 选项顺序**（`remediate.py`）：改为
+  `dsh --profile <p> [--patch <ov>] --json -- -` —— `--patch` / `--dump-config` 这类是 **launcher 选项**，
+  `--json` 是 **app 选项**，launcher 段必须排在 app 段之前。原顺序（`--json` 在前）在现版 dsh
+  （`0.2.0-rc.2`）上被直接拒：`{"type":"error","message":"unknown option '--patch'"}`（exit 1）；
+  交换后通过解析并读到 overlay。**取证**：2026-10-17 由 fix lane 在一次性 `DSH_HOME` 沙箱测出，
+  dev 在同类沙箱独立复核（两条命令都真跑过，真实 profile 未改）。
+  **为什么现在才发现**：profile 的 `cordis.patch.yml` 破损在 argv 解析之前先炸，这条被挡在后面 ——
+  **两个独立缺陷叠加**（YAML 先、argv 后），修好 YAML 会立刻撞上这条。
+- `validate_argv` 新增顺序断言（`--patch` 若出现必须排在 `--json` 之前），并把它钉成回归用例
+  `tests/test_remediate.py::test_build_argv_puts_launcher_flags_before_app_flags`；
+  参数化拒绝用例里补了一条「路径干净但顺序反了」的样本。
+- `runbook.md` §5.1 / §5.3 两处 smoke 命令同步改正（照抄旧写法会拿到 `unknown option '--patch'`）。
+  `CONTRACT_ARGV`（**无 overlay** 的形态 `[… --json -- -]`）**不变**，它本来就对。
+
 ### 变更（策略 · 2026-10-17）
 
 - **「一行不被任何规则认识的 ERROR」不再等于一条微信**（`classify.py`）：本地模式下

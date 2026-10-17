@@ -342,8 +342,18 @@ def _dsh_command(cfg: Mapping | object | None) -> str:
 def build_argv(cfg: Mapping | object | None = None) -> list[str]:
     """构造 dsh headless 的 argv（§6.7 实测写死）。
 
-    形如 ``[dsh, --profile, <profile>, --json, (--patch, <overlay>,)? --, -]``：
+    形如 ``[dsh, --profile, <profile>, (--patch, <overlay>,)? --json, --, -]``：
     ``--`` 终止选项解析、单独的 ``-`` 表示任务从 stdin 读（任务文本不进 argv）。
+
+    **顺序不是风格问题**：``--patch`` 是 launcher 选项，``--json`` 是 app 选项，
+    launcher 段必须排在 app 段之前。2026-10-17 实测（fix lane 提出，dev 在一次性
+    ``DSH_HOME`` 沙箱复核，两条命令都真跑过）：
+
+    - ``dsh --profile headless --json --patch <overlay> -- -`` →
+      ``{"type":"error","message":"unknown option '--patch'"}``（exit 1）
+    - ``dsh --profile headless --patch <overlay> --json -- -`` → 通过解析、读到 overlay
+
+    ⇒ 已有一条 ``validate_argv`` 断言把这个顺序钉住，别再换回去。
 
     Args:
         cfg: 插件配置。
@@ -354,12 +364,12 @@ def build_argv(cfg: Mapping | object | None = None) -> list[str]:
     profile = str(
         cfg_first(cfg, "remediation_profile", default=DEFAULT_PROFILE)
     ).strip()
-    argv = [_dsh_command(cfg), "--profile", profile or DEFAULT_PROFILE, "--json"]
+    argv = [_dsh_command(cfg), "--profile", profile or DEFAULT_PROFILE]
     overlay, overlay_source = resolve_overlay(cfg)
     if overlay:
         argv += ["--patch", overlay]
         _log.debug("修复将使用 overlay（%s）：%s", overlay_source, overlay)
-    argv += ["--", "-"]
+    argv += ["--json", "--", "-"]
     return argv
 
 
@@ -394,6 +404,12 @@ def validate_argv(argv: Sequence[str]) -> str:
     for item in argv[3:-2]:
         if _SHELL_METACHARS.search(str(item)):
             return f"argv 参数含 shell 元字符：{item!r}"
+    if (
+        "--patch" in argv
+        and "--json" in argv
+        and argv.index("--patch") > argv.index("--json")
+    ):
+        return "argv 的 --patch 必须排在 --json 之前（launcher 选项在 app 选项之前，2026-10-17 实测）"
     return ""
 
 

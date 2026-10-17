@@ -276,9 +276,9 @@ def test_build_argv_bundled_overlay_is_discovered_by_default() -> None:
         "dsh",
         "--profile",
         "headless",
-        "--json",
         "--patch",
         overlay,
+        "--json",
         "--",
         "-",
     ]
@@ -305,9 +305,9 @@ def test_build_argv_configured_overlay_wins_over_bundled() -> None:
         "dsh",
         "--profile",
         "headless",
-        "--json",
         "--patch",
         "/tmp/route.yaml",
+        "--json",
         "--",
         "-",
     ]
@@ -323,13 +323,37 @@ def test_build_argv_patch_overlay_inserted_before_terminator() -> None:
         "dsh",
         "--profile",
         "headless",
+        "--patch",
+        "/tmp/route.yaml",
+        "--json",
+        "--",
+        "-",
+    ]
+    assert argv[-2:] == ["--", "-"], "任务必须走 stdin，`-- -` 必须在末尾"
+
+
+def test_build_argv_puts_launcher_flags_before_app_flags() -> None:
+    """``--patch`` 必须排在 ``--json`` 之前（2026-10-17 实测：反了 → `unknown option '--patch'`）。
+
+    取证：fix lane 在 dsh `0.2.0-rc.2` 上先测出，dev 在一次性 ``DSH_HOME`` 沙箱复核 ——
+    ``--profile … --json --patch <ov> -- -`` 退出 1 并报 ``unknown option '--patch'``；
+    交换后通过解析并读到 overlay。profile 的 YAML 破损修好前这条被挡在后面，属**独立缺陷**。
+    """
+    argv = remediate.build_argv({"remediation_patch_overlay": "/tmp/route.yaml"})
+    assert argv.index("--patch") < argv.index("--json"), argv
+    assert remediate.validate_argv(argv) == ""
+    # 旧写法必须被校验器拒掉，防止回退
+    bad = [
+        "dsh",
+        "--profile",
+        "headless",
         "--json",
         "--patch",
         "/tmp/route.yaml",
         "--",
         "-",
     ]
-    assert argv[-2:] == ["--", "-"], "任务必须走 stdin，`-- -` 必须在末尾"
+    assert "launcher" in remediate.validate_argv(bad)
 
 
 @pytest.mark.parametrize(
@@ -345,6 +369,17 @@ def test_build_argv_patch_overlay_inserted_before_terminator() -> None:
             "--json",
             "--patch",
             "$(cat /etc/passwd)",
+            "--",
+            "-",
+        ],
+        [
+            # 顺序反了：路径本身干净，被拒只因 --patch 排在 --json 之后（2026-10-17 实测缺陷）
+            "dsh",
+            "--profile",
+            "headless",
+            "--json",
+            "--patch",
+            "/tmp/route.yaml",
             "--",
             "-",
         ],
