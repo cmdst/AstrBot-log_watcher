@@ -470,6 +470,25 @@ def render_burst(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def all_delivered(outcomes) -> bool:
+    """所有目标的投递是否都成功（``remediation_runs.receipt_sent`` 的判定规则）。
+
+    为什么落在投递层：``main`` 拿到的是「每个会话一个 :class:`DeliveryOutcome`」，但主循环
+    在本库没有测试夹具（``main.py`` 顶部 import astrbot）⇒ 把这条判定抽成纯函数，由
+    ``tests/test_deliver.py`` 直接钉住，main 只负责把结果列表递进来。
+
+    Args:
+        outcomes: 每个目标的投递结果（读它们的 ``ok``）。
+
+    Returns:
+        非空且全部 ``ok`` 才为 True；**空列表为 False** —— 没发出去就等于没告诉人。
+        进 ``pending_delivery`` 的重试不会回头补记（重试发的是投递计划，不再经过回执构造），
+        所以这个 True 的含义是「首次投递就把回执交给了通道」。
+    """
+    items = list(outcomes or [])
+    return bool(items) and all(bool(getattr(item, "ok", False)) for item in items)
+
+
 def strip_plan_markers(text: str) -> str:
     """去掉分片标记（测试用：验证分片不丢内容）。"""
     return _PLAN_MARKER_RE.sub("", text)

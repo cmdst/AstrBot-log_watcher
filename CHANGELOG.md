@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### 修复（2026-10-18 · 二）
+
+- **⚠️ 两个等级旋钮在生产链路上被静默丢弃**（`main.py` 白名单 ＋ `detect.py` 兜底 ＋ 回归）：
+  2026-10-17 加的 `unmatched_severity` / `transient_severity` 只写进了 `_conf_schema.json` 与
+  `classify.py`，**漏进 `main._engine_config()`** —— 那是显式白名单（R4 的设计）⇒ `ThreatEngine`
+  拿到的 cfg 里没有这两个键，`classify_block` 只能吃代码默认值。后果两条，都很硬：
+  ① 运营方设 `transient_severity=LOW` **不生效**（生产噪声的下降其实只来自默认值）；
+  ② 派单承诺的「`unmatched_severity=MEDIUM` 一步回滚」**失效**。
+  同时 `detect.fallback_verdict` 调 `classify_block(block)` 时也没传 cfg（降级路径同样被吞）。
+  **取证**：同一块日志喂 `ThreatEngine` —— 白名单形状的 cfg → `MEDIUM/notify`（回滚生效）；
+  漏传形状 → `LOW/digest`（设置被吞）。回归 `test_engine_config_forwards_the_severity_knobs`
+  （main 顶部 import astrbot、库内没有夹具，只能钉「源码事实」，端到端判据仍靠真跑）。
+- **`remediation_runs.receipt_sent` 不再恒 0**（`main.py` ＋ `store.py` ＋ `remediate.py` ＋ `deliver.py`）：
+  回执**真的**投递成功后才补写那一列 —— `deliver.all_delivered` 是判定规则（每个目标都 ok、且非空）、
+  `store.remediation_mark_receipt_sent` 只动单列且幂等、`RemediationRun.run_id` 让 main 知道写哪一行。
+  失败/重试不补记；闸门拦下的终态回执没有 run 行，因此无字段可置 —— 三条都写进 runbook §6.1。
+  来源：fix 派单 `20261018-dispatch-dev-receipt-sent.md`。
+- **`remediation_timeout_seconds` 默认 300 → 900**（`remediate.py` ＋ schema ＋ runbook §5.5）：
+  实测同一个真实任务直接跑 **284.32 s**、走插件 runner **308.0 s**（ok，9 步 / 39 次工具调用）
+  ⇒ 300 是「约一半概率死在收尾前」。同时记下「超时的轨迹只有元数据行、看着像卡死」的假象
+  （`wait_for` 取消 `communicate()` 时缓冲区不返回）与唯一可信判据（同 argv/env 手工跑计时）。
+- 评审跟进（两轴 code-review `main...0f5912f`）：参数化拒绝样本里的元字符用例改回**正确顺序**
+  （否则它会被顺序规则一起拒掉，元字符检查退化了这条样本也报不出来）；补一条把
+  「`--patch` 有、`--json` 无 ⇒ 不得抛异常」钉死的用例 —— 评审报的 `ValueError`「硬缺陷」
+  实测不成立（短路卫兵 `"--json" in argv` 在），但要防止以后有人把它「修」成抛异常。
+
 ### 修复（2026-10-18）
 
 - **`build_argv` 的 launcher/app 选项顺序**（`remediate.py`）：改为

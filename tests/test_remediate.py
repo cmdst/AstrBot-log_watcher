@@ -121,6 +121,7 @@ class FakeStore:
         self.begun: list[dict] = []
         self.finished: list[dict] = []
         self.pushed: list[float] = []
+        self.marked: list[str] = []
 
     def remediation_count(self, *, since: float) -> int:
         if self.boom:
@@ -149,6 +150,13 @@ class FakeStore:
         self.finished.append(
             {"run_id": run_id, "run": run, "receipt_sent": receipt_sent}
         )
+
+    def remediation_mark_receipt_sent(self, run_id) -> int:
+        """与 ``store.SqliteStore.remediation_mark_receipt_sent`` 同名同形（账本按名转发）。"""
+        if self.boom:
+            raise RuntimeError("db down")
+        self.marked.append(str(run_id))
+        return 1
 
     def remediation_last_at(self, fingerprint: str) -> float:
         if self.boom:
@@ -363,12 +371,14 @@ def test_build_argv_puts_launcher_flags_before_app_flags() -> None:
         ["dsh", "--profile", "head less", "--json", "--", "-"],
         ["dsh", "--profile", "headless", "--json", "run tests"],
         [
+            # 元字符规则的**单点**样本：顺序必须是对的，否则它会被顺序规则一起拒掉 ——
+            # 将来元字符检查退化，这条样本也报不出来（2026-10-18 评审指出）。
             "dsh",
             "--profile",
             "headless",
-            "--json",
             "--patch",
             "$(cat /etc/passwd)",
+            "--json",
             "--",
             "-",
         ],
@@ -389,6 +399,18 @@ def test_validate_argv_rejects_metacharacters_and_missing_stdin(
     argv: list[str],
 ) -> None:
     assert remediate.validate_argv(argv) != ""
+
+
+def test_validate_argv_order_rule_only_applies_when_both_flags_present() -> None:
+    """顺序规则只在 ``--json`` 与 ``--patch`` 同时出现时裁决，且**不得抛异常**。
+
+    取证：2026-10-18 评审报「``--patch`` 有、``--json`` 无 ⇒ ``argv.index('--json')`` 抛
+    ValueError」，实测该形状返回 ``''``（短路卫兵 `"--json" in argv` 在）—— 这条用例把它钉死，
+    顺手防止以后有人把它「修」成抛异常。该形状 ``build_argv`` 不会产出（永远追加 ``--json``），
+    所以这里只要求「不抛、且不因顺序被拒」。
+    """
+    shape = ["dsh", "--profile", "headless", "--patch", "/tmp/route.yaml", "--", "-"]
+    assert remediate.validate_argv(shape) == ""
 
 
 def test_build_child_env_drops_unlisted_secrets() -> None:
@@ -934,6 +956,20 @@ def test_run_records_ledger_finish_with_run_result(spawn, tmp_path: Path) -> Non
     assert run.status == "ok"
     assert store.begun, "开始要落库（并发/日限/冷却都读它）"
     assert store.finished and store.finished[0]["run"].status == "ok"
+    assert run.run_id == store.begun[0]["run_id"] != "", (
+        "run 必须带上账本主键：main 靠它把「回执已送达」写回同一行（receipt_sent）"
+    )
+
+
+def test_ledger_mark_receipt_sent_delegates_and_swallows_store_errors() -> None:
+    """账本转发「回执已送达」；存储层炸了只记 warning —— 记账不得影响投递。"""
+    store = FakeStore()
+    ledger = remediate.RemediationLedger(store, {})
+    ledger.mark_receipt_sent("r1")
+    assert store.marked == ["r1"]
+    ledger.mark_receipt_sent("")
+    assert store.marked == ["r1"], "空 run_id 静默跳过（账本没建行）"
+    remediate.RemediationLedger(FakeStore(boom=True), {}).mark_receipt_sent("r2")
 
 
 def test_artifact_dir_defaults_under_plugin_data() -> None:

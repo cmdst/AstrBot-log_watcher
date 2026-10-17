@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 try:  # 包内导入（main.py 走这条）
@@ -295,7 +296,9 @@ def local_rules() -> tuple:
     return tuple(merged)
 
 
-def fallback_verdict(block, *, rules: object = None) -> ThreatVerdict:
+def fallback_verdict(
+    block, *, rules: object = None, cfg: Mapping | object | None = None
+) -> ThreatVerdict:
     """本地保守分级（主循环在 engine/classify 不可用时的确定性兜底）。
 
     R2/R12 单一源：判定语义只有 ``classify`` 一份实现 —— 本函数直接委派
@@ -307,6 +310,9 @@ def fallback_verdict(block, *, rules: object = None) -> ThreatVerdict:
         block: 日志片段。
         rules: **已废弃**（历史参数）。判定规则统一来自 ``classify``；传值只会记一条
             warning，不再用于本地匹配，避免出现第二套规则优先级。
+        cfg: 插件配置，透传给 ``classify.classify_block``。**必须传**：白名单之外的键直接
+            影响等级落点（``unmatched_severity`` / ``transient_severity`` / ``route_map``），
+            不传就等于把运营方的设置静默丢掉（2026-10-18 实测的漏传就是这么来的）。
 
     Returns:
         :class:`~models.ThreatVerdict`；``classify`` 不可用时退回"只按命中等级"的
@@ -316,7 +322,7 @@ def fallback_verdict(block, *, rules: object = None) -> ThreatVerdict:
         _log.warning("detect.fallback_verdict 的 rules 参数已废弃：判定统一走 classify（R12）")
     module = _classify_module()
     try:
-        return module.classify_block(block)
+        return module.classify_block(block, cfg=cfg)
     except Exception as exc:  # classify 不可用也不能把主循环打挂
         _log.warning("classify 不可用，退回按等级的最小结论：%s: %s", type(exc).__name__, exc)
     hit_lines = [

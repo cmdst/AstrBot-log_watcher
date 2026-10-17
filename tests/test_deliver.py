@@ -345,3 +345,18 @@ def test_plan_forwards_only_when_caps_allow_and_mode_asks():
         block=block, caps=caps,
     )
     assert forced.kind == "forward"
+
+
+def test_all_delivered_requires_every_target_ok():
+    """``remediation_runs.receipt_sent`` 的判定规则：非空、且每个目标都成功。
+
+    这条规则住在投递层（而不是 main）的原因：main 在库里没有测试夹具（顶部 import astrbot），
+    抽成纯函数才钉得住（fix 派单 20261018-dispatch-dev-receipt-sent.md 要求回归覆盖）。
+    """
+    ok = models.DeliveryOutcome(session="s1", ok=True, attempts=1)
+    bad = models.DeliveryOutcome(session="s2", ok=False, attempts=3, error="prepare failed")
+    assert deliver.all_delivered([ok, ok]) is True
+    assert deliver.all_delivered([ok, bad]) is False, "有一个没送到就不算告诉了人"
+    assert deliver.all_delivered([]) is False, "没有目标 = 没人被告知"
+    assert deliver.all_delivered(None) is False
+    assert deliver.all_delivered([object()]) is False, "非 outcome 形状一律当没送达"

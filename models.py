@@ -204,6 +204,9 @@ class RemediationRun:
     summary: str = ""
     artifact: str = ""
     log_path: str = ""
+    #: 本次 run 在 ``remediation_runs`` 里的主键；账本没建行（``ledger=None`` 或 begin 失败）时为空。
+    #: main 靠它把「回执真的发出去了」写回同一行（``receipt_sent``），见 ``deliver.all_delivered``。
+    run_id: str = ""
 
     def to_dict(self) -> dict:
         """序列化为可 JSON 落盘的 dict。"""
@@ -214,6 +217,7 @@ class RemediationRun:
             "summary": self.summary,
             "artifact": self.artifact,
             "log_path": self.log_path,
+            "run_id": self.run_id,
         }
 
     @classmethod
@@ -237,6 +241,7 @@ class RemediationRun:
             summary=str(raw.get("summary", "") or ""),
             artifact=str(raw.get("artifact", "") or ""),
             log_path=str(raw.get("log_path", "") or ""),
+            run_id=str(raw.get("run_id", "") or ""),
         )
 
 

@@ -114,7 +114,7 @@ grep -a "日志监听启动" /root/AstrBot/data/logs/astrbot.log | tail -1
 | `classify_timeout_seconds` | int | `20` | 5-300，单次 LLM 判定超时。 |
 | `classify_system_prompt` | text | `""` | 覆盖内置提示词（留空用 prompts/classify_system.md）。 |
 | `fallback_severity` | string | `"MEDIUM"` | 降级地板（五级）：LLM 不可用/超时/输出非法时取 max(本地判定, 该值)。 |
-| `unmatched_severity` | string | `"LOW"` | 本地模式「有 ERROR 等级但没有任何规则能解释」的等级。默认 LOW = 只进摘要、不即时推送；填 `MEDIUM` 恢复旧行为（2026-10-16 实测：一天 95 条这样的块直推微信）。 |
+| `unmatched_severity` | string | `"LOW"` | 本地模式「有 ERROR 等级但没有任何规则能解释」的等级。默认 LOW = 只进摘要、不即时推送；填 `MEDIUM` 恢复旧行为（2026-10-16 重放：全天 95 条即时推送＝未匹配错误 41 条 ＋ 可恢复抖动 54 条，两族都曾被判 MEDIUM 直推）。**这个键必须同时进 `main._engine_config()` 白名单**，否则生产链路上被静默丢弃（2026-10-18 漏过一次，见 §7.2 / §10）。 |
 | `transient_severity` | string | `"MEDIUM"` | 本地模式可恢复抖动（上游 503 / 框架重试中）的等级。默认 MEDIUM = 验收基线（用例 TRANS-01，notes 写着「压成 LOW = 漏报」）；填 `LOW` = 抖动只进摘要。 |
 | `llm_max_block_lines` | int | `80` | 5-500，送 LLM 的最大行数。 |
 | `llm_max_calls_per_round` | int | `5` | 0-1000，单轮 LLM 调用上限（0 = 不限，不推荐）。 |
@@ -162,7 +162,7 @@ grep -a "日志监听启动" /root/AstrBot/data/logs/astrbot.log | tail -1
 | `remediation_profile` | string | `"headless"` | 传给 dsh 的 --profile 值。 |
 | `remediation_patch_overlay` | string | `""` | 留空 = 用插件自带的 dsh-headless-overlay.yml（与插件同目录，绝对路径解析，不依赖 cwd，以 --patch 叠加，不改任何 profile）。删除该文件即完全失效（可回滚）。填路径 = 手动覆盖。 |
 | `remediation_workdir` | string | `"/root/AstrBot"` | 子进程 cwd = 工作区根。 |
-| `remediation_timeout_seconds` | int | `300` | 30-3600，看门狗超时（超时会 kill 整个进程组并回收）。 |
+| `remediation_timeout_seconds` | int | `900` | 30-3600，看门狗超时（超时会 kill 整个进程组并回收）。默认 900 的依据与「超时 vs 卡死」的判据见 §5.5。 |
 | `remediation_max_concurrency` | int | `1` | 1-4，并发闸；建议恒为 1。 |
 | `remediation_cooldown_seconds` | int | `3600` | 0-86400，同指纹冷却，冷却期内不重复修复（会发 blocked 回执）。 |
 | `remediation_daily_limit` | int | `5` | 0-100，每日修复次数上限（跨重启持久）。 |
@@ -334,6 +334,25 @@ dsh --profile headless --patch /root/AstrBot/data/plugins/log_watcher/dsh-headle
 | `credential` | `unavailable` | headless 凭据/路由缺失（要配 provider 或恢复 overlay） |
 | 非上表（执行器终态） | `failed`/`timeout`/… | 已过闸，是子进程自己失败/超时/被取消，回执会写「非闸门拦截（已通过修复闸，执行器终态 X）」 |
 
+### 5.5 超时还是卡死：别用「空轨迹」判断
+
+**实测（2026-10-18）**：同一个真实修复任务，直接 `dsh` 跑 = **284.32 s**（exit 0 / 150 事件 /
+9 步 / 39 次工具调用），走插件 runner = **308.0 s**（`status=ok`）。所以
+`remediation_timeout_seconds` 的默认值从 300 抬到 **900**：300 是「约一半概率死在收尾前」，
+不是安全余量。
+
+**为什么超时看着像卡死**：`asyncio.wait_for(proc.communicate())` 被取消时**内部缓冲区不返回**，
+于是轨迹里只剩那行 JSON 元数据、stdout 为空 —— 那**不是**「dsh 没输出」。
+
+**唯一可信的判据**：用同一条 argv / 同一份 env 与工作区手工跑一次并计时：
+
+```bash
+time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- - <<< "只回复 OK"; echo "exit=$?"
+```
+
+手工跑得完、插件跑超时 ⇒ **看门狗太小**（调 `remediation_timeout_seconds`）；
+手工跑也迟迟不结束 ⇒ 才是真卡死（看轨迹 JSONL 的最后事件）。
+
 ---
 
 ## 6. 回执契约与真实样例
@@ -350,6 +369,15 @@ dsh --profile headless --patch /root/AstrBot/data/plugins/log_watcher/dsh-headle
 |---|---|---|
 | 闸门拦截 | `skipped` / `blocked` / `unavailable` | `main._maybe_remediate` → `_send_terminal_receipt`（main.py:1143 / 822） |
 | 执行器返回（含异常兜底） | `ok` / `failed` / `timeout` / `unavailable` / `rejected` | `main._maybe_remediate` → `_send_receipt`（main.py:1174） |
+
+**`remediation_runs.receipt_sent` 的含义与更新时机**（2026-10-18 起）：
+
+- 含义：**首次投递就把回执交给了通道**才为 1。判定规则＝`deliver.all_delivered`（每个目标会话
+  的 `DeliveryOutcome.ok` 全为真、且目标非空）；`main._mark_receipt_sent` 在投递成功后补写那一列。
+- 为什么不是 `finish` 写的：finish 发生在回执**之前**（回执要等 run 结束），设计里留的
+  「发完再覆盖」此前一直没人接 ⇒ 该字段恒 0（7/7 行），看上去像「从没通知过运营方」。
+- 不会置 1 的两种情况：进 `pending_delivery` 的重试（重试发的是投递计划，不再经过回执构造）；
+  闸门拦下的终态回执（它**没有** `remediation_runs` 行 —— 行由 `ledger.begin` 在真跑时创建）。
 | 子进程被取消（插件重载/关闭） | `cancelled` | `remediate.run_remediation` 的 `CancelledError` 分支：先回收进程组、补账、再透传取消；`_send_receipt` 由调用方中断时不再发送（这是唯一不发回执的状态，原因见 §10.3） |
 
 边界（明确写下来，不藏着）：`remediation_receipt=false` 关掉回执（不建议）；

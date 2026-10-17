@@ -1799,6 +1799,29 @@ class SqliteStore:
             )
         )
 
+    def remediation_mark_receipt_sent(self, run_id: str) -> int:
+        """把某个 run 的 ``receipt_sent`` 置 1（只动这一列），返回受影响行数。
+
+        为什么要单独一个方法：``remediation_finish`` 是**整行 UPDATE**，而回执是在 finish
+        **之后**才发的；再调一次 finish 就得保证传进来的 ``run`` 与首次逐字段一致，容易踩坑。
+        这里只更新「有没有告诉人」这一个事实，未知 ``run_id`` 是 no-op（返回 0）。
+
+        Args:
+            run_id: ``remediation_begin`` 返回的主键。
+
+        Returns:
+            受影响行数（0 表示没有这一行，或它已经是 1）。
+        """
+        rowcount = self._write(
+            lambda: self._conn.execute(
+                "UPDATE remediation_runs SET receipt_sent = 1"
+                " WHERE run_id = ? AND receipt_sent = 0",
+                (str(run_id),),
+            ).rowcount,
+            default=0,
+        )
+        return int(rowcount or 0)
+
     def remediation_last_at(self, fingerprint: str) -> float:
         """某指纹最近一次 run 的开始时间（冷却闸用）。"""
         row = self._read(

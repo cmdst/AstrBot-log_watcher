@@ -491,7 +491,7 @@ class LogWatcherPlugin(Star):
                 if isinstance(verdict, ThreatVerdict):
                     return verdict
                 return ThreatVerdict.from_dict(
-                    verdict, default=detect.fallback_verdict(block)
+                    verdict, default=detect.fallback_verdict(block, cfg=self._engine_config())
                 )
             except Exception as exc:
                 logger.warning(
@@ -503,12 +503,14 @@ class LogWatcherPlugin(Star):
                 result = hook(block, metrics, self._engine_config())
                 if isinstance(result, ThreatVerdict):
                     return result
-                return ThreatVerdict.from_dict(result, default=detect.fallback_verdict(block))
+                return ThreatVerdict.from_dict(
+                    result, default=detect.fallback_verdict(block, cfg=self._engine_config())
+                )
             except Exception as exc:
                 logger.warning(
                     f"{self._plat()}classify 模块异常，回退本地规则: {type(exc).__name__}: {exc}"
                 )
-        return detect.fallback_verdict(block)
+        return detect.fallback_verdict(block, cfg=self._engine_config())
 
     def _classify_hook(self):
         """classify.classify_block 的兜底入口（engine 不可用时才走）。"""
@@ -1174,10 +1176,40 @@ class LogWatcherPlugin(Star):
             f"（{run.summary or '无摘要'}）指纹 {verdict.fingerprint}"
         )
         if bool(self.config.get("remediation_receipt", True)):
+            outcomes = []
             for session in self._sessions():
-                await self._send_receipt(
-                    session, run, verdict, gate_reason=gate.reason or "ok"
+                outcomes.append(
+                    await self._send_receipt(
+                        session, run, verdict, gate_reason=gate.reason or "ok"
+                    )
                 )
+            self._mark_receipt_sent(run, outcomes)
+
+    def _mark_receipt_sent(self, run: RemediationRun, outcomes: list) -> None:
+        """回执**真的**发出去之后，才把 ``remediation_runs.receipt_sent`` 置 1。
+
+        为什么必须补这一步：该字段由 ``remediation_finish`` 写，而 finish 发生在回执**之前**
+        （回执要等 run 结束），设计里留的「发完再覆盖」一直没人接 ⇒ 7/7 行恒 0，
+        看上去像「从没通知过运营方」，既不能当审计、也不能当报警（fix 派单
+        ``20261018-dispatch-dev-receipt-sent.md``）。
+
+        只置 1、不置 0：本方法只在发送成功时被调用；失败路径保持 finish 写入的 0
+        （进 ``pending_delivery`` 重试；重试不补记，见 ``deliver.all_delivered``）。
+
+        Args:
+            run: 本次 run（``run_id`` 为空说明账本没建行，跳过）。
+            outcomes: 每个目标会话的投递结果。
+        """
+        run_id = str(getattr(run, "run_id", "") or "")
+        if not run_id or not deliver.all_delivered(outcomes):
+            return
+        marker = getattr(self.ledger, "mark_receipt_sent", None)
+        if not callable(marker):
+            return
+        try:
+            marker(run_id)
+        except Exception as exc:
+            logger.warning(f"{self._plat()}登记回执发送状态失败（不影响投递）: {exc!r}")
 
     def _remediation_gate(self, verdict: ThreatVerdict, now: float) -> RemediationGate:
         """engine.should_remediate（§6.6 ★）；engine 不可用时退回「仅看开关」。"""
@@ -1339,6 +1371,13 @@ class LogWatcherPlugin(Star):
             ),
             "classify_system_prompt": str(self.config.get("classify_system_prompt") or ""),
             "fallback_severity": str(self.config.get("fallback_severity") or "MEDIUM"),
+            # 2026-10-18 补漏：这两个旋钮当时只写进了 schema 与 classify，**没进本白名单** ⇒
+            # 生产链路上被静默丢弃（引擎路径与 detect 兜底路径都拿不到）：运营方设
+            # transient_severity=LOW 不生效，派单承诺的 unmatched_severity=MEDIUM「一步回滚」也失效。
+            # 白名单是本函数存在的意义（R4 显式转换），加键时必须同步这里。
+            # 回归：tests/test_classify.py::test_engine_config_forwards_the_severity_knobs
+            "unmatched_severity": str(self.config.get("unmatched_severity") or "LOW"),
+            "transient_severity": str(self.config.get("transient_severity") or "MEDIUM"),
             "kb_enabled": bool(self.config.get("kb_enabled", True)),
             "kb_max_entries": _as_int(
                 self.config.get("kb_max_entries", 500), 500, 50, 100000

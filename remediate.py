@@ -114,7 +114,11 @@ ENV_ALLOW_PREFIXES: tuple[str, ...] = ("PYTHON", "LC_")
 DEFAULT_DSH_COMMAND = "dsh"
 DEFAULT_PROFILE = "headless"
 DEFAULT_WORKDIR = "/root/AstrBot"
-DEFAULT_TIMEOUT_SECONDS = 300
+# 2026-10-18 实测：同一个真实修复任务，直接跑 dsh = 284.32 s（exit 0）、走插件 runner = 308.0 s
+# （status=ok，9 步 / 39 次工具调用）⇒ 原来的 300 s 是「约一半概率死在收尾前」，不是安全余量。
+# 症状还有欺骗性：超时的轨迹里只有元数据行、零 stdout（asyncio.wait_for 取消 communicate()
+# 时缓冲区不返回），看上去像卡死。默认抬到 900；怎么区分超时与卡死见 runbook §5.1。
+DEFAULT_TIMEOUT_SECONDS = 900
 MIN_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_CONCURRENCY = 1
@@ -1099,13 +1103,39 @@ class RemediationLedger:
         return run_id
 
     def finish(self, run_id: str, run: RemediationRun, *, receipt_sent: bool) -> None:
-        """登记一次 run 结束；``receipt_sent`` 可由 main 在发出回执后再调用一次覆盖。"""
+        """登记一次 run 结束。
+
+        注意时序：回执是在 run **结束之后**才发的，所以这里落库时 ``receipt_sent`` 必然是
+        False；「真的发出去了」由 main 事后调 :meth:`mark_receipt_sent` **只补那一列**。
+        别再靠二次 :meth:`finish` 覆盖整行 —— 那是整行 UPDATE，``run`` 必须与首次逐字段一致，
+        很容易把 status/summary 写回旧值。
+
+        Args:
+            run_id: ``begin`` 返回的主键（未建行时为空，调用方会跳过）。
+            run: 本次 run 的结果对象（或同形状对象）。
+            receipt_sent: 兼容参数；正常链路恒 False，见上。
+        """
         with contextlib.suppress(ValueError):
             self._active.remove(str(run_id))
         try:
             self.store.remediation_finish(str(run_id), run, receipt_sent=receipt_sent)
         except Exception as exc:
             _log.warning("登记修复结束失败（忽略）：%s: %s", type(exc).__name__, exc)
+
+    def mark_receipt_sent(self, run_id: str) -> None:
+        """把「回执已送达」写回账本（只动 ``receipt_sent`` 一列；失败只记 warning）。
+
+        调用时机：``main`` 把回执**真的**投出去之后（``deliver.all_delivered`` 为真）。
+        路径缺失或 ``run_id`` 为空一律静默跳过 —— 记账不该影响投递。
+        """
+        if not run_id:
+            return
+        try:
+            self.store.remediation_mark_receipt_sent(str(run_id))
+        except Exception as exc:
+            _log.warning(
+                "登记回执发送状态失败（忽略）：%s: %s", type(exc).__name__, exc
+            )
 
     def previous_runs(
         self, fingerprint: str, *, now: float, window: float = 86400.0
@@ -1371,7 +1401,8 @@ async def run_remediation(
         ledger: 修复账本（并发/冷却/日限/风暴/确认计数）；None 表示不做闸门校验。
         metrics: 窗口统计，透传给 :meth:`RemediationLedger.can_start` 与任务文本。
         now: 触发时刻，默认当前时间。
-        receipt_sent: 回执是否已发出（落库用；main 发完回执可再调 ``ledger.finish`` 覆盖）。
+        receipt_sent: 兼容参数（正常链路恒 False）：回执在 run **结束之后**才发，落库时它必然
+            还是「没发」；main 投递成功后用 ``ledger.mark_receipt_sent(run.run_id)`` 只补那一列。
 
     Returns:
         :class:`~models.RemediationRun`；``status`` 取值见模块 docstring。任何内部异常
@@ -1548,6 +1579,7 @@ async def _run_remediation(
             exit_code=None,
             duration=round(time.monotonic() - started, 3),
             summary=_scrub("插件重载/关闭时取消了本次修复：子进程与进程组已回收"),
+            run_id=ledger_run_id,
         )
         if ledger is not None and ledger_run_id:
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1615,6 +1647,7 @@ async def _run_remediation(
         ),
         artifact=artifact,
         log_path=log_path,
+        run_id=ledger_run_id,
     )
     if ledger is not None and ledger_run_id:
         await asyncio.to_thread(

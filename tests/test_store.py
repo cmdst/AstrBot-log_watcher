@@ -493,6 +493,34 @@ def test_sqlite_remediation_ledger_flow(tmp_path):
     db.close()
 
 
+def test_sqlite_remediation_mark_receipt_sent_only_touches_one_column(tmp_path):
+    """回执送达只补 ``receipt_sent``：0→1、幂等、未知 run_id 是 no-op，其它列一律不动。"""
+    import sqlite3
+
+    import models
+
+    db = _sqlite(tmp_path)
+    path = db.path
+    db.remediation_begin("run1", "fp1", "HIGH", task_sha1="sha", argv=["dsh", "--", "-"])
+    db.remediation_finish(
+        "run1",
+        models.RemediationRun(status="ok", exit_code=0, duration=2.5, summary="改了一处"),
+        receipt_sent=False,
+    )
+    assert db.remediation_mark_receipt_sent("run1") == 1, "0 → 1 要真写一行"
+    assert db.remediation_mark_receipt_sent("run1") == 0, "已经是 1 就不再写（幂等）"
+    assert db.remediation_mark_receipt_sent("nope") == 0, "未知 run_id 不得报错"
+    db.close()
+
+    conn = sqlite3.connect(path)
+    row = conn.execute(
+        "select status, exit_code, summary, receipt_sent from remediation_runs"
+        " where run_id = 'run1'"
+    ).fetchone()
+    conn.close()
+    assert tuple(row) == ("ok", 0, "改了一处", 1), "只动 receipt_sent，finish 写的列必须原样"
+
+
 def test_sqlite_prune_enforces_limits_and_orphans(tmp_path):
     db = _sqlite(tmp_path)
     now = time.time() + 1

@@ -794,6 +794,28 @@ def test_case_local_baseline_and_forbidden_tags(case: dict) -> None:
         )
 
 
+def test_engine_config_forwards_the_severity_knobs() -> None:
+    """main 的白名单必须转发两个等级旋钮 —— 这条只能量**源码**，原因在下面。
+
+    为什么会有这条古怪的用例：2026-10-17 加的两个旋钮只写进了 ``_conf_schema.json`` 与
+    ``classify.py``，**漏在 ``main._engine_config()`` 这个显式白名单里** ⇒ 生产链路上被静默
+    丢弃：引擎路径（``engine._classify`` → ``classify_block(block, metrics, cfg)``）与 detect
+    兜底路径都拿不到，运营方把 ``transient_severity`` 设成 LOW 不生效，派单承诺的
+    「``unmatched_severity=MEDIUM`` 一步回滚」同样失效。``main.py`` 顶部 import astrbot ⇒
+    库内没有夹具能实例化它，所以这里退一步钉「源码事实」；端到端判据仍靠真跑（ops 那份复核）。
+    """
+    source = (_PLUGIN_DIR / "main.py").read_text(encoding="utf-8")
+    body = source.split("def _engine_config(self)", 1)[1].split("\n    def ", 1)[0]
+    for key in ("unmatched_severity", "transient_severity"):
+        assert f'"{key}"' in body, (
+            f"_engine_config 白名单漏了 {key}：生产链路上这个旋钮会被静默丢弃"
+        )
+    fallback = source.split("def _classify(self", 1)[1].split("\n    def ", 1)[0]
+    assert "fallback_verdict(block, cfg=" in fallback, (
+        "兜底路径也必须把 cfg 传进去，否则降级时旋钮同样失效"
+    )
+
+
 def test_prompt_assets_exist_and_are_utf8() -> None:
     assert _SYSTEM_PROMPT_PATH.is_file(), f"系统提示词缺失：{_SYSTEM_PROMPT_PATH}"
     assert _REMEDIATE_TEMPLATE_PATH.is_file(), f"修复模板缺失：{_REMEDIATE_TEMPLATE_PATH}"
