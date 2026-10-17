@@ -20,6 +20,30 @@
 - 文档：`runbook.md` §4 配置表与 §6.1（代码落点 + 出口链 + `receipt_sent` 判定）、
   schema 两个键的 hint 同步。
 
+### 变更（2026-10-18 · 四）：出口策略的三条硬约束 ＋ 未送达汇总行 ＋ 纯抖动封顶
+
+运营方在同日的第三轮问答（Q14–Q18）上定案，一炉四件：
+
+- **至少两条出口（Q15=b）**：`target_sessions` 不足两条 ⇒ **加载但停摆** ——
+  `main._check_outlet_policy`（ERROR 日志 ＋ 状态目录写 `CONFIG-INVALID.txt`，含原因与恢复方法；
+  合格时自动删掉旧痕迹）、`main._loop` 不启动扫描线程。判据抽成纯函数
+  `deliver.has_redundant_outlets`（**只校验条数**：写两条不通的出口也算合格 —— 可达性只能靠
+  真发探针验，这条限制已写进 runbook §6.1）。
+- **未送达汇总行（Q14=c）**：转 `abandoned` 的同时，**下一条成功投递**的尾部带一行
+  「历史未送达：待重试 N 条、已放弃 M 条（**最高 X 级**，最早 Y 小时前）」；
+  `store.pending_stats()` 新增 `max_severity`（PendingQueue 内存态同步）。
+- **纯抖动封顶（Q11=b）**：`classify.clamp_transient_escalation` —— 本地锚点只有 `transient:` 族
+  **且**没有任何 `failure:` 族标签时，等级封顶 MEDIUM（重算 `route_map` 去向、附
+  `transient-escalation-capped` 标签与理由）；人工覆写（`source=manual`）永不封顶。
+  挂在 `engine.classify` 这个**公开入口**收口（KB/噪声/LLM/降级各分支都汇到它）。
+  **为什么规则这么窄**：那次**有价值的** GMI 修复（`9215dd87`）的块同时带
+  `local:failure:import-error` 与 `local:local-mode:unmatched-error` ⇒ 按"未匹配错误"封顶会正好
+  挡住它（我最初的想法已被自己的数据否掉）。
+- 连带：`test_engine.py::test_degraded_result_is_not_cached` 的等级断言按新策略改成 MEDIUM
+  （它关心的是缓存语义 —— `call_count`/tags 照旧逐字断言；同时新增
+  `transient-escalation-capped` 标签断言）。
+- 证据：临时副本 **318 passed**；库内 317 passed / 1 failed（唯一失败＝已知目录名环境性）。
+
 ### 修复（2026-10-18 · 二）
 
 - **⚠️ 两个等级旋钮在生产链路上被静默丢弃**（`main.py` 白名单 ＋ `detect.py` 兜底 ＋ 回归）：

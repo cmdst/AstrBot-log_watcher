@@ -34,7 +34,7 @@ import json
 import logging
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -576,6 +576,55 @@ def cfg_first(cfg: Mapping | object | None, *keys: str, default: Any = None) -> 
         if value is not None and str(value).strip() != "":
             return value
     return default
+
+
+CLAMP_TAG = "transient-escalation-capped"
+
+
+def clamp_transient_escalation(
+    verdict: ThreatVerdict, cfg: Mapping | object | None = None
+) -> ThreatVerdict:
+    """把「**纯**可恢复抖动」的最终等级封顶在 MEDIUM —— 不许它触发自动修复。
+
+    规则（运营方 2026-10-18 定案，Q11=b）：**同时**满足三条才封顶
+      ① tags 里有抖动族锚点（`transient:` 前缀：本地初判已把它认成可恢复抖动）；
+      ② tags 里**没有任何** `failure:` 族标签（有半点硬失败证据就放行）；
+      ③ `source != "manual"`（人工覆写优先，永不封顶）；
+    然后把高于 MEDIUM 的等级压回 MEDIUM，并按 ``route_map`` 重算去向（附 `CLAMP_TAG` 与理由）。
+
+    为什么**不**按「未匹配错误」封顶（我最初的想法，被自己的数据否掉）：那次**有价值的**
+    GMI 修复（指纹 9215dd87）的块**同时带** `local:failure:import-error` 与
+    `local:local-mode:unmatched-error` —— 按 unmatched 封顶会正好挡住它；且全库另有
+    12 条带噪声族标签的告警已是 HIGH。所以这里只认「纯抖动」，别的照旧。
+
+    Args:
+        verdict: 判定结论（本地/LLM/降级路径都适用）。
+        cfg: 插件配置（只读 ``route_map``，用于重算去向）。
+
+    Returns:
+        原 verdict，或在满足条件时封顶后的新 verdict（不改原对象）。
+    """
+    tags = [str(tag) for tag in (getattr(verdict, "tags", None) or [])]
+    if str(getattr(verdict, "source", "")) == "manual":  # engine.MANUAL_SOURCE 的字面量
+        return verdict
+    if not any("transient:" in tag for tag in tags):
+        return verdict
+    if any("failure:" in tag for tag in tags):
+        return verdict
+    if severity_rank(verdict.severity) <= severity_rank(Severity.MEDIUM):
+        return verdict
+    route_map = cfg.get("route_map") if isinstance(cfg, Mapping) else None
+    capped = Severity.MEDIUM
+    return replace(
+        verdict,
+        severity=capped,
+        route=route_for_severity(capped, route_map if isinstance(route_map, Mapping) else None),
+        tags=[*tags, CLAMP_TAG],
+        reason=(
+            verdict.reason
+            + "；本地锚点只有可恢复抖动（无 failure: 族证据）⇒ 等级封顶 MEDIUM，不进自动修复"
+        ),
+    )
 
 
 def _severity_cfg(cfg: Mapping | object | None, key: str, default: Severity) -> Severity:

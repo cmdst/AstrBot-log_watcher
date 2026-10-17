@@ -672,6 +672,9 @@ class PendingQueue:
             "abandoned": len(abandoned),
             "oldest_age": max(0.0, moment - oldest) if oldest else 0.0,
             "bytes": len(json.dumps([item.to_dict() for item in self.items])),
+            "max_severity": (
+                max((item.severity for item in active), key=_severity_rank) if active else ""
+            ),
         }
 
     def prune(self, now: float) -> int:
@@ -694,6 +697,18 @@ class PendingQueue:
             kept = kept[len(kept) - self.max_items :]
         self.items = kept
         return drop
+
+
+_SEVERITY_ORDER = {"IGNORE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+
+def _severity_rank(value: object) -> int:
+    """等级排序（store 自用：未送达汇总行要说「最高 X 级」）。
+
+    与 ``models.severity_rank`` 同义，但 store 这一层不 import models（保持零依赖）；
+    未知等级一律当 0（比"抛异常"更适合统计路径）。
+    """
+    return _SEVERITY_ORDER.get(str(getattr(value, "value", value)).upper(), 0)
 
 
 class DiskGovernor:
@@ -1694,6 +1709,14 @@ class SqliteStore:
             default=0.0,
         )
         active = counts.get("pending", 0) + counts.get("degraded", 0)
+        worst = self._read(
+            lambda: self._conn.execute(
+                "SELECT severity FROM pending_delivery WHERE state IN ('pending','degraded')"
+                " ORDER BY CASE severity WHEN 'CRITICAL' THEN 4 WHEN 'HIGH' THEN 3"
+                " WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 ELSE 0 END DESC LIMIT 1"
+            ).fetchone(),
+            None,
+        )
         return {
             "pending": counts.get("pending", 0),
             "degraded": counts.get("degraded", 0),
@@ -1701,6 +1724,8 @@ class SqliteStore:
             "abandoned": counts.get("abandoned", 0),
             "sent": counts.get("sent", 0),
             "oldest_age": max(0.0, moment - oldest) if oldest else 0.0,
+            # 汇总行（Q14=c）要能说「最高 X 级」：没送达的里面最要紧的那条
+            "max_severity": str(worst[0]) if worst and worst[0] else "",
         }
 
     def pending_import(self, items: Sequence[Mapping]) -> int:

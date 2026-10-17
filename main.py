@@ -150,6 +150,8 @@ class LogWatcherPlugin(Star):
         self._round_deltas: dict[str, int] = {}
         self._fingerprint_stats: dict[str, dict] = {}
         self._pending_stats: dict = {}
+        #: 出口策略不合格时的停摆原因（空串＝正常）；见 _check_outlet_policy（Q8=b / Q15=b）
+        self._config_blocked = ""
         self._last_metrics: dict = {}
         self._missing_notice_at = 0.0
         self._disk_report_at = 0.0
@@ -180,6 +182,7 @@ class LogWatcherPlugin(Star):
         kb_state = type(kb).__name__ if kb is not None else "无"
         if self.sqlite is not None and self.sqlite.last_error:
             logger.error(f"{self._plat()}状态库异常：{self.sqlite.last_error}")
+        self._check_outlet_policy()
         logger.info(
             f"{self._plat()}日志监听启动：目录 {self._log_dir()}，匹配 {self._pattern()}，"
             f"等级 {list(self._levels()) or '未配置'}，形态 {self._send_mode()}，"
@@ -233,6 +236,10 @@ class LogWatcherPlugin(Star):
         logger.info(f"{self._plat()}日志监听已停止；{self.disk.report()}")
 
     async def _loop(self) -> None:
+        if self._config_blocked:
+            # 停摆：不扫描、不投递、不修复（原因已在 initialize 里 ERROR ＋ 写进 CONFIG-INVALID.txt）
+            logger.warning(f"{self._plat()}插件处于停摆状态，扫描线程不启动")
+            return
         while True:
             try:
                 await self._scan_once()
@@ -241,6 +248,45 @@ class LogWatcherPlugin(Star):
             except Exception as exc:
                 logger.error(f"{self._plat()}扫描日志失败: {type(exc).__name__}: {exc}")
             await asyncio.sleep(self._interval())
+
+    def _check_outlet_policy(self) -> None:
+        """Q8=b ＋ Q15=b：出口不足两条 ⇒ **加载但停摆**（不静默假装在工作）。
+
+        为什么不是 raise：核心 loader 对**实例化**阶段的异常只保证"不再往下走"，插件失败在日志里
+        不一定醒目；而"停摆 ＋ 在状态目录写一份 CONFIG-INVALID.txt"是运营方能在**自己会看的地方**
+        留下的确定痕迹。配置合格后重启即恢复（合格时会把旧痕迹删掉，免得误导下一个人）。
+        """
+        self._config_blocked = ""
+        sessions = self._sessions()
+        marker = self.data_dir / "CONFIG-INVALID.txt"
+        if deliver.has_redundant_outlets(sessions):
+            if marker.exists():
+                try:
+                    marker.unlink()
+                except OSError as exc:
+                    logger.warning(f"{self._plat()}清理旧 CONFIG-INVALID.txt 失败: {exc!r}")
+            return
+        self._config_blocked = (
+            f"target_sessions 只有 {len(deliver.outlet_order(sessions))} 条出口，"
+            "策略要求至少 2 条（主出口 ＋ 备用出口）"
+        )
+        try:
+            marker.write_text(
+                "# log_watcher 配置不合格：插件已停摆\n\n"
+                f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"原因：{self._config_blocked}\n"
+                "怎么恢复：把插件配置里的 `target_sessions` 填成**至少两条**"
+                "（第 1 条是主出口、第 2 条是备用出口：主出口失败时才投备用出口），保存后重启 AstrBot。\n"
+                "为什么这么定：2026-10-18 运营方定案 —— 只有一个出口时，「通道坏了」与「一切正常」"
+                "长得一模一样（历史上 81 条告警就这样躺在 abandoned 里，其中 9 条是 HIGH）。\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning(f"{self._plat()}写 CONFIG-INVALID.txt 失败（仍然停摆）: {exc!r}")
+        logger.error(
+            f"{self._plat()}{self._config_blocked} ⇒ **插件停摆**：不扫描、不投递、不修复；"
+            f"填够两条并重启即恢复（详见 {marker}）"
+        )
 
     def _open_store(self) -> store.SqliteStore | None:
         """打开状态库；失败返回 None 并进入内存态降级。"""
@@ -672,9 +718,18 @@ class LogWatcherPlugin(Star):
         backlog = self._pending_stats or {}
         note = ""
         if backlog.get("active") or backlog.get("abandoned"):
+            # Q14=c：既留在队列里等下一次，也在**下一条成功消息**的尾部把账报清楚
+            extra = []
+            worst = str(backlog.get("max_severity") or "")
+            age = float(backlog.get("oldest_age") or 0.0)
+            if worst:
+                extra.append(f"最高 {worst} 级")
+            if age:
+                extra.append(f"最早 {age / 3600:.1f} 小时前")
+            tail = f"（{'，'.join(extra)}）" if extra else ""
             note = (
                 f"历史未送达：待重试 {backlog.get('active', 0)} 条、已放弃 "
-                f"{backlog.get('abandoned', 0)} 条（见 plugin_data/{PLUGIN_NAME}）"
+                f"{backlog.get('abandoned', 0)} 条{tail}（见 plugin_data/{PLUGIN_NAME}）"
             )
         all_ok, outcomes, planned = await self._deliver_outlets(
             lambda session: deliver.build_send_plan(

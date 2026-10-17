@@ -375,6 +375,23 @@ time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- 
 `delivery_max_attempts` 次（默认 **2** = 初投 + 1 次重试，配置里可改），用尽才切下一个出口，
 **第一个成功就停**（不再"两处都收到"）；全部失败才按主出口入队一次。
 
+**出口策略的三条硬约束**（同日定案，都已在代码里）：
+
+1. **至少两条出口**：`target_sessions` 不足两条 ⇒ 插件**停摆**（不扫描/不投递/不修复），
+   日志打 ERROR ＋ 在状态目录写 `CONFIG-INVALID.txt`（含原因与怎么恢复）；配置合格后重启即恢复，
+   合格时会把旧痕迹删掉。为什么不是"拒绝加载"：核心 loader 对实例化阶段的异常不保证醒目，
+   而停摆＋状态目录里的文件是运营方**会看到的地方**。
+2. **只校验条数，不校验可达性**：写两条不通的出口同样算"合格"（可达性只能靠真发一条探针来验）。
+   ⇒ **摘要里长期没有成功记录 = 出口可疑**，别把"很安静"当成"没事"。
+3. **纯抖动封顶**：本地锚点只有 `transient:` 族、且**没有任何** `failure:` 族标签时，最终等级封顶
+   MEDIUM（`classify.clamp_transient_escalation`，挂在 `engine.classify` 这个公开入口收口，
+   附 `transient-escalation-capped` 标签）⇒ 模型抬到 HIGH/CRITICAL 也**不会**触发自动修复。
+   带 `failure:` 证据的（例如那次 GMI `import-error`）**不受影响**；人工覆写（`source=manual`）永不封顶。
+
+**未送达汇总行**（Q14=c）：投递条目耗尽转 `abandoned` 的同时，**下一条成功投递**的尾部会带一行
+「历史未送达：待重试 N 条、已放弃 M 条（最高 X 级，最早 Y 小时前）」——既不静默丢失、也不刷屏。
+最高等级由 `store.pending_stats()["max_severity"]` 给出（只统计 `pending`/`degraded`）。
+
 **`remediation_runs.receipt_sent` 的含义与更新时机**（2026-10-18 起）：
 
 - 含义：**首次投递就把回执交给了通道**才为 1。判定规则＝`deliver.delivered`（**任一出口**

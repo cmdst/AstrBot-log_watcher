@@ -471,3 +471,13 @@ def test_deliver_over_outlets_survives_empty_plan_and_plan_error():
 
     ok, outcomes, planned = asyncio.run(scenario())
     assert ok is True and calls == ["main"] and [s for s, _ in planned] == ["main"]
+
+
+def test_has_redundant_outlets_needs_two_entries():
+    """Q8=b 定案的闸门条件：出口 <2 条就算不合格（main 据此停摆）。"""
+    assert deliver.has_redundant_outlets(["a", "b"]) is True
+    assert deliver.has_redundant_outlets(["a", "a"]) is False, "同一条写两遍不算冗余"
+    assert deliver.has_redundant_outlets(["a", "  "]) is False
+    assert deliver.has_redundant_outlets([]) is False
+    assert deliver.has_redundant_outlets(None) is False
+    assert deliver.has_redundant_outlets(["a"], minimum=1) is True

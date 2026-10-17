@@ -570,6 +570,16 @@ async def deliver_over_outlets(
     return False, outcomes, planned
 
 
+def has_redundant_outlets(sessions, *, minimum: int = 2) -> bool:
+    """出口是否够冗余（策略：至少「主 + 备」两条，2026-10-18 运营方定案 Q8=b）。
+
+    为什么只校验**条数**、不校验可达性：可达性只能靠「真发一条探针」来验（会在群里打扰，
+    各平台也没有等价的健康检查）。所以这是**名义**校验 —— 配置里写两条不通的出口同样算通过，
+    这一点必须让人知情（已写进 runbook §4：单出口/名义出口的可用性靠摘要里的成功记录自证）。
+    """
+    return len(outlet_order(sessions)) >= max(1, int(minimum))
+
+
 def strip_plan_markers(text: str) -> str:
     """去掉分片标记（测试用：验证分片不丢内容）。"""
     return _PLAN_MARKER_RE.sub("", text)

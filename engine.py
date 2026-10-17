@@ -35,6 +35,7 @@ try:
         build_classification_prompt,
         cfg_first,
         cfg_get,
+        clamp_transient_escalation,
         classify_block,
         degraded_verdict,
         is_benign_noise,
@@ -53,6 +54,7 @@ except ImportError:  # 平铺导入（tests 直接 import engine）
         build_classification_prompt,
         cfg_first,
         cfg_get,
+        clamp_transient_escalation,
         classify_block,
         degraded_verdict,
         is_benign_noise,
@@ -628,7 +630,11 @@ class ThreatEngine:
         """
         try:
             verdict = await self._classify(block, metrics)
-            return self._apply_new_pattern_escalation(verdict, metrics)
+            # 收口（Q11=b 定案）：纯抖动族不许被抬到 HIGH/CRITICAL 从而触发自动修复。
+            # 放在这里是因为这是公开入口唯一的成功 return，KB/噪声/LLM/降级各分支都汇到它。
+            return clamp_transient_escalation(
+                self._apply_new_pattern_escalation(verdict, metrics), self._cfg
+            )
         except Exception as exc:  # 最后一道保险：看门狗不能因为判定层 bug 死掉
             self._stats["degraded"] += 1
             _log.warning("判定层异常，保守降级：%s: %s", type(exc).__name__, exc)

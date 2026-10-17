@@ -764,3 +764,29 @@ def test_harden_tree_fixes_existing_permissions(tmp_path):
     fixed = store.harden_tree(tmp_path)
     assert fixed >= 1
     assert stat.S_IMODE(legacy.stat().st_mode) == 0o600
+
+
+def test_pending_stats_reports_worst_severity_of_undelivered(tmp_path):
+    """Q14=c 的汇总行要能说「最高 X 级」：统计里必须带上未送达条目的最高等级。"""
+    import models
+
+    db = _sqlite(tmp_path)
+    assert db.pending_stats()["max_severity"] == ""
+    # 注意：队列按 fingerprint 合并同源条目 ⇒ 三条必须用不同指纹才是三条（见上一个用例）
+    for severity, item_id, fingerprint in (
+        ("LOW", "i1", "fp1"),
+        ("HIGH", "i2", "fp2"),
+        ("MEDIUM", "i3", "fp3"),
+    ):
+        db.pending_add(
+            store.PendingItem(
+                item_id=item_id,
+                session="s",
+                text="x",
+                fingerprint=fingerprint,
+                severity=severity,
+            )
+        )
+    stats = db.pending_stats()
+    assert stats["active"] == 3 and stats["max_severity"] == "HIGH"
+    db.close()

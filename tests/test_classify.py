@@ -926,3 +926,72 @@ def test_route_map_cannot_silence_high_or_critical() -> None:
     # 低等级仍允许覆写（地板只护 HIGH/CRITICAL），合法高等级覆写也允许
     assert route_for_severity("MEDIUM", {"MEDIUM": "digest"}) is Route.DIGEST
     assert route_for_severity("HIGH", {"HIGH": "emergency"}) is Route.EMERGENCY
+
+
+def test_transient_only_escalation_is_capped_at_medium() -> None:
+    """Q11=b 定案：只有「纯抖动」（transient: 锚点 ＋ 无 failure: 证据）才封顶 MEDIUM。
+
+    取证依据（这条规则为什么这么窄）：那次**有价值的** GMI 修复（指纹 9215dd87）的块
+    **同时带** `local:failure:import-error` 与 `local:local-mode:unmatched-error` ⇒ 按
+    「未匹配错误」封顶会正好挡住它；全库另有 12 条带噪声族标签的告警已是 HIGH。
+    """
+    import models
+    from classify import clamp_transient_escalation
+
+    def build(severity, tags, source="llm"):
+        return models.ThreatVerdict(
+            severity=severity,
+            tags=list(tags),
+            source=source,
+            route=models.ROUTE_BY_SEVERITY[severity],
+            reason="（测试）",
+            fingerprint="fp-test",
+        )
+
+    cfg = {"route_map": {}}
+    capped = clamp_transient_escalation(
+        build(models.Severity.HIGH, ["timeout", "llm", "local:transient:provider-retry"]), cfg
+    )
+    assert capped.severity is models.Severity.MEDIUM
+    assert capped.route is models.Route.NOTIFY, "封顶后要按 route_map 重算去向"
+    assert "transient-escalation-capped" in capped.tags
+    assert "封顶" in capped.reason
+
+    # 反例 1：带半点硬失败证据（GMI 那种）一律放行
+    keep = clamp_transient_escalation(
+        build(
+            models.Severity.HIGH,
+            ["local:transient:provider-retry", "local:failure:import-error"],
+        ),
+        cfg,
+    )
+    assert keep.severity is models.Severity.HIGH
+
+    # 反例 2：人工覆写（source=manual）永不封顶
+    manual = clamp_transient_escalation(
+        build(models.Severity.CRITICAL, ["local:transient:x"], source="manual"), cfg
+    )
+    assert manual.severity is models.Severity.CRITICAL
+
+    # 反例 3：本来就不高于 MEDIUM 的返回原对象（不做无谓改动）
+    low = build(models.Severity.LOW, ["local:transient:x"])
+    assert clamp_transient_escalation(low, cfg) is low
+
+    # 反例 4：没有抖动锚点的（例如纯 LLM 判断）不动
+    other = clamp_transient_escalation(build(models.Severity.HIGH, ["llm"]), cfg)
+    assert other.severity is models.Severity.HIGH
+
+    # 路由覆写仍然生效：MEDIUM→digest 时封顶后的去向要跟着走
+    overridden = clamp_transient_escalation(
+        build(models.Severity.HIGH, ["local:transient:x"]), {"route_map": {"MEDIUM": "digest"}}
+    )
+    assert overridden.route is models.Route.DIGEST
+
+
+def test_engine_classify_wires_the_transient_clamp() -> None:
+    """封顶必须挂在**公开入口**上（engine.classify 的成功 return），否则 KB/LLM 各分支漏网。"""
+    source = (_PLUGIN_DIR / "engine.py").read_text(encoding="utf-8")
+    body = source.split("async def classify(", 1)[1].split("\n    async def ", 1)[0]
+    assert "clamp_transient_escalation(" in body, (
+        "engine.classify 没接上封顶：纯抖动族又会被抬到 HIGH 并触发自动修复"
+    )

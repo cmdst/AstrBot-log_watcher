@@ -189,7 +189,10 @@ def test_degraded_result_is_not_cached() -> None:
     assert context.call_count == 2, (
         "降级结果被写进了知识库，provider 恢复后不会再问 LLM"
     )
-    assert recovered.severity is Severity.HIGH
+    # Q11=b（2026-10-18 定案）：provider_retry 是**纯粹的可恢复抖动** ⇒ 模型给 HIGH 也要被封顶
+    # 到 MEDIUM（不许进自动修复）。本用例关心的是缓存语义（call_count / tags），等级按新策略钉死。
+    assert recovered.severity is Severity.MEDIUM
+    assert "transient-escalation-capped" in recovered.tags
     assert "kb-hit:llm" not in recovered.tags
 
 
