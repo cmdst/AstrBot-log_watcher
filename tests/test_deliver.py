@@ -481,3 +481,14 @@ def test_has_redundant_outlets_needs_two_entries():
     assert deliver.has_redundant_outlets([]) is False
     assert deliver.has_redundant_outlets(None) is False
     assert deliver.has_redundant_outlets(["a"], minimum=1) is True
+
+
+def test_mask_session_hides_identifier_but_keeps_shape():
+    """会话标识不进日志：启动横幅与投递报错都走 mask_session。"""
+    assert deliver.mask_session("哈尼娅:FriendMessage:2060958352") == "哈尼娅:FriendMessage:（ID 已隐）"
+    assert deliver.mask_session("哈尼娅:GroupMessage:744868236") == "哈尼娅:GroupMessage:（ID 已隐）"
+    # 解析不出三段的原样返回（宁可留着，也别把调试信息弄丢）
+    assert deliver.mask_session("weixin_oc:FriendMessage:") == "weixin_oc:FriendMessage:"
+    assert deliver.mask_session("no-colon") == "no-colon"
+    assert deliver.mask_session("") == ""
+    assert deliver.mask_session(None) == ""

@@ -186,7 +186,8 @@ class LogWatcherPlugin(Star):
         logger.info(
             f"{self._plat()}日志监听启动：目录 {self._log_dir()}，匹配 {self._pattern()}，"
             f"等级 {list(self._levels()) or '未配置'}，形态 {self._send_mode()}，"
-            f"间隔 {self._interval()}s，会话 {caps or '未配置'}；"
+            f"间隔 {self._interval()}s，会话 {len(self._sessions())} 条"
+            f"（{'/'.join(sorted({str(item) for item in caps.values()})) or '未配置'}）；"
             f"状态 {state}，分级 {self._classify_mode()}"
             f"（provider {'已配置' if self._classify_provider_id() else '未配置'}），"
             f"修复 {'开启' if self._remediation_enabled() else '关闭'}；"
@@ -717,19 +718,25 @@ class LogWatcherPlugin(Star):
         hits = sum(block.hit_count for block, _ in sendable)
         backlog = self._pending_stats or {}
         note = ""
-        if backlog.get("active") or backlog.get("abandoned"):
-            # Q14=c：既留在队列里等下一次，也在**下一条成功消息**的尾部把账报清楚
+        # Q14=c：在下一条成功消息的尾部把账报清楚。口径是**最近一个窗口**（默认 24h），不是终身 ——
+        # 终身计数会把 2026-10-14~18 那 81 条历史债永远挂在每条消息尾部（实测：终身 81 / 24h 内 6）。
+        if backlog.get("recent_active") or backlog.get("recent_abandoned"):
+            counts = []
+            if backlog.get("recent_active"):
+                counts.append(f"待重试 {backlog.get('recent_active', 0)} 条")
+            if backlog.get("recent_abandoned"):
+                counts.append(f"已放弃 {backlog.get('recent_abandoned', 0)} 条")
             extra = []
-            worst = str(backlog.get("max_severity") or "")
-            age = float(backlog.get("oldest_age") or 0.0)
+            worst = str(backlog.get("recent_max_severity") or "")
+            age = float(backlog.get("recent_oldest_age") or 0.0)
             if worst:
                 extra.append(f"最高 {worst} 级")
             if age:
                 extra.append(f"最早 {age / 3600:.1f} 小时前")
             tail = f"（{'，'.join(extra)}）" if extra else ""
             note = (
-                f"历史未送达：待重试 {backlog.get('active', 0)} 条、已放弃 "
-                f"{backlog.get('abandoned', 0)} 条{tail}（见 plugin_data/{PLUGIN_NAME}）"
+                f"最近 {backlog.get('window_hours', 24):g} 小时未送达："
+                f"{'、'.join(counts)}{tail}（见 plugin_data/{PLUGIN_NAME}）"
             )
         all_ok, outcomes, planned = await self._deliver_outlets(
             lambda session: deliver.build_send_plan(
@@ -796,7 +803,7 @@ class LogWatcherPlugin(Star):
                     ]
                 )
                 if not await self.context.send_message(session, chain):
-                    outcome.error = f"找不到会话 {session} 对应的平台"
+                    outcome.error = f"找不到会话 {deliver.mask_session(session)} 对应的平台"
                     return outcome
             else:
                 if plan.kind == "forward":
@@ -809,7 +816,7 @@ class LogWatcherPlugin(Star):
                         session, MessageChain(chain=[Plain(chunk)])
                     )
                     if not sent:
-                        outcome.error = f"找不到会话 {session} 对应的平台"
+                        outcome.error = f"找不到会话 {deliver.mask_session(session)} 对应的平台"
                         return outcome
         except Exception as exc:
             outcome.error = f"{type(exc).__name__}: {exc}"

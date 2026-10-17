@@ -659,12 +659,15 @@ class PendingQueue:
             item.next_at = float(now) + max(0.0, float(delay))
         return item
 
-    def stats(self, now: float | None = None) -> dict:
-        """队列统计（待重试/已放弃/最早条目的年龄）。"""
+    def stats(self, now: float | None = None, *, window: float = 86400.0) -> dict:
+        """队列统计（待重试/已放弃/最早条目的年龄；含 `recent_*` 窗口口径）。"""
         moment = time.time() if now is None else float(now)
         active = [item for item in self.items if item.state in {"pending", "degraded"}]
         abandoned = [item for item in self.items if item.state == "abandoned"]
         oldest = min((item.created_at for item in active), default=0.0)
+        fresh = [item for item in self.items if item.created_at >= moment - float(window)]
+        fresh_active = [item for item in fresh if item.state in {"pending", "degraded"}]
+        fresh_oldest = min((item.created_at for item in fresh), default=0.0)
         return {
             "pending": len([item for item in active if item.state == "pending"]),
             "degraded": len([item for item in active if item.state == "degraded"]),
@@ -675,6 +678,15 @@ class PendingQueue:
             "max_severity": (
                 max((item.severity for item in active), key=_severity_rank) if active else ""
             ),
+            "window_hours": round(float(window) / 3600.0, 2),
+            "recent_pending": len([i for i in fresh_active if i.state == "pending"]),
+            "recent_degraded": len([i for i in fresh_active if i.state == "degraded"]),
+            "recent_abandoned": len([i for i in fresh if i.state == "abandoned"]),
+            "recent_active": len(fresh_active),
+            "recent_max_severity": (
+                max((i.severity for i in fresh), key=_severity_rank) if fresh else ""
+            ),
+            "recent_oldest_age": max(0.0, moment - fresh_oldest) if fresh_oldest else 0.0,
         }
 
     def prune(self, now: float) -> int:
@@ -1694,8 +1706,13 @@ class SqliteStore:
 
         return bool(self._write(run, False))
 
-    def pending_stats(self, now: float | None = None) -> dict:
-        """队列统计（与 `PendingQueue.stats()` 同形状）。"""
+    def pending_stats(self, now: float | None = None, *, window: float = 86400.0) -> dict:
+        """队列统计（与 `PendingQueue.stats()` 同形状）。
+
+        Args:
+            now: 统计时刻（默认当前时间）。
+            window: 「最近」口径的窗口秒数（汇总行用；默认 24h）。
+        """
         moment = time.time() if now is None else float(now)
         rows = self._read(
             lambda: self._conn.execute(
@@ -1709,6 +1726,32 @@ class SqliteStore:
             default=0.0,
         )
         active = counts.get("pending", 0) + counts.get("degraded", 0)
+        # 汇总行只报**最近一个窗口**（默认 24h）：终身计数会把 2026-10-14~18 那 81 条历史债
+        # 永远挂在每条消息尾部（实测：终身 81 / 最近 24h 只有 6）⇒ 那是噪声，不是信息。
+        recent = self._read(
+            lambda: self._conn.execute(
+                "SELECT state, COUNT(*), MIN(created_at), MAX("
+                "CASE severity WHEN 'CRITICAL' THEN 4 WHEN 'HIGH' THEN 3"
+                " WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 ELSE 0 END)"
+                " FROM pending_delivery WHERE created_at >= ? GROUP BY state",
+                (moment - float(window),),
+            ).fetchall(),
+            [],
+        )
+        recent_counts = {str(row[0]): int(row[1] or 0) for row in recent or []}
+        recent_active = recent_counts.get("pending", 0) + recent_counts.get("degraded", 0)
+        rank_to_severity = {4: "CRITICAL", 3: "HIGH", 2: "MEDIUM", 1: "LOW", 0: ""}
+        recent_worst = max(
+            (int(row[3] or 0) for row in recent or []), default=0
+        )
+        recent_oldest = min(
+            (
+                float(row[2] or 0.0)
+                for row in recent or []
+                if row[2] and row[0] in ("pending", "degraded", "abandoned")
+            ),
+            default=0.0,
+        )
         worst = self._read(
             lambda: self._conn.execute(
                 "SELECT severity FROM pending_delivery WHERE state IN ('pending','degraded')"
@@ -1726,6 +1769,14 @@ class SqliteStore:
             "oldest_age": max(0.0, moment - oldest) if oldest else 0.0,
             # 汇总行（Q14=c）要能说「最高 X 级」：没送达的里面最要紧的那条
             "max_severity": str(worst[0]) if worst and worst[0] else "",
+            # 窗口口径（main 的汇总行用这几个；见 runbook §6.1）
+            "window_hours": round(float(window) / 3600.0, 2),
+            "recent_pending": recent_counts.get("pending", 0),
+            "recent_degraded": recent_counts.get("degraded", 0),
+            "recent_abandoned": recent_counts.get("abandoned", 0),
+            "recent_active": recent_active,
+            "recent_max_severity": rank_to_severity.get(recent_worst, ""),
+            "recent_oldest_age": max(0.0, moment - recent_oldest) if recent_oldest else 0.0,
         }
 
     def pending_import(self, items: Sequence[Mapping]) -> int:

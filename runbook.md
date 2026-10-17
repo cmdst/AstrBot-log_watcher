@@ -388,9 +388,17 @@ time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- 
    附 `transient-escalation-capped` 标签）⇒ 模型抬到 HIGH/CRITICAL 也**不会**触发自动修复。
    带 `failure:` 证据的（例如那次 GMI `import-error`）**不受影响**；人工覆写（`source=manual`）永不封顶。
 
-**未送达汇总行**（Q14=c）：投递条目耗尽转 `abandoned` 的同时，**下一条成功投递**的尾部会带一行
-「历史未送达：待重试 N 条、已放弃 M 条（最高 X 级，最早 Y 小时前）」——既不静默丢失、也不刷屏。
-最高等级由 `store.pending_stats()["max_severity"]` 给出（只统计 `pending`/`degraded`）。
+**未送达汇总行**（Q14=c，2026-10-18 二次修正）：投递条目耗尽转 `abandoned` 的同时，**下一条成功投递**
+的尾部会带一行「最近 24 小时未送达：待重试 N 条、已放弃 M 条（最高 X 级，最早 Y 小时前）」——
+既不静默丢失、也不刷屏。
+
+- **口径是最近一个窗口（默认 24 h），不是终身**：终身计数会把 2026-10-14~18 那 81 条历史债**永远**
+  挂在每条消息尾部（实测：终身 81 / 24 h 内只有 6）⇒ 那是噪声不是信息。窗口内的最高等级由
+  `store.pending_stats()["recent_max_severity"]` 给出（含 `pending`/`degraded`/`abandoned`）。
+- 计数为 0 的那一项不出现（只剩一项时读起来清楚）。
+- **会话标识不进日志**：`deliver.mask_session()` 把 ``平台:类型:<ID>`` 掩成 ``平台:类型:（ID 已隐）``，
+  用在启动横幅与「找不到会话」报错里 —— 因为 astrbot.log 正是插件自己要扫的那份日志。
+  要看真实出口请读插件配置，不要靠日志。
 
 **`remediation_runs.receipt_sent` 的含义与更新时机**（2026-10-18 起）：
 

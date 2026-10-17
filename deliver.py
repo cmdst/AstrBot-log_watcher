@@ -570,6 +570,20 @@ async def deliver_over_outlets(
     return False, outcomes, planned
 
 
+def mask_session(session: str) -> str:
+    """把会话串里的标识掩掉：``平台:类型:<ID>`` → ``平台:类型:（ID 已隐）``。
+
+    为什么要掩：插件启动横幅会把出口列表写进 ``astrbot.log``，而这份日志**正是插件自己要扫的**
+    —— 运营方的会话标识不该被顺带抄进日志（2026-10-18 fix 用「合成日志探针」才发现横幅里有全串）。
+    解析不出三段就原样返回（宁可留着，也别因为掩码把调试信息弄丢）。
+    """
+    text = str(session or "")
+    parts = text.split(":")
+    if len(parts) < 3 or not parts[-1]:
+        return text
+    return ":".join([*parts[:-1], "（ID 已隐）"])
+
+
 def has_redundant_outlets(sessions, *, minimum: int = 2) -> bool:
     """出口是否够冗余（策略：至少「主 + 备」两条，2026-10-18 运营方定案 Q8=b）。
 

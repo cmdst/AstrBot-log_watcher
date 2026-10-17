@@ -789,4 +789,20 @@ def test_pending_stats_reports_worst_severity_of_undelivered(tmp_path):
         )
     stats = db.pending_stats()
     assert stats["active"] == 3 and stats["max_severity"] == "HIGH"
+    # 窗口口径：三天前那条不进 `recent_*` —— 否则终身计数会把历史债永远挂在汇总行上
+    db.pending_add(
+        store.PendingItem(
+            item_id="old",
+            session="s2",
+            text="x",
+            fingerprint="fp-old",
+            severity="CRITICAL",
+            created_at=time.time() - 3 * 86400,
+        )
+    )
+    stats2 = db.pending_stats()
+    assert stats2["active"] == 4 and stats2["max_severity"] == "CRITICAL"
+    assert stats2["recent_active"] == 3, "最近 24h 只算窗口内的"
+    assert stats2["recent_max_severity"] == "HIGH", "窗口内的最高等级"
+    assert stats2["window_hours"] == 24.0
     db.close()
