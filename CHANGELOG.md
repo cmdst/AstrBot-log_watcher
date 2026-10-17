@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### 变更（2026-10-18 · 三）：告警出口从「双发」改为「按优先级 fallback」
+
+**背景**：运营方定案**放弃微信**（被动回复窗口：每次入站只放行 1–3 条主动消息；我复算的现场数
+＝497 次平台拒收、92 条入队、82 条耗尽、**0 次重试成功**），改以 **QQ 为主力**（私聊主、测试群备）。
+
+- `deliver.outlet_order`（deliver.py:473）：出口列表**即优先级** —— 保序、去空白、去重。
+- `deliver.deliver_over_outlets`（deliver.py:499）：主出口成功即停；每个出口最多
+  `delivery_max_attempts` 次尝试（**默认 4 → 2** = 初投 + 1 次重试，配置里可改）；用尽才切下一个
+  出口；全部失败才按主出口入队一次。为什么改：旧实现是「每个目标都发一遍」⇒ 两个出口都通时
+  **两处都收到**（重复打扰），出口死掉时又各自堆 `abandoned`（历史 81 条）。
+- `deliver.delivered`（deliver.py:487）：`receipt_sent` 的判定从「全部目标成功」改成
+  「**任一出口成功**」—— fallback 语义下成功路径通常只有一条记录，用旧的「全部成功」会把
+  「主失败、备成功」误判成没送达（字段会恒 0）。
+- 回归 5 条：顺序/去重、主成功不碰备用、用尽切备用（退避与事件序列都钉住）、全失败只给一次
+  `give_up`、空计划与构造异常不带走整条链路。
+- 文档：`runbook.md` §4 配置表与 §6.1（代码落点 + 出口链 + `receipt_sent` 判定）、
+  schema 两个键的 hint 同步。
+
 ### 修复（2026-10-18 · 二）
 
 - **⚠️ 两个等级旋钮在生产链路上被静默丢弃**（`main.py` 白名单 ＋ `detect.py` 兜底 ＋ 回归）：
@@ -15,7 +33,7 @@
   漏传形状 → `LOW/digest`（设置被吞）。回归 `test_engine_config_forwards_the_severity_knobs`
   （main 顶部 import astrbot、库内没有夹具，只能钉「源码事实」，端到端判据仍靠真跑）。
 - **`remediation_runs.receipt_sent` 不再恒 0**（`main.py` ＋ `store.py` ＋ `remediate.py` ＋ `deliver.py`）：
-  回执**真的**投递成功后才补写那一列 —— `deliver.all_delivered` 是判定规则（每个目标都 ok、且非空）、
+  回执**真的**投递成功后才补写那一列 —— `deliver.delivered` 是判定规则（任一出口 ok）、
   `store.remediation_mark_receipt_sent` 只动单列且幂等、`RemediationRun.run_id` 让 main 知道写哪一行。
   失败/重试不补记；闸门拦下的终态回执没有 run 行，因此无字段可置 —— 三条都写进 runbook §6.1。
   来源：fix 派单 `20261018-dispatch-dev-receipt-sent.md`。

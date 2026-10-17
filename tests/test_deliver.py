@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 import re
 import sys
@@ -348,15 +349,125 @@ def test_plan_forwards_only_when_caps_allow_and_mode_asks():
 
 
 def test_all_delivered_requires_every_target_ok():
-    """``remediation_runs.receipt_sent`` 的判定规则：非空、且每个目标都成功。
+    """``remediation_runs.receipt_sent`` 的判定规则：**任一出口成功**即算送达。
 
-    这条规则住在投递层（而不是 main）的原因：main 在库里没有测试夹具（顶部 import astrbot），
+    这条判定住在投递层（而不是 main）的原因：main 在库里没有测试夹具（顶部 import astrbot），
     抽成纯函数才钉得住（fix 派单 20261018-dispatch-dev-receipt-sent.md 要求回归覆盖）。
+    2026-10-18 语义从「全部成功」改成「任一成功」：投递模型变成按优先级 fallback，
+    成功路径上 outcomes 里通常只有一条记录。
     """
     ok = models.DeliveryOutcome(session="s1", ok=True, attempts=1)
     bad = models.DeliveryOutcome(session="s2", ok=False, attempts=3, error="prepare failed")
-    assert deliver.all_delivered([ok, ok]) is True
-    assert deliver.all_delivered([ok, bad]) is False, "有一个没送到就不算告诉了人"
-    assert deliver.all_delivered([]) is False, "没有目标 = 没人被告知"
-    assert deliver.all_delivered(None) is False
-    assert deliver.all_delivered([object()]) is False, "非 outcome 形状一律当没送达"
+    assert deliver.delivered([bad, ok]) is True, "主出口失败、备出口成功也算送达"
+    assert deliver.delivered([bad, bad]) is False
+    assert deliver.delivered([]) is False, "没有目标 = 没人被告知"
+    assert deliver.delivered(None) is False
+    assert deliver.delivered([object()]) is False, "非 outcome 形状一律当没送达"
+
+
+def test_outlet_order_keeps_priority_and_dedupes():
+    """出口列表**即优先级**（第 1 个是主出口）：保序、去空白、去重。"""
+    assert deliver.outlet_order(["main", " backup ", "", "main", None, "third"]) == [
+        "main",
+        "backup",
+        "third",
+    ]
+    assert deliver.outlet_order([]) == [] and deliver.outlet_order(None) == []
+
+
+def _plan_for(session: str):
+    return deliver.SendPlan(session=session, kind="text", chunks=["x"])
+
+
+def test_deliver_over_outlets_stops_at_first_success():
+    """主出口成功就不再碰备用出口 —— 不再「两处都收到」。"""
+    sent: list[str] = []
+
+    async def scenario():
+        async def send(session, plan):
+            sent.append(session)
+            return models.DeliveryOutcome(session=session, ok=True, attempts=1)
+
+        return await deliver.deliver_over_outlets(
+            ["main", "backup"], _plan_for, send, attempts=2
+        )
+
+    ok, outcomes, planned = asyncio.run(scenario())
+    assert ok is True and sent == ["main"], "备用出口不得被使用"
+    assert [session for session, _ in planned] == ["main"]
+
+
+def test_deliver_over_outlets_switches_after_attempts_exhausted():
+    """Q7 定案：单出口默认重试一次（attempts=2），用尽后切下一个出口；备用成功即算送达。"""
+    calls: list[str] = []
+    sleeps: list[float] = []
+    events: list[str] = []
+
+    async def scenario():
+        async def send(session, plan):
+            calls.append(session)
+            return models.DeliveryOutcome(
+                session=session, ok=(session == "backup"), attempts=1, error="prepare failed"
+            )
+
+        async def sleep(seconds):
+            sleeps.append(seconds)
+
+        return await deliver.deliver_over_outlets(
+            ["main", "backup"],
+            _plan_for,
+            send,
+            attempts=2,
+            delay=lambda attempt: 5.0,
+            sleep=sleep,
+            on_event=lambda kind, payload: events.append(kind),
+        )
+
+    ok, outcomes, planned = asyncio.run(scenario())
+    assert ok is True
+    assert calls == ["main", "main", "backup"], "主出口两次都失败后才切备用（不再 4 连重试）"
+    assert sleeps == [5.0], "同一出口失败一次后等 5s 再试"
+    assert events == ["retry", "switch", "backup_used"]
+    assert len(outcomes) == 3 and [s for s, _ in planned] == ["main", "backup"]
+
+
+def test_deliver_over_outlets_reports_total_failure_once():
+    """所有出口都失败：返回 False 并给一次 give_up（调用方据此**只入队一次**）。"""
+    events: list[str] = []
+
+    async def scenario():
+        async def send(session, plan):
+            return models.DeliveryOutcome(session=session, ok=False, attempts=1, error="dead")
+
+        return await deliver.deliver_over_outlets(
+            ["main", "backup"], _plan_for, send, attempts=1,
+            on_event=lambda kind, payload: events.append(kind),
+        )
+
+    ok, outcomes, planned = asyncio.run(scenario())
+    assert ok is False and len(outcomes) == 2 and len(planned) == 2
+    assert events == ["switch", "switch", "give_up"]
+
+
+def test_deliver_over_outlets_survives_empty_plan_and_plan_error():
+    """计划为空或构造抛异常只跳过该出口，后面的出口照用（不能把整条链路带走）。"""
+    calls: list[str] = []
+
+    async def scenario():
+        def build(session):
+            if session == "boom":
+                raise RuntimeError("builder failed")
+            if session == "silent":
+                return deliver.SendPlan(session=session, kind="skip", reason="IGNORE 仅入库")
+            return _plan_for(session)
+
+        async def send(session, plan):
+            calls.append(session)
+            return models.DeliveryOutcome(session=session, ok=True, attempts=1)
+
+        return await deliver.deliver_over_outlets(
+            ["boom", "silent", "main"], build, send, attempts=1
+        )
+
+    ok, outcomes, planned = asyncio.run(scenario())
+    assert ok is True and calls == ["main"] and [s for s, _ in planned] == ["main"]

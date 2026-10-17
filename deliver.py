@@ -470,23 +470,104 @@ def render_burst(payload: dict) -> str:
     return "\n".join(lines)
 
 
-def all_delivered(outcomes) -> bool:
-    """所有目标的投递是否都成功（``remediation_runs.receipt_sent`` 的判定规则）。
+def outlet_order(sessions) -> list[str]:
+    """出口顺序：**列表即优先级**（第 1 个是主出口），去空白、去重、保序。
 
-    为什么落在投递层：``main`` 拿到的是「每个会话一个 :class:`DeliveryOutcome`」，但主循环
-    在本库没有测试夹具（``main.py`` 顶部 import astrbot）⇒ 把这条判定抽成纯函数，由
-    ``tests/test_deliver.py`` 直接钉住，main 只负责把结果列表递进来。
+    2026-10-18 运营方定案：告警改走 QQ（私聊为主、测试群为备），微信撤出。
+    出口列表从「都发一遍」变成「按序 fallback」，所以顺序本身是语义。
+    """
+    chain: list[str] = []
+    for raw in sessions or []:
+        text = str(raw or "").strip()
+        if text and text not in chain:
+            chain.append(text)
+    return chain
 
-    Args:
-        outcomes: 每个目标的投递结果（读它们的 ``ok``）。
 
-    Returns:
-        非空且全部 ``ok`` 才为 True；**空列表为 False** —— 没发出去就等于没告诉人。
-        进 ``pending_delivery`` 的重试不会回头补记（重试发的是投递计划，不再经过回执构造），
-        所以这个 True 的含义是「首次投递就把回执交给了通道」。
+def delivered(outcomes) -> bool:
+    """**至少一个出口**把消息交出去了 ⇒ 算送达。
+
+    为什么不是「全部成功」：投递模型从"双发到每个目标"改成"按优先级 fallback"
+    （2026-10-18 定案）—— 成功路径上 ``outcomes`` 里通常只有一条记录，用「全部成功」
+    会把"主出口失败、备出口成功"误判成没送达（``remediation_runs.receipt_sent`` 会恒 0）。
+    空列表 = 没有出口发出 ⇒ 没告诉人。
     """
     items = list(outcomes or [])
-    return bool(items) and all(bool(getattr(item, "ok", False)) for item in items)
+    return any(bool(getattr(item, "ok", False)) for item in items)
+
+
+async def deliver_over_outlets(
+    sessions,
+    build_plan,
+    send,
+    *,
+    attempts: int = 1,
+    delay=None,
+    sleep=None,
+    on_event=None,
+) -> tuple[bool, list, list]:
+    """按出口顺序投递：主出口成功即停；每个出口最多 ``attempts`` 次尝试，用尽才切下一个。
+
+    为什么放在这里而不是 main：顺序、预算、何时切出口都是纯逻辑，用注入的 ``send``/``sleep``
+    就能逐条钉住（``tests/test_deliver.py``）；``main`` 只把真实发送函数接进来
+    （唯一发送者仍是 ``main._send_plan``）。
+
+    Args:
+        sessions: 出口列表（前为优先），见 :func:`outlet_order`。
+        build_plan: ``(session) -> SendPlan``；返回 None 或 ``plan.empty`` 表示这个出口这轮不发。
+        send: ``async (session, plan) -> DeliveryOutcome``。
+        attempts: 每个出口的最多尝试次数（含首次；配置键 ``delivery_max_attempts``）。
+        delay: ``(attempt) -> float`` 第 attempt 次失败后等多久；None 表示不等待。
+        sleep: ``async (seconds) -> None``；生产传 ``asyncio.sleep``。
+        on_event: ``(kind, payload) -> None`` 观测点：``retry`` / ``switch`` / ``backup_used``
+            / ``skipped`` / ``plan_error`` / ``give_up``（main 用它写日志）。
+
+    Returns:
+        ``(是否有出口成功, 每次尝试的结果, 每轮的 (出口, 计划))``；第三个元素供调用方
+        记账与入队（全失败时只入队一次，别再按出口堆 abandoned）。
+    """
+    chain = outlet_order(sessions)
+    budget = max(1, int(attempts or 1))
+    outcomes: list = []
+    planned: list[tuple[str, object]] = []
+
+    def _emit(kind: str, **payload) -> None:
+        if on_event is not None:
+            on_event(kind, payload)
+
+    for index, session in enumerate(chain):
+        try:
+            plan = build_plan(session)
+        except Exception as exc:  # 构造计划失败只跳过这个出口，别把整条链路带走
+            _emit("plan_error", session=session, error=f"{type(exc).__name__}: {exc}")
+            continue
+        if plan is None or getattr(plan, "empty", False):
+            _emit("skipped", session=session)
+            continue
+        planned.append((session, plan))
+        for attempt in range(1, budget + 1):
+            outcome = await send(session, plan)
+            outcomes.append(outcome)
+            if getattr(outcome, "ok", False):
+                if index:
+                    _emit("backup_used", session=session, index=index)
+                return True, outcomes, planned
+            if attempt < budget:
+                wait = float(delay(attempt) or 0.0) if delay is not None else 0.0
+                _emit(
+                    "retry",
+                    session=session,
+                    attempt=attempt,
+                    budget=budget,
+                    wait=wait,
+                    error=str(getattr(outcome, "error", "")),
+                )
+                if sleep is not None and wait > 0:
+                    await sleep(wait)
+        _emit("switch", session=session, index=index, budget=budget)
+    if outcomes:
+        _emit("give_up", tried=len(planned))
+    return False, outcomes, planned
 
 
 def strip_plan_markers(text: str) -> str:

@@ -11,10 +11,10 @@
     "invisible": true
   },
   "target_sessions": {
-    "description": "主动提醒会话",
+    "description": "主动提醒会话（按优先级）",
     "type": "list",
     "default": [],
-    "hint": "命中日志时把提醒主动发到这些会话。填 unified_msg_origin：群 BOT1:group:10001、私聊 BOT1:private:10002；可填多个。误配后果：留空 = 只扫描不发送（含修复回执也发不出）。"
+    "hint": "命中日志时把提醒主动发到这些会话。**列表即优先级**：第 1 个是主出口，只有它失败（含重试）才发第 2 个 —— 不再「两个都发」。填 unified_msg_origin：群 BOT1:group:10001、私聊 BOT1:private:10002；可填多个。误配后果：留空 = 只扫描不发送（含修复回执也发不出）；只填一个 = 没有冗余出口。"
   },
   "send_mode": {
     "description": "提醒形态",
@@ -436,10 +436,10 @@
     "invisible": true
   },
   "delivery_max_attempts": {
-    "description": "最大重试次数",
+    "description": "单出口最大尝试次数",
     "type": "int",
-    "default": 4,
-    "hint": "1-20，单条消息最多重试次数（失败进重试队列，绝不静默丢）。误配后果：过小=抖动即放弃。"
+    "default": 2,
+    "hint": "1-20，**每个出口**最多尝试几次（默认 2 = 初投 + 1 次重试）；用尽后切 `target_sessions` 里的下一个出口，全部出口都失败才进重试队列。误配后果：=1 表示失败即切下一个出口；过大=出口死掉时白等（2026-10-18 实测：固定 4 连重试下 92 条入队、82 条耗尽、**0 次重试成功**）。"
   },
   "delivery_base_delay_seconds": {
     "description": "重试退避基数（秒）",

@@ -676,9 +676,8 @@ class LogWatcherPlugin(Star):
                 f"历史未送达：待重试 {backlog.get('active', 0)} 条、已放弃 "
                 f"{backlog.get('abandoned', 0)} 条（见 plugin_data/{PLUGIN_NAME}）"
             )
-        all_ok = True
-        for session in self._sessions():
-            plan = deliver.build_send_plan(
+        all_ok, outcomes, planned = await self._deliver_outlets(
+            lambda session: deliver.build_send_plan(
                 verdict,
                 self._deliver_config(),
                 session,
@@ -686,26 +685,32 @@ class LogWatcherPlugin(Star):
                 excerpt=excerpt,
                 caps=self._caps_for(session),
                 extra_note=note,
-            )
-            if plan.empty:
-                logger.debug(f"{self._plat(session)}本轮不再发送：{plan.reason}")
-                continue
-            outcome = await self._send_plan(session, plan)
+            ),
+            "日志提醒",
+        )
+        ok_sessions = {item.session for item in outcomes if item.ok}
+        for session, plan in planned:
             # 降级提示无论成败都要可见：失败轮次的操作者更需要知道发的是降级形态
             for hint in plan.degradation:
-                if outcome.ok:
+                if session in ok_sessions:
                     logger.info(f"{self._plat(session)}投递提示：{hint}")
                 else:
                     logger.warning(f"{self._plat(session)}投递提示（本轮失败）：{hint}")
-            if outcome.ok:
-                self.counters.bump("delivery_ok")
-                self._bump_delta("delivery_ok")
-            else:
-                all_ok = False
-                await self._enqueue_failure(session, plan, verdict, outcome, now)
+        if not outcomes:
+            # 所有出口这轮都不发（计划为空）：不算失败，也不清摘录存档
+            all_ok = True
+        elif all_ok:
+            self.counters.bump("delivery_ok")
+            self._bump_delta("delivery_ok")
+        else:
+            self.counters.bump("delivery_failed")
+            self._bump_delta("delivery_failed")
+            session, plan = planned[0]
+            await self._enqueue_failure(session, plan, verdict, outcomes[-1], now)
         logger.info(
             f"{self._plat()}命中 {hits} 条日志（{len(sendable)} 段），"
-            f"投递 {len(self._sessions())} 个会话，成功：{'是' if all_ok else '否'}"
+            f"出口 {len(self._sessions())} 个（尝试 {len(outcomes)} 次），"
+            f"成功：{'是' if all_ok else '否'}"
         )
         if all_ok and self._round_excerpt is not None and self._excerpt_mode() != "file":
             # ledger_only：成功即回收（成功残留不留垃圾）；file 模式保留给人工取证
@@ -757,14 +762,60 @@ class LogWatcherPlugin(Star):
         outcome.ok = True
         return outcome
 
-    async def _send_receipt(
+    async def _deliver_outlets(self, build_plan, label: str):
+        """按出口顺序投递（2026-10-18 定案）：主出口成功即停，失败才走备用出口；
+        每个出口最多 ``delivery_max_attempts`` 次尝试（默认 2 = 初投 + 1 次重试）。
+
+        与旧行为的差别（为什么改）：从前是「每个目标都发一遍、各自失败各自进重试队列」——
+        两个出口都通时你会**两处都收到**（重复打扰），出口死掉时又各自堆 ``abandoned``。
+        现在**列表即优先级**，第一个成功就停。
+
+        Args:
+            build_plan: ``(session) -> SendPlan``。
+            label: 日志里的业务名（如「日志提醒」）。
+
+        Returns:
+            :func:`deliver.deliver_over_outlets` 的三元组。
+        """
+        return await deliver.deliver_over_outlets(
+            self._sessions(),
+            build_plan,
+            self._send_plan,
+            attempts=self.retry_policy.max_attempts,
+            delay=lambda attempt: deliver.next_delay(attempt, self.retry_policy),
+            sleep=asyncio.sleep,
+            on_event=lambda kind, payload: self._log_delivery_event(kind, payload, label),
+        )
+
+    def _log_delivery_event(self, kind: str, payload: dict, label: str) -> None:
+        """把出口链的观测点写成一行一事件的日志（便于 grep 归因）。"""
+        plat = self._plat(str(payload.get("session", "")))
+        if kind == "retry":
+            logger.warning(
+                f"{plat}{label}第 {payload.get('attempt')}/{payload.get('budget')} 次失败，"
+                f"{float(payload.get('wait') or 0):.0f}s 后在同一出口重试：{payload.get('error')}"
+            )
+        elif kind == "switch":
+            logger.warning(f"{plat}{label}该出口 {payload.get('budget')} 次均失败，切下一个出口")
+        elif kind == "backup_used":
+            logger.info(
+                f"{plat}{label}主出口未成功，已改用第 {int(payload.get('index', 0)) + 1} 个出口"
+            )
+        elif kind == "give_up":
+            logger.error(f"{self._plat()}{label}所有出口均失败（试过 {payload.get('tried')} 个）")
+        elif kind == "plan_error":
+            logger.warning(f"{plat}{label}构造投递计划失败，跳过该出口：{payload.get('error')}")
+        elif kind == "skipped":
+            logger.debug(f"{plat}{label}本轮不进这个出口（计划为空）")
+
+    def _receipt_plan(
         self,
         session: str,
         run: RemediationRun,
         verdict: ThreatVerdict,
         *,
         gate_reason: str = "",
-    ) -> DeliveryOutcome:
+    ) -> SendPlan:
         """§4.6 + 用户定案 B：修复回执（渠道/方案/判定/诊断/改动清单/建议/轨迹）。
 
         ``build_receipt`` 是回执格式的唯一实现（remediate.py）；模块缺失时退化为最小
@@ -777,7 +828,7 @@ class LogWatcherPlugin(Star):
             gate_reason: 被闸门拦下时的原因（§4.5 枚举；成功时为 ``ok``）。
 
         Returns:
-            投递结果；失败同样进待重试队列（不静默丢）。
+            该出口的发送计划（只构造、不发送；发送与 fallback 由 ``_send_receipt`` 走出口链）。
         """
         text = ""
         builder = self._receipt_builder()
@@ -798,11 +849,31 @@ class LogWatcherPlugin(Star):
                 f"摘要：{run.summary or '（无）'}\n"
                 f"轨迹：{run.log_path or '（无轨迹：未创建子进程）'}"
             )
-        plan = SendPlan(session=session, kind="text", chunks=[text])
-        outcome = await self._send_plan(session, plan)
-        if not outcome.ok:
+        return SendPlan(session=session, kind="text", chunks=[text])
+
+    async def _send_receipt(
+        self, run: RemediationRun, verdict: ThreatVerdict, *, gate_reason: str = ""
+    ) -> tuple[bool, list]:
+        """把修复回执按出口链投出去（主出口失败才走备用出口）。
+
+        为什么回执也要 fallback：用户定案 B —— 每次修复尝试都必须让运营方知道结果
+        （「未改动」也不许省略）。一个出口死了，另一个还能把回执送到。
+
+        Returns:
+            ``(是否有出口成功, 每次尝试的结果)``；全失败时按**主出口**入队一次
+            （不再按出口各堆一条，避免历史那种 81 条 abandoned）。
+        """
+        all_ok, outcomes, planned = await self._deliver_outlets(
+            lambda session: self._receipt_plan(
+                session, run, verdict, gate_reason=gate_reason
+            ),
+            "修复回执",
+        )
+        if not all_ok and planned:
+            session, plan = planned[0]
+            outcome = outcomes[-1] if outcomes else DeliveryOutcome(session=session)
             await self._enqueue_failure(session, plan, verdict, outcome, time.time())
-        return outcome
+        return all_ok, outcomes
 
     def _receipt_builder(self):
         """remediate.build_receipt 的惰性入口（模块缺失返回 None）。"""
@@ -849,8 +920,7 @@ class LogWatcherPlugin(Star):
             exit_code=None,
             summary=f"修复闸拦截（{gate_reason}）：未创建子进程",
         )
-        for session in self._sessions():
-            await self._send_receipt(session, run, verdict, gate_reason=gate_reason)
+        await self._send_receipt(run, verdict, gate_reason=gate_reason)
 
     async def _enqueue_failure(
         self,
@@ -1119,19 +1189,22 @@ class LogWatcherPlugin(Star):
         """把聚合结果发给所有会话（失败同样进重试队列）。"""
         if not self._sessions():
             return
-        for session in self._sessions():
-            plan = SendPlan(session=session, kind="text", chunks=[text])
-            outcome = await self._send_plan(session, plan)
-            if outcome.ok:
-                self.counters.bump("delivery_ok")
-                self._bump_delta("delivery_ok")
-                continue
+        all_ok, outcomes, planned = await self._deliver_outlets(
+            lambda session: SendPlan(session=session, kind="text", chunks=[text]),
+            "聚合摘要",
+        )
+        if all_ok:
+            self.counters.bump("delivery_ok")
+            self._bump_delta("delivery_ok")
+            return
+        if planned:
+            session, plan = planned[0]
             verdict = ThreatVerdict(
                 severity=severity,
                 fingerprint=f"{route.value}-{int(now)}",
                 route=route,
             )
-            await self._enqueue_failure(session, plan, verdict, outcome, now)
+            await self._enqueue_failure(session, plan, verdict, outcomes[-1], now)
 
     async def _maybe_remediate(
         self, block: LogBlock, verdict: ThreatVerdict, now: float
@@ -1176,13 +1249,9 @@ class LogWatcherPlugin(Star):
             f"（{run.summary or '无摘要'}）指纹 {verdict.fingerprint}"
         )
         if bool(self.config.get("remediation_receipt", True)):
-            outcomes = []
-            for session in self._sessions():
-                outcomes.append(
-                    await self._send_receipt(
-                        session, run, verdict, gate_reason=gate.reason or "ok"
-                    )
-                )
+            _, outcomes = await self._send_receipt(
+                run, verdict, gate_reason=gate.reason or "ok"
+            )
             self._mark_receipt_sent(run, outcomes)
 
     def _mark_receipt_sent(self, run: RemediationRun, outcomes: list) -> None:
@@ -1194,14 +1263,14 @@ class LogWatcherPlugin(Star):
         ``20261018-dispatch-dev-receipt-sent.md``）。
 
         只置 1、不置 0：本方法只在发送成功时被调用；失败路径保持 finish 写入的 0
-        （进 ``pending_delivery`` 重试；重试不补记，见 ``deliver.all_delivered``）。
+        （进 ``pending_delivery`` 重试；重试不补记，见 ``deliver.delivered``）。
 
         Args:
             run: 本次 run（``run_id`` 为空说明账本没建行，跳过）。
             outcomes: 每个目标会话的投递结果。
         """
         run_id = str(getattr(run, "run_id", "") or "")
-        if not run_id or not deliver.all_delivered(outcomes):
+        if not run_id or not deliver.delivered(outcomes):
             return
         marker = getattr(self.ledger, "mark_receipt_sent", None)
         if not callable(marker):

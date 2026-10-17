@@ -205,7 +205,7 @@ class RemediationRun:
     artifact: str = ""
     log_path: str = ""
     #: 本次 run 在 ``remediation_runs`` 里的主键；账本没建行（``ledger=None`` 或 begin 失败）时为空。
-    #: main 靠它把「回执真的发出去了」写回同一行（``receipt_sent``），见 ``deliver.all_delivered``。
+    #: main 靠它把「回执真的发出去了」写回同一行（``receipt_sent``），见 ``deliver.delivered``。
     run_id: str = ""
 
     def to_dict(self) -> dict:

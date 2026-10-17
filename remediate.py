@@ -1125,7 +1125,7 @@ class RemediationLedger:
     def mark_receipt_sent(self, run_id: str) -> None:
         """把「回执已送达」写回账本（只动 ``receipt_sent`` 一列；失败只记 warning）。
 
-        调用时机：``main`` 把回执**真的**投出去之后（``deliver.all_delivered`` 为真）。
+        调用时机：``main`` 把回执**真的**投出去之后（``deliver.delivered`` 为真）。
         路径缺失或 ``run_id`` 为空一律静默跳过 —— 记账不该影响投递。
         """
         if not run_id:

@@ -90,7 +90,7 @@ grep -a "日志监听启动" /root/AstrBot/data/logs/astrbot.log | tail -1
 |---|---|---|---|
 | `log_with_bot_id` | bool | `false` | 开启后插件日志会带 [platform:平台ID]，多 Bot 环境便于定位；平台 ID 取自提醒会话的 unified_msg_origin 前缀。 |
 | **=== 主动提醒 ===** | | | |
-| `target_sessions` | list | `[]` | 命中日志时把提醒主动发到这些会话。填 unified_msg_origin：群 BOT1:group:10001、私聊 BOT1:private:10002；可填多个。 |
+| `target_sessions` | list | `[]` | 命中日志时把提醒主动发到这些会话。**列表即优先级**：第 1 个是主出口，只有它失败才发第 2 个（不是双发）。填 unified_msg_origin：群 BOT1:group:10001、私聊 BOT1:private:10002。 |
 | `send_mode` | string | `"auto"` | auto = 按通道能力选（默认）；text = 只发纯文本分片；forward = 优先合并转发（通道不支持时自动退回文本）。注意：旧配置里的 file/txt 会被映射成 text —— weixin_oc 通道只有 Plain 文本能送达，File 会被服务端 prepare 失败、No… |
 | `prefer_forward` | bool | `false` | 通道同时支持文本与转发时优先用合并转发。 |
 | `notify_min_severity` | string | `"MEDIUM"` | 即时告警的最低等级（五级）。低于它的判定只进摘要或静默。 |
@@ -362,18 +362,23 @@ time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- 
 > **每一次修复尝试都必须向 `target_sessions` 推送一条回执**，含没修成的那些；
 > **「未改动」不许省略**；**被闸拦下必须写明被哪一道闸拦下 + 后续怎么办**。
 
-代码落点：`remediate.build_receipt`（remediate.py:1610）是唯一实现；`main._send_receipt`（main.py:754）
-负责投递；两条调用路径覆盖全部终态：
+代码落点：`remediate.build_receipt`（remediate.py:1610）是唯一实现；`main._receipt_plan`（main.py:811）
+构造某出口的回执计划，`main._send_receipt`（main.py:854）按**出口链**投出去；两条调用路径覆盖全部终态：
 
 | 路径 | 覆盖状态 | 代码位置 |
 |---|---|---|
-| 闸门拦截 | `skipped` / `blocked` / `unavailable` | `main._maybe_remediate` → `_send_terminal_receipt`（main.py:1143 / 822） |
-| 执行器返回（含异常兜底） | `ok` / `failed` / `timeout` / `unavailable` / `rejected` | `main._maybe_remediate` → `_send_receipt`（main.py:1174） |
+| 闸门拦截 | `skipped` / `blocked` / `unavailable` | `main._maybe_remediate` → `_send_terminal_receipt` |
+| 执行器返回（含异常兜底） | `ok` / `failed` / `timeout` / `unavailable` / `rejected` | `main._maybe_remediate` → `_send_receipt` |
+
+**出口链与重试**（2026-10-18 运营方定案）：`deliver.outlet_order`（deliver.py:473）保序去重，
+列表第 1 个是主出口；`deliver.deliver_over_outlets`（deliver.py:499）逐个出口试
+`delivery_max_attempts` 次（默认 **2** = 初投 + 1 次重试，配置里可改），用尽才切下一个出口，
+**第一个成功就停**（不再"两处都收到"）；全部失败才按主出口入队一次。
 
 **`remediation_runs.receipt_sent` 的含义与更新时机**（2026-10-18 起）：
 
-- 含义：**首次投递就把回执交给了通道**才为 1。判定规则＝`deliver.all_delivered`（每个目标会话
-  的 `DeliveryOutcome.ok` 全为真、且目标非空）；`main._mark_receipt_sent` 在投递成功后补写那一列。
+- 含义：**首次投递就把回执交给了通道**才为 1。判定规则＝`deliver.delivered`（**任一出口**
+  的 `DeliveryOutcome.ok` 为真；空列表 = 没告诉人）；`main._mark_receipt_sent` 在投递成功后补写那一列。
 - 为什么不是 `finish` 写的：finish 发生在回执**之前**（回执要等 run 结束），设计里留的
   「发完再覆盖」此前一直没人接 ⇒ 该字段恒 0（7/7 行），看上去像「从没通知过运营方」。
 - 不会置 1 的两种情况：进 `pending_delivery` 的重试（重试发的是投递计划，不再经过回执构造）；
