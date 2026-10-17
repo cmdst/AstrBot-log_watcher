@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### 变更（策略 · 2026-10-17）
+
+- **「一行不被任何规则认识的 ERROR」不再等于一条微信**（`classify.py`）：本地模式下
+  `unmatched_error` 的落点从硬编码 `MEDIUM` 改为可配的 `unmatched_severity`，**默认 `LOW`**
+  （进摘要台账，不再即时推送）；「噪声规则只解释了一部分命中行」时的抬升（原
+  `severity_max(…, MEDIUM)`）同步改抬到 `unmatched_severity`，否则这里留一条刷屏缝。
+  **取证**：重放 2026-10-16 全天 = 98 片段 → 95 条 `notify`，其中 **95 条没有任何硬失败信号**；
+  生产台账（10-14~10-17）共 85 条推送，命中硬失败规则的 **0 条**；最小复现 = 一行 ERROR + 零上下文。
+  改动后同一天重放 = 56 条 notify。**可逆**：`unmatched_severity = "MEDIUM"` 一步回到旧行为（重放 95 条）。
+- **新增两个等级旋钮**（`classify.py` 本地判定 + `_conf_schema.json`）：`unmatched_severity`
+  （默认 `LOW`）、`transient_severity`（默认 `MEDIUM`）。为什么 `transient_severity` **默认不动**：
+  验收用例 `TRANS-01-provider-retry` 的 notes 明写「压成 LOW = 漏报」，默认值属于契约，不得由实现侧下调；
+  运营方要在自己通道上把 provider 抖动从「即时推送」改到「摘要」，改配置即可（实测：`transient_severity="LOW"`
+  → 同日 notify 0 条、摘要 18 条；再把 `digest_interval_seconds` 调到 6 h → 合计 5 条/天）。
+- 回归测试五处（`tests/test_classify.py`）：`test_unmatched_error_line_is_not_ignored`（改为 LOW+DIGEST，
+  仍断言带标签与证据）、`test_unmatched_severity_is_reversible_and_typo_safe`、
+  `test_noise_line_with_unmatched_error_goes_to_digest`、`test_transient_retry_keeps_contract_baseline`
+  （守住 TRANS-01 基线）、`test_transient_severity_tunable_to_digest`。
+- **已知未闭合**：LLM 判定不可用时的降级地板仍是 `max(本地判定, fallback_severity)`，默认 `MEDIUM`
+  （由 `test_degraded_verdict_is_conservative_even_if_config_says_ignore` 钉住）⇒ provider 挂掉的那段时间，
+  噪声会沿降级路径回来（台账里带 `llm-unconfigured`/`llm-timeout`/`degraded` 标签的推送占少数）。
+
 ### 新增
 
 - **本地噪声规则 `agent-tool-path-miss`**（`classify.py`）：`computer_tools.*` 的

@@ -421,16 +421,68 @@ def test_critical_level_line_forces_critical() -> None:
     assert "level:CRITICAL" in verdict.reason
 
 
-def test_unmatched_error_line_is_not_ignored() -> None:
-    block = make_block(
+def _unmatched_error_block() -> LogBlock:
+    """一行谁都不认识的 ERROR（2026-10-16 生产实测：一天 95 条这样的块直推微信）。"""
+    return make_block(
         [
             "[2026-10-13 11:00:00.000] [Core] [ERRO] [v4.28.2] [core.unknown.module:42]: "
             "出现了没有任何规则覆盖的怪异错误状态码 4711",
         ]
     )
-    verdict = classify_block(block)
-    assert verdict.severity is Severity.MEDIUM
+
+
+def test_unmatched_error_line_is_not_ignored() -> None:
+    """未被任何规则解释的 ERROR：仍然被看见（留摘录、带标签），但只进摘要，不即时推送。
+
+    **2026-10-17 的策略变更（运营方决定）**：此前这一族直接判 MEDIUM，而 MEDIUM 的最小
+    含义是「立刻推一条微信」；生产实测 24 h 内 95 条推送里 95 条都属于这一族。
+    恢复旧行为是一条配置：``unmatched_severity = "MEDIUM"``（见下方可逆性用例）。
+    """
+    verdict = classify_block(_unmatched_error_block())
+    assert verdict.severity is Severity.LOW
+    assert verdict.route is Route.DIGEST
     assert "local-mode:unmatched-error" in verdict.tags
+    assert verdict.evidence.strip()
+    assert verdict.reason.strip()
+
+
+def test_unmatched_severity_is_reversible_and_typo_safe() -> None:
+    """可逆性 + 笔误安全：MEDIUM 回到旧行为；非法值回落 LOW（笔误不得把安静变成打扰）。"""
+    block = _unmatched_error_block()
+    restored = classify_block(block, cfg={"unmatched_severity": "MEDIUM"})
+    assert restored.severity is Severity.MEDIUM
+    assert restored.route is Route.NOTIFY
+    assert classify_block(block, cfg={"unmatched_severity": "LWO"}).severity is Severity.LOW
+
+
+def test_noise_line_with_unmatched_error_goes_to_digest() -> None:
+    """一致性：噪声规则只解释了一部分命中行时，同样只进摘要（否则这里留一条刷屏缝）。"""
+    lines = [
+        asyncio_future_block().lines[0],  # 已知噪声行
+        "[2026-10-13 11:00:01.000] [Core] [ERRO] [v4.28.2] [core.unknown.module:43]: "
+        "另一个没人认识的错误 4712",
+    ]
+    verdict = classify_block(make_block(lines))
+    assert verdict.severity is Severity.LOW
+    assert verdict.route is Route.DIGEST
+    assert "local-mode:unmatched-error" in verdict.tags
+
+
+def test_transient_retry_keeps_contract_baseline() -> None:
+    """验收基线（TRANS-01-provider-retry）：可恢复抖动的默认等级仍是 MEDIUM + notify。
+
+    这条基线来自 architecture §4.1 与用例 notes「压成 LOW = 漏报」，本次改动**不得**带跑它。
+    """
+    verdict = classify_block(provider_retry_block())
+    assert verdict.severity is Severity.MEDIUM
+    assert verdict.route is Route.NOTIFY
+
+
+def test_transient_severity_tunable_to_digest() -> None:
+    """运营方旋钮：``transient_severity = "LOW"`` ⇒ 抖动只进摘要，provider 抖动不再刷聊天。"""
+    verdict = classify_block(provider_retry_block(), cfg={"transient_severity": "LOW"})
+    assert verdict.severity is Severity.LOW
+    assert verdict.route is Route.DIGEST
 
 
 def test_warning_only_block_stays_low() -> None:

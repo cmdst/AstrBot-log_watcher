@@ -110,6 +110,8 @@ CHANGELOG 里 v1 关于 `forward` 形态可用的说法已删除。
 | `classify_enable` | `true` | 不动 | 关掉会退回"按等级直灌" |
 | `classify_provider_id` | `""` | 有 provider 就填 | 留空 = 只用本地规则 |
 | `notify_min_severity` | `MEDIUM` | 不动 | 低于它的判定只进摘要或静默 |
+| `unmatched_severity` | `LOW` | 不动（要旧行为才填 `MEDIUM`） | 「谁都不认识」的 ERROR 判成几级：默认只进摘要，不再即时推 |
+| `transient_severity` | `MEDIUM` | 嫌 provider 抖动吵就填 `LOW` | 可恢复抖动（503/重试中）判成几级；默认保持验收基线 TRANS-01 |
 | `remediation_enable` | **`false`** | 确认前置条件后再开 | 总开关；开着才有紧急修复 |
 | `remediation_permission_mode` | `workspace-write` | 不动 | 只接受 `read-only`/`workspace-write` |
 | `remediation_daily_limit` | `5` | 不动 | 每日修复上限（跨重启持久） |

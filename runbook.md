@@ -114,6 +114,8 @@ grep -a "日志监听启动" /root/AstrBot/data/logs/astrbot.log | tail -1
 | `classify_timeout_seconds` | int | `20` | 5-300，单次 LLM 判定超时。 |
 | `classify_system_prompt` | text | `""` | 覆盖内置提示词（留空用 prompts/classify_system.md）。 |
 | `fallback_severity` | string | `"MEDIUM"` | 降级地板（五级）：LLM 不可用/超时/输出非法时取 max(本地判定, 该值)。 |
+| `unmatched_severity` | string | `"LOW"` | 本地模式「有 ERROR 等级但没有任何规则能解释」的等级。默认 LOW = 只进摘要、不即时推送；填 `MEDIUM` 恢复旧行为（2026-10-16 实测：一天 95 条这样的块直推微信）。 |
+| `transient_severity` | string | `"MEDIUM"` | 本地模式可恢复抖动（上游 503 / 框架重试中）的等级。默认 MEDIUM = 验收基线（用例 TRANS-01，notes 写着「压成 LOW = 漏报」）；填 `LOW` = 抖动只进摘要。 |
 | `llm_max_block_lines` | int | `80` | 5-500，送 LLM 的最大行数。 |
 | `llm_max_calls_per_round` | int | `5` | 0-1000，单轮 LLM 调用上限（0 = 不限，不推荐）。 |
 | `llm_max_calls_per_hour` | int | `60` | 0-100000，每小时 LLM 调用上限（0 = 不限）。 |

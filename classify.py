@@ -578,6 +578,24 @@ def cfg_first(cfg: Mapping | object | None, *keys: str, default: Any = None) -> 
     return default
 
 
+def _severity_cfg(cfg: Mapping | object | None, key: str, default: Severity) -> Severity:
+    """读本地模式的等级地板（``unmatched_severity`` / ``transient_severity``）。
+
+    为什么不用 ``Severity.parse(value)`` 的默认值：它的回落是 MEDIUM，一次笔误
+    （``"LWO"``）会把「安静」变成「打扰」。这里显式传 default，缺键或非法值都回到
+    代码里写明的那个等级。
+
+    Args:
+        cfg: 插件配置，可为 None。
+        key: 配置键名。
+        default: 键缺失或值非法时的回落等级。
+
+    Returns:
+        规整后的等级。
+    """
+    return Severity.parse(cfg_get(cfg, key, None), default)
+
+
 def _metrics_int(metrics: Mapping | None, key: str, default: int = 0) -> int:
     """从 metrics 里取一个非负整数。"""
     try:
@@ -597,7 +615,9 @@ def classify_block(
         block: 日志片段。
         metrics: 可选上下文统计，支持的键：``repeat_count``（窗口内同指纹出现次数）、
             ``component``（覆盖组件名）。
-        cfg: 可选配置，支持 ``route_map``（等级 → 去向覆写）。
+        cfg: 可选配置，支持 ``route_map``（等级 → 去向覆写）、``unmatched_severity``
+            （未被任何规则解释的错误行的等级，默认 LOW）、``transient_severity``
+            （可恢复抖动族的等级，默认 MEDIUM）。
 
     Returns:
         与 LLM 判定同形状的 :class:`ThreatVerdict`。
@@ -610,13 +630,21 @@ def classify_block(
         severity = severity_max(*(rule.severity for rule in signals.noises))
         confidence = max(rule.confidence for rule in signals.noises)
         if signals.unmatched_error:
-            # 噪声规则只解释了一部分命中行，剩下的错误行必须被看见
-            severity = severity_max(severity, Severity.MEDIUM)
+            # 噪声规则只解释了一部分命中行，剩下的错误行必须被看见 —— 但不必被吵醒。
+            # 2026-10-17 起抬到 unmatched_severity（默认 LOW ⇒ 进摘要台账），不再抬到
+            # MEDIUM：MEDIUM 的最小含义是「立刻推微信」（见 notify_min_severity）。
+            severity = severity_max(
+                severity, _severity_cfg(cfg, "unmatched_severity", Severity.LOW)
+            )
     elif signals.transients:
-        severity = Severity.MEDIUM
+        # 可恢复抖动（上游 503 / 框架重试中）的地板。默认 MEDIUM = 既有验收基线
+        #（用例 TRANS-01-provider-retry 的期望值，未经运营方决定不得下调）；
+        # 运营方可用 transient_severity 调到 LOW，把抖动从「即时推送」改到「摘要」。
+        severity = _severity_cfg(cfg, "transient_severity", Severity.MEDIUM)
         confidence = max(rule.confidence for rule in signals.transients)
     elif signals.unmatched_error:
-        severity = Severity.MEDIUM
+        # 一行「不被任何规则认识」的 ERROR 不再等于一条微信：默认进摘要（2026-10-17 起的策略）。
+        severity = _severity_cfg(cfg, "unmatched_severity", Severity.LOW)
         confidence = 0.35
     elif any(level == "WARNING" for level in signals.levels):
         severity = Severity.LOW

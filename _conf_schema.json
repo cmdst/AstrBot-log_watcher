@@ -203,6 +203,46 @@
     ],
     "hint": "降级地板（五级）：LLM 不可用/超时/输出非法时取 max(本地判定, 该值)。误配后果：设 IGNORE 会被强制抬回 MEDIUM（不放行）；设 HIGH = provider 一抖就告警。"
   },
+  "unmatched_severity": {
+    "description": "未匹配错误的等级",
+    "type": "string",
+    "default": "LOW",
+    "options": [
+      "IGNORE",
+      "LOW",
+      "MEDIUM",
+      "HIGH",
+      "CRITICAL"
+    ],
+    "labels": [
+      "IGNORE",
+      "LOW",
+      "MEDIUM",
+      "HIGH",
+      "CRITICAL"
+    ],
+    "hint": "本地模式下「有 ERROR 等级但没有任何规则能解释」的片段判成几级。默认 LOW = 进摘要台账、不即时推送（2026-10-17 起的策略）；填 MEDIUM = 恢复旧行为「不认识就告警」。误配后果：填 MEDIUM/HIGH 会把无法归类的错误直灌聊天（实测一天 95 条）。"
+  },
+  "transient_severity": {
+    "description": "瞬态抖动的等级",
+    "type": "string",
+    "default": "MEDIUM",
+    "options": [
+      "IGNORE",
+      "LOW",
+      "MEDIUM",
+      "HIGH",
+      "CRITICAL"
+    ],
+    "labels": [
+      "IGNORE",
+      "LOW",
+      "MEDIUM",
+      "HIGH",
+      "CRITICAL"
+    ],
+    "hint": "本地模式下可恢复抖动（上游 503、框架重试中）判成几级。默认 MEDIUM = 即时告警（验收用例 TRANS-01-provider-retry 的基线）；填 LOW = 抖动只进摘要，provider 抖动不再刷聊天。误配后果：填 LOW 后真实的上游故障只在摘要里出现；填 HIGH/CRITICAL 会让抖动进修复候选。"
+  },
   "llm_max_block_lines": {
     "description": "送分级模型的最大行数",
     "type": "int",
