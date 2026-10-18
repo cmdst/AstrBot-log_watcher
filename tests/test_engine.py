@@ -14,6 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import tempfile
+
 _PLUGIN_DIR = Path(__file__).resolve().parents[1]
 _TESTS_DIR = Path(__file__).resolve().parent
 for _path in (_PLUGIN_DIR, _TESTS_DIR):
@@ -497,6 +499,30 @@ def test_engine_stats_are_a_snapshot() -> None:
     assert engine.stats()["local"] == 1
 
 
+def _run_pkg_import_probe(code: str, package: str) -> "subprocess.CompletedProcess[str]":
+    """在「父目录里有个名叫 <package> 的目录」的临时舞台里跑包子进程。
+
+    为什么需要舞台：包导入形态要求**父目录里那个目录名**就是合法包名。库的 clone 目录叫
+    ``AstrBot-log_watcher``（带连字符，不是合法标识符）⇒ 直接从库目录跑**必然**假失败
+    （`ModuleNotFoundError: No module named 'log_watcher'`；2026-10-19 fix 复跑 v2.1.0 时撞到，
+    这条红在库目录下每次都会出现）。这里在临时目录里造一个**字面叫 ``log_watcher`` 的符号链接**
+    指向真实插件目录，再以它为 cwd —— 断言照旧，且与仓库目录名无关。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp) / package
+        try:
+            staged.symlink_to(_PLUGIN_DIR, target_is_directory=True)
+        except (OSError, NotImplementedError):  # pragma: no cover - 极少数文件系统
+            pytest.skip(f"本机不允许建符号链接，跳过包导入形态（{package}）")
+        return subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=tmp,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
 @pytest.mark.parametrize("mode", ["flat", "package"])
 def test_modules_import_without_astrbot(mode: str) -> None:
     if mode == "flat":
@@ -505,21 +531,20 @@ def test_modules_import_without_astrbot(mode: str) -> None:
             " leaked = sorted(m for m in sys.modules if m.startswith('astrbot'));"
             " assert not leaked, leaked; print('offline-ok')"
         )
-        cwd = _PLUGIN_DIR
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(_PLUGIN_DIR),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
     else:
         code = (
             "import sys; import log_watcher.classify, log_watcher.engine;"
             " leaked = sorted(m for m in sys.modules if m.startswith('astrbot'));"
             " assert not leaked, leaked; print('pkg-ok')"
         )
-        cwd = _PLUGIN_DIR.parent
-    proc = subprocess.run(
-        [sys.executable, "-c", code],
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+        proc = _run_pkg_import_probe(code, "log_watcher")
     assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
     assert ("offline-ok" in proc.stdout) or ("pkg-ok" in proc.stdout)
 
