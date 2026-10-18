@@ -51,3 +51,11 @@
               low: low
               high: high
               max: max
+
+# 2026-10-18 补（fix lane）：dsh 升到 0.2.1-rc.2 后，headless profile 里
+# `credentials` 条目是 `disabled: true` ⇒ apiKeyEnv 指向的密钥无法从
+# ~/.dsh/.credentials.yaml 解析，通道以 MISSING_CREDENTIAL 秒退（实测）。
+# 这里显式启用凭据服务；密钥仍只存在于凭据库，本文件不含明文。
+- id: credentials
+  name: "@deepseek-ai/dsh-credentials-local"
+  disabled: false

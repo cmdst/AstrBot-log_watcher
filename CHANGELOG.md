@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### 修复（2026-10-18 · 六）：把「启用凭据服务」并进库里的 `dsh-headless-overlay.yml`
+
+dsh 升到 **0.2.1-rc.2** 后，headless profile 里 `credentials` 条目是 `disabled: true`（web 那份没禁）
+⇒ overlay 里 `apiKeyEnv: CODECOMMAND_API_KEY` 无法从 `~/.dsh/.credentials.yaml` 解析，
+**自动修复通道以 `MISSING_CREDENTIAL` 秒退**（修复链在真实候选上暴露的第二处阻断，fix 当晚定位）。
+
+- 生产副本由 fix 就地在文件末尾追加了 8 行（显式启用 `@deepseek-ai/dsh-credentials-local`，
+  **不含任何明文密钥**）——但**那是插件自带文件、库里有同名件**：不回填的话，**下次覆盖就把这处修复抹掉**。
+- 本提交把那 8 行**原样**并进库（`sed -n '54,61p'` 直取，先 `head -53 | diff` 证明库是副本的前缀才追加）；
+  复核：库与生产副本 **sha256 均为 `fd6f5e06…`、逐字节一致（61 行）**，`dsh --profile headless --dump-config`
+  **exit 0**（stderr 0 字节）。
+- **没有**跑付费的真实最小调用：库文件现在与 fix 刚验过的那份（exit 0 / 8.5 s / `CHANNEL-OK`）**逐字节相同**，
+  字节相等即证据可迁移；不为验收烧配额。
+- 教训（已进下级手册 §7-17）：**插件自带的 profile 叠加件也在"库 vs 生产副本"的对照面里** ——
+  只对照 `.py` 与 `_conf_schema.json` 会漏掉它，而它的漂移同样会在下一次覆盖时静默回退。
+
 ### 修复（2026-10-18 · 五）：上线自检发现的两处自伤
 
 部署当晚（06:22 出口迁移上线）做**自己的验收**时量出两件，都不是别人的问题：
