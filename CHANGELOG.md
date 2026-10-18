@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### 运维文档（2026-10-19 · 七）：轨迹截断的验收判据 ＋ 两条会被误读的「绿灯」
+
+真实误判风险来自一次运行良好的 run：`r20261018-234346-9503f842`（**ok / exit 0 / 511.2 s**）
+的轨迹文件**恰好等于上限 262144 字节** —— agent 在诊断里读了历史轨迹（含 21:11 那次失败记录），
+把输出顶到封顶，结尾的 `{"type":"final"}` 与 `turn_end` **都不在文件里**。
+
+- `runbook.md` §6.1 新增「轨迹被输出上限截断时怎么验收」：正确判据＝账本 `status='ok'` ＋
+  `summary` 非空（插件**流式**提取，不受截断影响）＋ `receipt_sent` 的**写回≠送达**语义 ＋
+  arena 之外零写入；文件尾的 `…（已截断）` 标记可用于**事后**判读。想保住整份轨迹就把
+  `remediation_max_output_bytes` 调到 `1048576`（面板保存即可）。
+- 同节补一条：`dsh --profile headless --dump-config` **exit 0 只证明"能组合"、不渲染提示词**
+  ⇒ 它绿 ≠ 真能跑（2026-10-18 的 `{{cwd}}` 与 `MISSING_CREDENTIAL` 两处阻断都是真跑才暴露的）。
+- 本次**只改文档**，未动一行业务代码、未改默认值（`remediation_max_output_bytes` 生产配置里
+  显式为 262144，改**默认值**不影响现网、只会制造库与副本的 schema 差异，故留给配置侧）。
+
 ### 修复（2026-10-18 · 六）：把「启用凭据服务」并进库里的 `dsh-headless-overlay.yml`
 
 dsh 升到 **0.2.1-rc.2** 后，headless profile 里 `credentials` 条目是 `disabled: true`（web 那份没禁）

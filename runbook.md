@@ -388,6 +388,20 @@ time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- 
    附 `transient-escalation-capped` 标签）⇒ 模型抬到 HIGH/CRITICAL 也**不会**触发自动修复。
    带 `failure:` 证据的（例如那次 GMI `import-error`）**不受影响**；人工覆写（`source=manual`）永不封顶。
 
+**轨迹被输出上限截断时怎么验收**（2026-10-19 定，来自一次真实误判风险）：
+`remediation_max_output_bytes`（默认 **262144** = 256 KiB）是**流式落盘上限**，超限会在文件尾追加
+标记 `…（已截断）` 并截断后续行 —— agent 若读了大文件（例如去比对历史轨迹），一次**成功** run
+的轨迹也可能**恰好封顶**，结尾的 `{"type":"final"}` 与 `turn_end` 就都不在文件里了（实测：
+`r20261018-234346-9503f842`，`ok` / `exit 0` / 511.2 s，文件恰为 262144 字节）。
+
+- **正确判据（按此验收，别再"看轨迹里有没有 `final`"）**：① 账本 `remediation_runs.status='ok'`；
+  ② 该行 `summary` 非空（插件**流式**提取结论，不受文件截断影响）；③ `receipt_sent` 的语义（见上：
+  **写回** ≠ **送达**；`remediation_receipt=false` 时仍写回但不投递）；④ arena 之外零写入。
+- 文件尾的 `…（已截断）` 标记可用于**事后**判读；想保住完整轨迹就把
+  `remediation_max_output_bytes` 调到 `1048576`（1 MiB，面板保存即可、无需停机）。
+- ⚠️ 同类"绿灯陷阱"：`dsh --profile headless --dump-config` **exit 0 只证明"能组合"、不渲染提示词**
+  ⇒ 它绿 ≠ 真能跑（2026-10-18 的 `{{cwd}}` 与 `MISSING_CREDENTIAL` 两处阻断都是**真跑**才暴露的）。
+
 **未送达汇总行**（Q14=c，2026-10-18 二次修正）：投递条目耗尽转 `abandoned` 的同时，**下一条成功投递**
 的尾部会带一行「最近 24 小时未送达：待重试 N 条、已放弃 M 条（最高 X 级，最早 Y 小时前）」——
 既不静默丢失、也不刷屏。
