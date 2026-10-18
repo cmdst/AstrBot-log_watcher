@@ -25,7 +25,7 @@ from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Node, Nodes, Plain
 from astrbot.api.star import Context, Star, StarTools
 
-from . import deliver, detect, store
+from . import config_map, deliver, detect, store
 from .log_reader import block_lines, new_lines, normalize_levels, render_lines
 from .models import (
     DeliveryOutcome,
@@ -94,6 +94,10 @@ class LogWatcherPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.config = config or {}
+        # 配置访问层：v2.2.0 起配置按组分块（见 _conf_schema.json），以点号路径读取；
+        # 嵌套缺失时回退旧扁平键（命中会打一条 WARNING 提示迁移），再回退默认值。
+        # 键名映射的唯一事实源是 config_map.KEY_MAP（加键时必须同步 schema / KEY_MAP / 这里）。
+        self.cfg = config_map.ConfigView(self.config)
 
         try:
             self.data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
@@ -109,12 +113,12 @@ class LogWatcherPlugin(Star):
         self.pending = store.PendingQueue(self.data_dir / "pending.json")
         self.disk = store.DiskGovernor(
             self.data_dir,
-            keep=_as_int(self.config.get("keep_excerpt_files", 50), 50, 1, 1000),
+            keep=_as_int(self.cfg.get("state.keep_excerpt_files", 50), 50, 1, 1000),
             max_age=float(
-                _as_int(self.config.get("outbox_max_age_hours", 24), 24, 1, 720) * 3600
+                _as_int(self.cfg.get("state.outbox_max_age_hours", 24), 24, 1, 720) * 3600
             ),
             max_bytes=_as_int(
-                self.config.get("outbox_max_bytes", 32 * 1024 * 1024),
+                self.cfg.get("state.outbox_max_bytes", 32 * 1024 * 1024),
                 32 * 1024 * 1024,
                 1024 * 1024,
                 1024 * 1024 * 1024,
@@ -122,9 +126,9 @@ class LogWatcherPlugin(Star):
         )
         self.gate = detect.NotifyGate(self.counters, self._gate_config())
         self.retry_policy = deliver.RetryPolicy(
-            max_attempts=_as_int(self.config.get("delivery_max_attempts", 4), 4, 1, 20),
+            max_attempts=_as_int(self.cfg.get("delivery.max_attempts", 4), 4, 1, 20),
             base_delay=float(
-                _as_int(self.config.get("delivery_base_delay_seconds", 5), 5, 1, 600)
+                _as_int(self.cfg.get("delivery.base_delay_seconds", 5), 5, 1, 600)
             ),
         )
 
@@ -268,7 +272,7 @@ class LogWatcherPlugin(Star):
                     logger.warning(f"{self._plat()}清理旧 CONFIG-INVALID.txt 失败: {exc!r}")
             return
         self._config_blocked = (
-            f"target_sessions 只有 {len(deliver.outlet_order(sessions))} 条出口，"
+            f"notify.target_sessions 只有 {len(deliver.outlet_order(sessions))} 条出口，"
             "策略要求至少 2 条（主出口 ＋ 备用出口）"
         )
         try:
@@ -276,7 +280,7 @@ class LogWatcherPlugin(Star):
                 "# log_watcher 配置不合格：插件已停摆\n\n"
                 f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"原因：{self._config_blocked}\n"
-                "怎么恢复：把插件配置里的 `target_sessions` 填成**至少两条**"
+                "怎么恢复：把插件配置里的 `notify.target_sessions` 填成**至少两条**"
                 "（第 1 条是主出口、第 2 条是备用出口：主出口失败时才投备用出口），保存后重启 AstrBot。\n"
                 "为什么这么定：2026-10-18 运营方定案 —— 只有一个出口时，「通道坏了」与「一切正常」"
                 "长得一模一样（历史上 81 条告警就这样躺在 abandoned 里，其中 9 条是 HIGH）。\n",
@@ -291,7 +295,7 @@ class LogWatcherPlugin(Star):
 
     def _open_store(self) -> store.SqliteStore | None:
         """打开状态库；失败返回 None 并进入内存态降级。"""
-        configured = str(self.config.get("state_db_path") or "").strip()
+        configured = str(self.cfg.get("state.db_path") or "").strip()
         path = (
             Path(os.path.expanduser(configured))
             if configured
@@ -357,7 +361,7 @@ class LogWatcherPlugin(Star):
                 kb = SqliteKnowledgeBase(
                     self.sqlite,
                     max_entries=_as_int(
-                        self.config.get("kb_max_entries", 500), 500, 50, 100000
+                        self.cfg.get("classify.kb_max_entries", 500), 500, 50, 100000
                     ),
                 )
             except Exception as exc:
@@ -387,7 +391,7 @@ class LogWatcherPlugin(Star):
         if not levels:
             if not self._no_level_notice:
                 self._no_level_notice = True
-                logger.warning(f"{self._plat()}未配置 levels，日志扫描不会产生提醒")
+                logger.warning(f"{self._plat()}未配置 scan.levels，日志扫描不会产生提醒")
             return
         self._no_level_notice = False
         self.counters.bump("rounds")
@@ -525,7 +529,7 @@ class LogWatcherPlugin(Star):
                 self._no_session_notice = True
                 logger.warning(
                     f"{self._plat()}命中 {sum(b.hit_count for b, _ in sendable)} 条日志，"
-                    "但未配置 target_sessions，提醒被丢弃"
+                    "但未配置 notify.target_sessions，提醒被丢弃"
                 )
         for block, verdict in sendable:
             await self._maybe_remediate(block, verdict, now)
@@ -826,7 +830,7 @@ class LogWatcherPlugin(Star):
 
     async def _deliver_outlets(self, build_plan, label: str):
         """按出口顺序投递（2026-10-18 定案）：主出口成功即停，失败才走备用出口；
-        每个出口最多 ``delivery_max_attempts`` 次尝试（默认 2 = 初投 + 1 次重试）。
+        每个出口最多 ``delivery.max_attempts`` 次尝试（默认 2 = 初投 + 1 次重试）。
 
         与旧行为的差别（为什么改）：从前是「每个目标都发一遍、各自失败各自进重试队列」——
         两个出口都通时你会**两处都收到**（重复打扰），出口死掉时又各自堆 ``abandoned``。
@@ -966,7 +970,7 @@ class LogWatcherPlugin(Star):
         ``off``/``not_candidate`` 属默认路径（修复默认关），同一指纹**每进程只提示一次**，
         避免每次命中都刷屏；其余拦截原因每次都发。
         """
-        if not bool(self.config.get("remediation_receipt", True)):
+        if not bool(self.cfg.get("remediation.receipt", True)):
             return
         if not self._sessions():
             return
@@ -1133,7 +1137,8 @@ class LogWatcherPlugin(Star):
         self._round_rates.clear()
         self._round_deltas.clear()
 
-        # §8.6 轨迹保留三键（remediation_artifact_keep/max_age/max_bytes）的唯一周期调用点：
+        # §8.6 轨迹保留三键（remediation.artifact_keep / artifact_max_age /
+        # artifact_max_bytes）的唯一周期调用点：
         # 每轮一次、放独立线程；状态库不可用时也要清（修复恰恰常在这种时候发生）。
         prune_artifacts = self._prune_artifacts_hook()
         if prune_artifacts is not None:
@@ -1310,7 +1315,7 @@ class LogWatcherPlugin(Star):
             f"{self._plat()}修复回执：{run.status} exit={run.exit_code} "
             f"（{run.summary or '无摘要'}）指纹 {verdict.fingerprint}"
         )
-        if bool(self.config.get("remediation_receipt", True)):
+        if bool(self.cfg.get("remediation.receipt", True)):
             _, outcomes = await self._send_receipt(
                 run, verdict, gate_reason=gate.reason or "ok"
             )
@@ -1371,7 +1376,7 @@ class LogWatcherPlugin(Star):
 
     def _remediation_enable_requested(self) -> bool:
         """配置里是否打开了修复（不看状态库；用于区分「没开」与「库不可写」）。"""
-        return bool(self.config.get("remediation_enable", False))
+        return bool(self.cfg.get("remediation.enable", False))
 
     def _should_remediate_hook(self):
         if self._should_remediate_fn is not None:
@@ -1414,8 +1419,8 @@ class LogWatcherPlugin(Star):
     # ---------- 日志前缀 ----------
 
     def _plat(self, session: str | None = None) -> str:
-        """log_with_bot_id 开启时给日志补平台前缀（平台 ID 取自会话前缀）。"""
-        if not bool(self.config.get("log_with_bot_id", False)):
+        """self_guard.log_with_bot_id 开启时给日志补平台前缀（平台 ID 取自会话前缀）。"""
+        if not bool(self.cfg.get("self_guard.log_with_bot_id", False)):
             return ""
         if session and ":" in session:
             return f"[platform:{session.split(':', 1)[0]}] "
@@ -1427,26 +1432,26 @@ class LogWatcherPlugin(Star):
     # ---------- 配置映射（R4：插件键 → 模块 cfg） ----------
 
     def _levels(self) -> tuple[str, ...]:
-        return normalize_levels(self.config.get("levels"))
+        return normalize_levels(self.cfg.get("scan.levels"))
 
     def _send_mode(self) -> str:
-        mode = str(self.config.get("send_mode") or "auto").strip().lower()
+        mode = str(self.cfg.get("notify.send_mode") or "auto").strip().lower()
         if mode in {"file", "txt"}:
             # 历史配置：附件形态在部分通道必然失败，统一走文本（K10）
             return "auto(file→text)"
         return mode if mode in {"auto", "text", "forward"} else "auto"
 
     def _deliver_config(self) -> deliver.DeliverConfig:
-        mode = str(self.config.get("send_mode") or "auto").strip().lower()
+        mode = str(self.cfg.get("notify.send_mode") or "auto").strip().lower()
         return deliver.DeliverConfig(
             send_mode=mode or "auto",
-            prefer_forward=bool(self.config.get("prefer_forward", False)),
-            include_excerpt=bool(self.config.get("include_excerpt", True)),
+            prefer_forward=bool(self.cfg.get("notify.prefer_forward", False)),
+            include_excerpt=bool(self.cfg.get("notify.include_excerpt", True)),
             max_excerpt_chars=_as_int(
-                self.config.get("max_excerpt_chars", 6000), 6000, 200, _MAX_EXCERPT_CHARS
+                self.cfg.get("notify.max_excerpt_chars", 6000), 6000, 200, _MAX_EXCERPT_CHARS
             ),
             max_chars_per_message=_as_int(
-                self.config.get("max_chars_per_message", 0), 0, 0, _MAX_CHARS_PER_MESSAGE
+                self.cfg.get("notify.max_chars_per_message", 0), 0, 0, _MAX_CHARS_PER_MESSAGE
             ),
         )
 
@@ -1454,154 +1459,154 @@ class LogWatcherPlugin(Star):
         return detect.GateConfig.from_mapping(
             {
                 "dedupe_window": _as_int(
-                    self.config.get("dedupe_window_seconds", 900), 900, 0, 7 * 86400
+                    self.cfg.get("budget.dedupe_window_seconds", 900), 900, 0, 7 * 86400
                 ),
                 "max_per_round": _as_int(
-                    self.config.get("max_alerts_per_round", 5), 5, 0, 100
+                    self.cfg.get("budget.max_alerts_per_round", 5), 5, 0, 100
                 ),
                 "max_per_minute": _as_int(
-                    self.config.get("max_alerts_per_minute", 12), 12, 0, 600
+                    self.cfg.get("budget.max_alerts_per_minute", 12), 12, 0, 600
                 ),
                 "max_per_hour": _as_int(
-                    self.config.get("max_alerts_per_hour", 80), 80, 0, 5000
+                    self.cfg.get("budget.max_alerts_per_hour", 80), 80, 0, 5000
                 ),
                 "max_per_day": _as_int(
-                    self.config.get("max_alerts_per_day", 300), 300, 0, 50000
+                    self.cfg.get("budget.max_alerts_per_day", 300), 300, 0, 50000
                 ),
                 "burst_window": _as_int(
-                    self.config.get("burst_window_seconds", 60), 60, 1, 3600
+                    self.cfg.get("budget.burst_window_seconds", 60), 60, 1, 3600
                 ),
                 "burst_threshold": _as_int(
-                    self.config.get("burst_threshold", 8), 8, 1, 500
+                    self.cfg.get("budget.burst_threshold", 8), 8, 1, 500
                 ),
-                "burst_min_severity": self.config.get("burst_min_severity", "MEDIUM"),
+                "burst_min_severity": self.cfg.get("budget.burst_min_severity", "MEDIUM"),
                 "digest_interval": _as_int(
-                    self.config.get("digest_interval_seconds", 1800), 1800, 10, 86400
+                    self.cfg.get("budget.digest_interval_seconds", 1800), 1800, 10, 86400
                 ),
                 "digest_max_items": _as_int(
-                    self.config.get("digest_max_items", 50), 50, 1, 1000
+                    self.cfg.get("budget.digest_max_items", 50), 50, 1, 1000
                 ),
-                "silence_ranges": self.config.get("silence_ranges", []),
-                "silence_min_severity": self.config.get("silence_min_severity", "HIGH"),
-                "notify_min_severity": self.config.get("notify_min_severity", "MEDIUM"),
+                "silence_ranges": self.cfg.get("budget.silence_ranges", []),
+                "silence_min_severity": self.cfg.get("budget.silence_min_severity", "HIGH"),
+                "notify_min_severity": self.cfg.get("notify.min_severity", "MEDIUM"),
             }
         )
 
     def _engine_config(self) -> dict:
         """engine.py 的内部 cfg 键（§6.6，R4：与插件配置键显式转换）。"""
-        route_map = self.config.get("route_map")
+        route_map = self.cfg.get("classify.route_map")
         return {
-            "classify_enable": bool(self.config.get("classify_enable", True)),
+            "classify_enable": bool(self.cfg.get("classify.enable", True)),
             "classify_mode": self._classify_mode(),
             "llm_provider_id": self._classify_provider_id(),
             "llm_timeout": _as_int(
-                self.config.get("classify_timeout_seconds", 20), 20, 5, 300
+                self.cfg.get("classify.timeout_seconds", 20), 20, 5, 300
             ),
             "llm_max_block_lines": _as_int(
-                self.config.get("llm_max_block_lines", 80), 80, 5, 500
+                self.cfg.get("classify.max_block_lines", 80), 80, 5, 500
             ),
-            "classify_system_prompt": str(self.config.get("classify_system_prompt") or ""),
-            "fallback_severity": str(self.config.get("fallback_severity") or "MEDIUM"),
+            "classify_system_prompt": str(self.cfg.get("classify.system_prompt") or ""),
+            "fallback_severity": str(self.cfg.get("classify.fallback_severity") or "MEDIUM"),
             # 2026-10-18 补漏：这两个旋钮当时只写进了 schema 与 classify，**没进本白名单** ⇒
             # 生产链路上被静默丢弃（引擎路径与 detect 兜底路径都拿不到）：运营方设
             # transient_severity=LOW 不生效，派单承诺的 unmatched_severity=MEDIUM「一步回滚」也失效。
             # 白名单是本函数存在的意义（R4 显式转换），加键时必须同步这里。
             # 回归：tests/test_classify.py::test_engine_config_forwards_the_severity_knobs
-            "unmatched_severity": str(self.config.get("unmatched_severity") or "LOW"),
-            "transient_severity": str(self.config.get("transient_severity") or "MEDIUM"),
-            "kb_enabled": bool(self.config.get("kb_enabled", True)),
+            "unmatched_severity": str(self.cfg.get("classify.unmatched_severity") or "LOW"),
+            "transient_severity": str(self.cfg.get("classify.transient_severity") or "MEDIUM"),
+            "kb_enabled": bool(self.cfg.get("classify.kb_enabled", True)),
             "kb_max_entries": _as_int(
-                self.config.get("kb_max_entries", 500), 500, 50, 100000
+                self.cfg.get("classify.kb_max_entries", 500), 500, 50, 100000
             ),
-            "noise_shortcut": bool(self.config.get("noise_shortcut", True)),
+            "noise_shortcut": bool(self.cfg.get("classify.noise_shortcut", True)),
             "route_map": route_map if isinstance(route_map, dict) else {},
-            "new_pattern_escalate": bool(self.config.get("new_pattern_escalate", False)),
-            "notify_min_severity": str(self.config.get("notify_min_severity") or "MEDIUM"),
+            "new_pattern_escalate": bool(self.cfg.get("classify.new_pattern_escalate", False)),
+            "notify_min_severity": str(self.cfg.get("notify.min_severity") or "MEDIUM"),
             "llm_max_calls_per_round": _as_int(
-                self.config.get("llm_max_calls_per_round", 5), 5, 0, 1000
+                self.cfg.get("classify.max_calls_per_round", 5), 5, 0, 1000
             ),
             "llm_max_calls_per_hour": _as_int(
-                self.config.get("llm_max_calls_per_hour", 60), 60, 0, 100000
+                self.cfg.get("classify.max_calls_per_hour", 60), 60, 0, 100000
             ),
         }
 
     def _remediate_config(self) -> dict:
         """remediate.py 的内部 cfg 键（§6.7/§8.6）。"""
-        permission = str(self.config.get("remediation_permission_mode") or "workspace-write")
+        permission = str(self.cfg.get("remediation.permission_mode") or "workspace-write")
         if permission not in {"read-only", "workspace-write"}:
             # R9：权限级别写死，越权值一律回落并告警（子进程 env 是调用方可控的）
             logger.warning(
-                f"{self._plat()}remediation_permission_mode={permission!r} 不被允许，"
+                f"{self._plat()}remediation.permission_mode={permission!r} 不被允许，"
                 "已回落 workspace-write"
             )
             permission = "workspace-write"
         return {
             "remediation_enable": self._remediation_enabled(),
             "remediation_dsh_command": str(
-                self.config.get("remediation_dsh_command") or "dsh"
+                self.cfg.get("remediation.dsh_command") or "dsh"
             ),
-            "remediation_profile": str(self.config.get("remediation_profile") or "headless"),
+            "remediation_profile": str(self.cfg.get("remediation.profile") or "headless"),
             "remediation_patch_overlay": str(
-                self.config.get("remediation_patch_overlay") or ""
+                self.cfg.get("remediation.patch_overlay") or ""
             ),
             "remediation_workdir": str(
-                self.config.get("remediation_workdir") or "/root/AstrBot"
+                self.cfg.get("remediation.workdir") or "/root/AstrBot"
             ),
             "remediation_timeout_seconds": _as_int(
-                self.config.get("remediation_timeout_seconds", 300), 300, 30, 3600
+                self.cfg.get("remediation.timeout_seconds", 300), 300, 30, 3600
             ),
             "remediation_max_concurrency": _as_int(
-                self.config.get("remediation_max_concurrency", 1), 1, 1, 4
+                self.cfg.get("remediation.max_concurrency", 1), 1, 1, 4
             ),
             "remediation_cooldown_seconds": _as_int(
-                self.config.get("remediation_cooldown_seconds", 3600), 3600, 0, 86400
+                self.cfg.get("remediation.cooldown_seconds", 3600), 3600, 0, 86400
             ),
             "remediation_daily_limit": _as_int(
-                self.config.get("remediation_daily_limit", 5), 5, 0, 100
+                self.cfg.get("remediation.daily_limit", 5), 5, 0, 100
             ),
             "remediation_permission_mode": permission,
-            "remediation_env_refs": _as_list(self.config.get("remediation_env_refs")),
+            "remediation_env_refs": _as_list(self.cfg.get("remediation.env_refs")),
             "remediation_inherit_env": bool(
-                self.config.get("remediation_inherit_env", False)
+                self.cfg.get("remediation.inherit_env", False)
             ),
             "remediation_artifact_dir": str(
-                self.config.get("remediation_artifact_dir") or ""
+                self.cfg.get("remediation.artifact_dir") or ""
             ),
             "remediation_max_output_bytes": _as_int(
-                self.config.get("remediation_max_output_bytes", 1048576),
+                self.cfg.get("remediation.max_output_bytes", 1048576),
                 1048576,
                 4096,
                 16777216,
             ),
             "remediation_prompt_template": str(
-                self.config.get("remediation_prompt_template") or ""
+                self.cfg.get("remediation.prompt_template") or ""
             ),
-            "remediation_receipt": bool(self.config.get("remediation_receipt", True)),
-            "remediation_trace_raw": bool(self.config.get("remediation_trace_raw", False)),
+            "remediation_receipt": bool(self.cfg.get("remediation.receipt", True)),
+            "remediation_trace_raw": bool(self.cfg.get("remediation.trace_raw", False)),
             "remediation_artifact_keep": _as_int(
-                self.config.get("remediation_artifact_keep", 50), 50, 0, 100000
+                self.cfg.get("remediation.artifact_keep", 50), 50, 0, 100000
             ),
             "remediation_artifact_max_age": _as_int(
-                self.config.get("remediation_artifact_max_age", 7 * 86400),
+                self.cfg.get("remediation.artifact_max_age", 7 * 86400),
                 7 * 86400,
                 0,
                 365 * 86400,
             ),
             "remediation_artifact_max_bytes": _as_int(
-                self.config.get("remediation_artifact_max_bytes", 64 * 1024 * 1024),
+                self.cfg.get("remediation.artifact_max_bytes", 64 * 1024 * 1024),
                 64 * 1024 * 1024,
                 0,
                 1 << 40,
             ),
             "remediate_confirm_count": _as_int(
-                self.config.get("remediate_confirm_count", 2), 2, 1, 10
+                self.cfg.get("remediation.confirm_count", 2), 2, 1, 10
             ),
             "remediate_confidence_threshold": _as_float(
-                self.config.get("remediate_confidence_threshold", 0.8), 0.8, 0.0, 1.0
+                self.cfg.get("remediation.confidence_threshold", 0.8), 0.8, 0.0, 1.0
             ),
-            "new_pattern_escalate": bool(self.config.get("new_pattern_escalate", False)),
+            "new_pattern_escalate": bool(self.cfg.get("classify.new_pattern_escalate", False)),
             "max_alerts_per_minute": _as_int(
-                self.config.get("max_alerts_per_minute", 12), 12, 0, 600
+                self.cfg.get("budget.max_alerts_per_minute", 12), 12, 0, 600
             ),
             "self_feedback_ids": self._self_echo_ids(),
         }
@@ -1618,78 +1623,78 @@ class LogWatcherPlugin(Star):
     def _prune_config(self) -> dict:
         return {
             "history_retention_days": _as_int(
-                self.config.get("history_retention_days", 30), 30, 1, 3650
+                self.cfg.get("state.history_retention_days", 30), 30, 1, 3650
             ),
             "history_max_rows": _as_int(
-                self.config.get("history_max_rows", 20000), 20000, 1000, 1000000
+                self.cfg.get("state.history_max_rows", 20000), 20000, 1000, 1000000
             ),
             "fingerprint_ttl_hours": _as_int(
-                self.config.get("fingerprint_ttl_hours", 72), 72, 1, 720
+                self.cfg.get("state.fingerprint_ttl_hours", 72), 72, 1, 720
             ),
             "kb_max_entries": _as_int(
-                self.config.get("kb_max_entries", 500), 500, 50, 100000
+                self.cfg.get("classify.kb_max_entries", 500), 500, 50, 100000
             ),
             "remediation_timeout_seconds": _as_int(
-                self.config.get("remediation_timeout_seconds", 300), 300, 30, 3600
+                self.cfg.get("remediation.timeout_seconds", 300), 300, 30, 3600
             ),
         }
 
     def _classify_mode(self) -> str:
-        mode = str(self.config.get("classify_mode") or "auto").strip().lower()
+        mode = str(self.cfg.get("classify.mode") or "auto").strip().lower()
         return mode if mode in {"auto", "local", "llm"} else "auto"
 
     def _classify_provider_id(self) -> str:
-        return str(self.config.get("classify_provider_id") or "").strip()
+        return str(self.cfg.get("classify.provider_id") or "").strip()
 
     def _remediation_enabled(self) -> bool:
         """R9/R10/F08：默认关；状态库不可用**或不可写**时强制关（fail-closed）。"""
         if not self._store_writable():
             return False
-        return bool(self.config.get("remediation_enable", False))
+        return bool(self.cfg.get("remediation.enable", False))
 
     def _before(self) -> int:
-        return _as_int(self.config.get("context_before", 5), 5, 0, _MAX_CONTEXT_LINES)
+        return _as_int(self.cfg.get("scan.context_before", 5), 5, 0, _MAX_CONTEXT_LINES)
 
     def _after(self) -> int:
-        return _as_int(self.config.get("context_after", 5), 5, 0, _MAX_CONTEXT_LINES)
+        return _as_int(self.cfg.get("scan.context_after", 5), 5, 0, _MAX_CONTEXT_LINES)
 
     def _max_lines_per_poll(self) -> int:
         return _as_int(
-            self.config.get("max_lines_per_poll", 200), 200, 20, _MAX_LINES_PER_POLL
+            self.cfg.get("scan.max_lines_per_poll", 200), 200, 20, _MAX_LINES_PER_POLL
         )
 
     def _interval(self) -> int:
         return _as_int(
-            self.config.get("poll_interval_seconds", 30),
+            self.cfg.get("scan.poll_interval_seconds", 30),
             30,
             _MIN_POLL_SECONDS,
             _MAX_POLL_SECONDS,
         )
 
     def _retry_batch(self) -> int:
-        return _as_int(self.config.get("delivery_retry_batch", 5), 5, 1, 50)
+        return _as_int(self.cfg.get("delivery.retry_batch", 5), 5, 1, 50)
 
     def _fingerprint_ttl(self) -> float:
         return float(
-            _as_int(self.config.get("fingerprint_ttl_hours", 72), 72, 1, 24 * 30) * 3600
+            _as_int(self.cfg.get("state.fingerprint_ttl_hours", 72), 72, 1, 24 * 30) * 3600
         )
 
     def _excerpt_mode(self) -> str:
-        mode = str(self.config.get("excerpt_mode") or "ledger_only").strip().lower()
+        mode = str(self.cfg.get("state.excerpt_mode") or "ledger_only").strip().lower()
         return mode if mode in {"off", "ledger_only", "file"} else "ledger_only"
 
     def _sessions(self) -> list[str]:
-        return _as_list(self.config.get("target_sessions"))
+        return _as_list(self.cfg.get("notify.target_sessions"))
 
     def _self_log_names(self) -> list[str]:
-        names = [PLUGIN_NAME, *_as_list(self.config.get("self_log_names"))]
+        names = [PLUGIN_NAME, *_as_list(self.cfg.get("self_guard.log_names"))]
         return list(dict.fromkeys(names))
 
     def _self_echo_ids(self) -> list[str]:
         """本插件目标会话 id：用于屏蔽「自己发送失败被适配器记的 WARN 回声」。
 
-        取自 target_sessions 去掉平台前缀后的会话 id 与完整会话串，另可用
-        self_feedback_ids 追加；判定还要求行里出现发送失败特征词，
+        取自 notify.target_sessions 去掉平台前缀后的会话 id 与完整会话串，另可用
+        self_guard.feedback_ids 追加；判定还要求行里出现发送失败特征词，
         所以不会误伤同一平台上其他用户的故障。
         """
         ids: list[str] = []
@@ -1701,14 +1706,14 @@ class LogWatcherPlugin(Star):
                 tail = text.split(":")[-1].strip()
                 if tail:
                     ids.append(tail)
-        ids.extend(_as_list(self.config.get("self_feedback_ids")))
+        ids.extend(_as_list(self.cfg.get("self_guard.feedback_ids")))
         return list(dict.fromkeys([item for item in ids if len(item) >= 6]))
 
     def _exclude_keywords(self) -> list[str]:
-        return _as_list(self.config.get("exclude_keywords"))
+        return _as_list(self.cfg.get("scan.exclude_keywords"))
 
     def _skip_existing(self) -> bool:
-        return bool(self.config.get("start_from_end", True))
+        return bool(self.cfg.get("scan.start_from_end", True))
 
     def _pattern(self) -> str:
         """日志文件名模式（F11：必须是相对模式且不含 ``..``，否则回落 ``*.log``）。
@@ -1716,18 +1721,18 @@ class LogWatcherPlugin(Star):
         ``../*.log`` 会读到日志目录之外的文件（内容照样进摘录/对话/磁盘），绝对模式会抛
         ``NotImplementedError`` 让插件静默不扫描 —— 两者都在这里拦掉并 warning。
         """
-        raw = str(self.config.get("file_pattern") or "*.log").strip() or "*.log"
+        raw = str(self.cfg.get("scan.file_pattern") or "*.log").strip() or "*.log"
         candidate = Path(raw)
         if candidate.is_absolute() or ".." in candidate.parts:
             logger.warning(
-                f"{self._plat()}file_pattern={raw!r} 不是合法的相对模式（绝对路径或含 ..），"
+                f"{self._plat()}scan.file_pattern={raw!r} 不是合法的相对模式（绝对路径或含 ..），"
                 "已回落 *.log（F11）"
             )
             return "*.log"
         return raw
 
     def _channel_overrides(self) -> dict:
-        raw = self.config.get("channel_overrides")
+        raw = self.cfg.get("delivery.channel_overrides")
         return raw if isinstance(raw, dict) else {}
 
     def _caps_for(self, session: str):
@@ -1753,7 +1758,7 @@ class LogWatcherPlugin(Star):
 
     def _log_dir(self) -> Path:
         """日志目录：优先用配置，其次跟随 AstrBot 的 log_file_path，最后回落 data/logs。"""
-        configured = str(self.config.get("log_dir") or "").strip()
+        configured = str(self.cfg.get("scan.log_dir") or "").strip()
         if configured:
             return Path(os.path.expanduser(configured))
         data_root = self.data_dir.parent.parent
@@ -1816,7 +1821,7 @@ class LogWatcherPlugin(Star):
 
     def _maybe_report_disk(self, now: float) -> None:
         configured = float(
-            _as_int(self.config.get("disk_report_interval_hours", 24), 24, 1, 168)
+            _as_int(self.cfg.get("state.disk_report_interval_hours", 24), 24, 1, 168)
         ) * 3600.0
         interval = max(_DISK_REPORT_MIN_INTERVAL, configured)
         if now - self._disk_report_at < interval:

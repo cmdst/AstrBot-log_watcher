@@ -8,7 +8,7 @@ desc: >-
   采集进度与计数落在 SQLite（WAL）里，日志轮转与截断自动续读；修复固定以 workspace-write
   权限在指定工作区内运行，路由由插件自带的 dsh-headless-overlay.yml 以 --patch 叠加
   （不改任何 profile，删文件即失效）。
-version: 2.1.0
+version: 2.2.0
 author: Wolfycz
 repo: https://github.com/cmdst/AstrBot-log_watcher
 astrbot_version: ">=4.27,<5"

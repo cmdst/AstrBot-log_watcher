@@ -26,6 +26,12 @@ def _schema() -> dict:
     return json.loads((_PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
 
 
+def _leaf(path: str) -> dict:
+    """按点号路径取 schema 叶子（v2.2.0 起配置按组分块）。"""
+    group, leaf = path.split(".", 1)
+    return _schema()[group]["items"][leaf]
+
+
 def _main_src() -> str:
     return (_PLUGIN_DIR / "main.py").read_text(encoding="utf-8")
 
@@ -37,21 +43,24 @@ def test_max_output_bytes_default_matches_in_all_three_places() -> None:
     结尾的 `{"type":"final"}` 被截掉，按「看轨迹里有没有 final」验收会把成功判成失败。
     """
     wanted = 1048576
-    assert _schema()["remediation_max_output_bytes"]["default"] == wanted
+    assert _leaf("remediation.max_output_bytes")["default"] == wanted
     assert remediate.DEFAULT_MAX_OUTPUT_BYTES == wanted
-    assert f'self.config.get("remediation_max_output_bytes", {wanted})' in _main_src(), (
+    assert f'self.cfg.get("remediation.max_output_bytes", {wanted})' in _main_src(), (
         "main 的显式白名单才是生产生效的那份；它没跟着改 = 生产仍按旧默认跑"
     )
 
 
 def test_timeout_default_matches_schema_and_code() -> None:
     """修复超时默认值（300 → 900 那次）也要两处一致。"""
-    assert _schema()["remediation_timeout_seconds"]["default"] == remediate.DEFAULT_TIMEOUT_SECONDS
+    assert (
+        _leaf("remediation.timeout_seconds")["default"] == remediate.DEFAULT_TIMEOUT_SECONDS
+    )
     assert remediate.DEFAULT_TIMEOUT_SECONDS == 900
 
 
 def test_output_bytes_bounds_are_unchanged() -> None:
     """只抬默认值，不动上下界（下界 4096 允许运营方按需调小）。"""
     assert (remediate.MIN_OUTPUT_BYTES, remediate.MAX_OUTPUT_BYTES) == (4096, 16777216)
-    hint = _schema()["remediation_max_output_bytes"]["hint"]
+    hint = _leaf("remediation.max_output_bytes")["hint"]
     assert "4096-16777216" in hint, "hint 里的区间要跟着上下界走"
+

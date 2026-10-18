@@ -56,6 +56,31 @@ grep -a "日志监听启动" /root/AstrBot/data/logs/astrbot.log | tail -1
 # 期望：形态 auto… 状态 SQLite… 分级 auto… 修复 关闭；… overlay <插件目录>/dsh-headless-overlay.yml（bundled）
 ```
 
+### 1.4 v2.2.0 的配置结构迁移（**必须按这个顺序**，否则值会丢）
+
+v2.2.0 把插件配置从 95 个扁平顶键改成 8 个分组（§3）。**核心会在插件加载时把 schema 里没有的键
+判为 stale 键、并从配置文件里删掉**（`AstrBotConfig.check_config_integrity()` + `save_config()`），
+所以「先换版、再迁移」= 值已经没了。顺序：
+
+```bash
+CFG=/root/AstrBot/data/config/log_watcher_config.json
+PLUG=/root/AstrBot/data/plugins/log_watcher
+# 0) 先备份插件目录与配置（§8.1）
+# 1) 干跑体检：期望「可映射 82/82、未知键 0、缺值的键 0、将丢弃 13」
+python3 $PLUG/tools/migrate_config_v2.py --config $CFG
+# 2) 迁移：写 $CFG.bak-pre-v2.2.0-<ts>（原始扁平备份）后原子替换
+python3 $PLUG/tools/migrate_config_v2.py --config $CFG --apply
+# 3) 换版：用新版覆盖插件目录（排除 .git / __pycache__ / .pytest_cache / *.bak-*）
+# 4) 自愈复核；只在判失败时用最后一条从备份重建（第 2–3 步之间被任何一次插件加载清过）
+python3 $PLUG/tools/migrate_config_v2.py --config $CFG --verify --against $CFG.bak-pre-v2.2.0-*
+python3 $PLUG/tools/migrate_config_v2.py --config $CFG --from-backup $CFG.bak-pre-v2.2.0-*
+# 5) 重载插件，验收：启动行版本 2.2.0、日志无 `Config key removed`（本插件的键）、
+#    无 CONFIG-INVALID.txt、notify.target_sessions 仍 ≥ 2 条
+```
+
+窗口纪律：第 2–5 步之间不要在 WebUI 上碰 log_watcher 的配置页（旧 schema 会抢先清理）。
+脚本**任何模式都不打印配置值**（只回键名与计数）；配置回滚见 §8.5。
+
 ---
 
 ## 2. 前置条件与自检
@@ -64,7 +89,7 @@ grep -a "日志监听启动" /root/AstrBot/data/logs/astrbot.log | tail -1
 |---|---|---|
 | AstrBot 文件日志开启（`log_file_enable`） | `ls -l /root/AstrBot/data/logs/astrbot.log` | 文件存在且持续增长；否则插件每 10 分钟一条 warning |
 | 全局 `log_level` 覆盖你要的等级 | `grep -a "\[ERRO\]" /root/AstrBot/data/logs/astrbot.log \| tail -1` | 有该等级的行；全局 INFO 时不会有 DEBUG 行 |
-| 提醒会话填对 | `grep -A3 target_sessions /root/AstrBot/data/config/log_watcher_config.json` | 形如 `BOT1:group:10001` / `平台: FriendMessage:xxx@im.wechat` |
+| 提醒会话填对 | `grep -A2 '"target_sessions"' /root/AstrBot/data/config/log_watcher_config.json`（v2.2.0 起它在 `notify` 组内） | 形如 `BOT1:group:10001` / `平台: FriendMessage:xxx@im.wechat` |
 | LLM 分级（可选） | 插件启动行里 `分级 auto（provider 已配置/未配置）` | 未配置时会以本地规则工作，判定里带 `llm-unconfigured` 标签 |
 | dsh 可用（仅修复需要） | `which dsh && dsh --version` | `/usr/local/bin/dsh`、`0.2.0-rc.2`（本机实测） |
 | headless 路由（仅修复需要） | 见 §5.3 的手动验证命令 | 带 overlay `exit=0`；不带 overlay `exit=1 / MISSING_CREDENTIAL` |
@@ -77,143 +102,154 @@ grep -a "日志监听启动" /root/AstrBot/data/logs/astrbot.log | tail -1
 
 ## 3. 配置速查
 
-- **权威来源**：`_conf_schema.json`（80 个可见键 + 兼容键，每键都带中文 hint 与「误配后果」）。
-  WebUI 插件详情页按分组渲染：基础/主动提醒、日志扫描、AI 威胁分级、通知预算/聚合/静默、
-  投递重试、状态/磁盘、紧急修复、自反馈/管理白名单。
-- **默认值来源**：与代码里的 `config.get(key, default)` 逐条对齐（本节的默认值即 schema 的默认值）。
+- **权威来源**：`_conf_schema.json` —— **v2.2.0 起是 8 个分组 / 82 个叶子键**（对标插件市场的
+  写法：分组 `object` + 叶子带中文 hint 与「误配后果」）。WebUI 插件详情页按这 8 组渲染，
+  `data/config/log_watcher_config.json` 也是同样的嵌套结构：手改时按组找，不用再翻一条 95 键的长列表。
+  分组先后与键名：`notify` 主动提醒 → `scan` 日志扫描 → `classify` AI 威胁分级 →
+  `budget` 通知预算·聚合·静默 → `delivery` 投递与通道能力 → `state` 状态·磁盘·留存 →
+  `remediation` 紧急修复 → `self_guard` 自身识别·自反馈。
+- **默认值来源**：与代码里的 `self.cfg.get("组.叶子", default)` 逐条对齐（本节的默认值即 schema 的默认值）。
+  键名映射的唯一事实源是 `config_map.KEY_MAP`：schema 叶子、main 的读取点、迁移脚本三方由
+  `tests/test_config_map.py` 钉死，加键时漏任何一处都会红。
 - 新键在插件下次加载时由 `AstrBotConfig` 自动写进 `data/config/log_watcher_config.json`，
-  **不需要手改 JSON**。
-- `send_mode` 默认已从 `file` 改为 `auto`；老配置里的 `file`/`txt`/`attachment` 会被映射成文本
+  **不需要手改 JSON**；但 **v2.1.0 → v2.2.0 这次是结构变化，必须手动迁移一次**（§1.4）。
+- `notify.send_mode` 默认已从 `file` 改为 `auto`；老配置里的 `file`/`txt`/`attachment` 会被映射成文本
   并把这条映射写进日志（`历史配置 file（txt 附件）已废弃…`）。
 
 | 键 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `log_with_bot_id` | bool | `false` | 开启后插件日志会带 [platform:平台ID]，多 Bot 环境便于定位；平台 ID 取自提醒会话的 unified_msg_origin 前缀。 |
-| **=== 主动提醒 ===** | | | |
-| `target_sessions` | list | `[]` | 命中日志时把提醒主动发到这些会话。**列表即优先级**：第 1 个是主出口，只有它失败才发第 2 个（不是双发）。填 unified_msg_origin：群 BOT1:group:10001、私聊 BOT1:private:10002。 |
-| `send_mode` | string | `"auto"` | auto = 按通道能力选（默认）；text = 只发纯文本分片；forward = 优先合并转发（通道不支持时自动退回文本）。注意：旧配置里的 file/txt 会被映射成 text —— weixin_oc 通道只有 Plain 文本能送达，File 会被服务端 prepare 失败、No… |
-| `prefer_forward` | bool | `false` | 通道同时支持文本与转发时优先用合并转发。 |
-| `notify_min_severity` | string | `"MEDIUM"` | 即时告警的最低等级（五级）。低于它的判定只进摘要或静默。 |
-| `include_excerpt` | bool | `true` | 告警里是否附日志摘录正文。 |
-| `max_excerpt_chars` | int | `6000` | 单条摘录字符上限（200-20000，代码夹紧）。 |
-| `max_chars_per_message` | int | `0` | 覆盖通道分片长度；0 = 按通道能力表（推荐）。上限 8000（硬顶）。 |
-| **=== 日志扫描 ===** | | | |
-| `log_dir` | string | `""` | 留空 = 用 AstrBot 自己的日志目录（跟随 log_file_path，默认 <data>/logs），一般不用改。 |
-| `file_pattern` | string | `"*.log"` | 目录里扫哪些文件，glob 写法。默认只读当前日志文件；填 astrbot.log* 会把轮转出来的历史文件也扫一遍。 |
-| `levels` | list | `["ERROR", "CRITICAL"]` | 只提醒列表里的等级，可填 DEBUG/INFO/WARNING/ERROR/CRITICAL（也认短名 DBUG/WARN/ERRO/CRIT，内部统一规整为规范长名）。 |
-| `exclude_keywords` | list | `[]` | 行里包含任一关键字就不算命中（仍会作为前后文出现在摘录里）。本插件自己的日志固定被忽略，避免自触发循环。 |
-| `poll_interval_seconds` | int | `30` | 扫描间隔秒（5-86400）。也是「文件末尾的报错等不到后文」的最长等待时间。 |
-| `start_from_end` | bool | `true` | 开启（默认）= 跳过文件已有内容，不重放历史；关闭 = 从文件开头读。 |
-| `context_before` | int | `5` | 0-200。命中行前面带几行日志。 |
-| `context_after` | int | `5` | 0-200。命中行后面带几行日志（堆栈就靠它带出来）；前后文连成一片的多条命中会合并成一段，不会重复前文。同样也是发出的延迟（见 poll_interval_seconds）。 |
-| `max_lines_per_poll` | int | `200` | 20-5000。一轮最多展开多少行（含前后文），超出的只在汇总里计数。 |
-| **=== AI 威胁分级 ===** | | | |
-| `classify_enable` | bool | `true` | 分级总开关。关闭后按日志等级直接触发（噪声 8.9:1 会直灌聊天）。 |
-| `classify_mode` | string | `"auto"` | auto = 配了 provider 走 LLM、否则本地规则；local = 永不调 LLM（最省、可离线）；llm = LLM 优先、失败降级。 |
-| `classify_provider_id` | string | `""` | AstrBot 的 provider id，供 llm_generate 使用。 |
-| `classify_timeout_seconds` | int | `20` | 5-300，单次 LLM 判定超时。 |
-| `classify_system_prompt` | text | `""` | 覆盖内置提示词（留空用 prompts/classify_system.md）。 |
-| `fallback_severity` | string | `"MEDIUM"` | 降级地板（五级）：LLM 不可用/超时/输出非法时取 max(本地判定, 该值)。 |
-| `unmatched_severity` | string | `"LOW"` | 本地模式「有 ERROR 等级但没有任何规则能解释」的等级。默认 LOW = 只进摘要、不即时推送；填 `MEDIUM` 恢复旧行为（2026-10-16 重放：全天 95 条即时推送＝未匹配错误 41 条 ＋ 可恢复抖动 54 条，两族都曾被判 MEDIUM 直推）。**这个键必须同时进 `main._engine_config()` 白名单**，否则生产链路上被静默丢弃（2026-10-18 漏过一次，见 §7.2 / §10）。 |
-| `transient_severity` | string | `"MEDIUM"` | 本地模式可恢复抖动（上游 503 / 框架重试中）的等级。默认 MEDIUM = 验收基线（用例 TRANS-01，notes 写着「压成 LOW = 漏报」）；填 `LOW` = 抖动只进摘要。 |
-| `llm_max_block_lines` | int | `80` | 5-500，送 LLM 的最大行数。 |
-| `llm_max_calls_per_round` | int | `5` | 0-1000，单轮 LLM 调用上限（0 = 不限，不推荐）。 |
-| `llm_max_calls_per_hour` | int | `60` | 0-100000，每小时 LLM 调用上限（0 = 不限）。 |
-| `noise_shortcut` | bool | `true` | 已知噪声短路（asyncio 回调异常等直接判 IGNORE，不付 token）。 |
-| `kb_enabled` | bool | `true` | 指纹知识库：同一指纹复用上次判定。 |
-| `kb_max_entries` | int | `500` | 50-100000，知识库条数上限（超出由 prune 清理）。 |
-| `new_pattern_escalate` | bool | `false` | 新指纹升一级（见 architecture §4.3）。 |
-| `route_map` | dict | `{}` | 等级→路由覆写，如 {"MEDIUM": "digest"}。非法值会被忽略并 warning；CRITICAL→store 被强制拒绝。 |
-| `llm_provider_id`（隐藏） | string | `""` | 兼容键：为空时用 classify_provider_id；非空时优先级更高（旧配置迁移用）。 |
-| `chat_provider_id`（隐藏） | string | `""` | 兼容键：同 llm_provider_id，仅在前两者都为空时生效。一般不用改。 |
-| `llm_timeout`（隐藏） | int | `20` | 兼容键：等同 classify_timeout_seconds（engine 内部别名，最低优先级）。一般不用改。 |
-| `provider_id`（隐藏） | string | `""` | 兼容键：内部短名，最低优先级。一般不用改。 |
-| **=== 通知预算 / 聚合 / 静默 ===** | | | |
-| `dedupe_window_seconds` | int | `900` | 0-604800，同指纹冷却窗口：窗口内重复命中不再单独告警。 |
-| `digest_interval_seconds` | int | `1800` | 60-86400，LOW 级摘要聚合间隔。 |
-| `digest_max_items` | int | `50` | 1-500，单个摘要桶最多条目数。 |
-| `max_alerts_per_round` | int | `5` | 0-100，单轮发送上限。 |
-| `max_alerts_per_minute` | int | `12` | 0-600，分钟预算。 |
-| `max_alerts_per_hour` | int | `80` | 0-5000，小时预算。 |
-| `max_alerts_per_day` | int | `300` | 0-50000，日预算（跨重启持久化）。 |
-| `burst_window_seconds` | int | `60` | 1-3600，突发窗口长度。 |
-| `burst_threshold` | int | `8` | 1-500，窗口内达到多少条告警就合并成一条突发消息。 |
-| `burst_min_severity` | string | `"MEDIUM"` | 参与突发合并的最低等级（五级）。 |
-| `silence_ranges` | list | `[]` | 静默时段（本机时区，支持跨夜），如 ["23:00-07:00"]。格式错会被忽略并 warning。 |
-| `silence_min_severity` | string | `"HIGH"` | ≥ 此等级的告警可穿透静默时段（五级）。 |
-| `channel_overrides` | dict | `{}` | 按通道覆盖能力，如 {"weixin_oc": {"max_chars": 1000}}。 |
-| **=== 投递重试 ===** | | | |
-| `delivery_max_attempts` | int | `4` | 1-20，单条消息最多重试次数（失败进重试队列，绝不静默丢）。 |
-| `delivery_base_delay_seconds` | int | `5` | 1-600，重试退避基数（指数退避起点，秒）。 |
-| `delivery_retry_batch` | int | `5` | 1-50，每轮最多重发多少条待重试消息。 |
-| **=== 状态 / 磁盘 ===** | | | |
-| `state_db_path` | string | `""` | 留空 = <plugin_data>/log_watcher.sqlite3（推荐）。 |
-| `fingerprint_ttl_hours` | int | `72` | 1-720，指纹计数与知识库条目保留时长。 |
-| `history_retention_days` | int | `30` | 1-3650，alerts / remediation_runs 保留天数。 |
-| `history_max_rows` | int | `20000` | 1000-1000000，alerts 行数硬上限（超出按最旧删除）。 |
-| `outbox_max_bytes` | int | `33554432` | 1 MiB-1 GiB，摘录目录硬字节上限（与 keep_excerpt_files 同时生效，取更严）。 |
-| `excerpt_mode` | string | `"ledger_only"` | ledger_only = 摘录进 alerts.excerpt_path 指向的单文件（推荐）；file = 每轮一个文件（旧行为）；off = 不留摘录。 |
-| `keep_excerpt_files` | int | `50` | 1-1000，摘录目录保留文件数。 |
-| `outbox_max_age_hours` | int | `24` | 1-720，摘录最长留存小时。 |
-| `disk_report_interval_hours` | int | `24` | 1-168，磁盘占用报告的间隔（日志一行 usage）。 |
-| **=== 紧急修复（dsh headless，默认关） ===** | | | |
-| `remediation_enable` | bool | `false` | 修复总开关，默认关。开启前必须先把 headless 凭据/路由配好（插件自带 dsh-headless-overlay.yml 已默认叠加），否则每次都是 unavailable（只发回执，不修）。 |
-| `remediation_dsh_command` | string | `"dsh"` | dsh 可执行文件/绝对路径。 |
-| `remediation_profile` | string | `"headless"` | 传给 dsh 的 --profile 值。 |
-| `remediation_patch_overlay` | string | `""` | 留空 = 用插件自带的 dsh-headless-overlay.yml（与插件同目录，绝对路径解析，不依赖 cwd，以 --patch 叠加，不改任何 profile）。删除该文件即完全失效（可回滚）。填路径 = 手动覆盖。 |
-| `remediation_workdir` | string | `"/root/AstrBot"` | 子进程 cwd = 工作区根。 |
-| `remediation_timeout_seconds` | int | `900` | 30-3600，看门狗超时（超时会 kill 整个进程组并回收）。默认 900 的依据与「超时 vs 卡死」的判据见 §5.5。 |
-| `remediation_max_concurrency` | int | `1` | 1-4，并发闸；建议恒为 1。 |
-| `remediation_cooldown_seconds` | int | `3600` | 0-86400，同指纹冷却，冷却期内不重复修复（会发 blocked 回执）。 |
-| `remediation_daily_limit` | int | `5` | 0-100，每日修复次数上限（跨重启持久）。 |
-| `remediation_permission_mode` | string | `"workspace-write"` | 子进程权限级别，只允许 read-only / workspace-write（只改当前工作区）。danger-full-access 会被强制回落并 warning，本插件不提供该选项；子进程也不会携带任何sandbox_permissions 提权键（无头场景无人审批）。 |
-| `remediation_env_refs` | list | `[]` | 额外传给子进程的环境变量名（值取自父进程 env）。 |
-| `remediation_inherit_env` | bool | `false` | 是否把父进程 os.environ 整体传给子进程。 |
-| `remediation_artifact_dir` | string | `""` | 轨迹与产物目录，留空 = <plugin_data>/remediation。 |
-| `remediation_artifact_keep` | int | `50` | 1-100000，轨迹目录保留文件数上限。由插件每轮自动调用 prune_artifacts() 清理（不需要手工 cron）。 |
-| `remediation_artifact_max_age` | int | `604800` | 0-315360000，轨迹最长留存秒数（默认 7 天）。同样由每轮的 prune_artifacts() 执行。 |
-| `remediation_artifact_max_bytes` | int | `67108864` | 0-1 TiB，轨迹目录字节上限。同样由每轮的 prune_artifacts() 执行。 |
-| `remediation_max_output_bytes` | int | `1048576` | 4096-16777216，单个轨迹文件落盘上限（超出截断并标记）。2026-10-19 起默认 256 KiB → 1 MiB：实测一次成功 run 的轨迹恰好封顶、结尾 `final` 被截。 |
-| `remediation_trace_raw` | bool | `false` | true = 轨迹保留 stdout/stderr 原文（默认 false 会做凭据掩码 <masked>）。 |
-| `remediation_prompt_template` | text | `""` | 覆盖 prompts/remediate_task.md（留空用自带模板）。 |
-| `remediation_receipt` | bool | `true` | 是否发修复回执。**强烈建议保持开启**：每一次修复尝试（含 skipped/blocked/unavailable/timeout/failed/cancelled/rejected）都必须回执，关掉等于修复结果不可见。 |
-| `remediate_confirm_count` | int | `2` | 1-10，HIGH 级需要连续命中多少次才触发修复（见 architecture §4.2）。 |
-| `remediate_confidence_threshold` | float | `0.8` | 0.0-1.0，置信度直通阈值（≥ 该值可跳过确认次数）。 |
-| **=== 自反馈 / 管理白名单 ===** | | | |
-| `self_log_names` | list | `["log_watcher"]` | 本插件自身日志 tag，命中时不计入告警（防自触发循环）。 |
-| `self_feedback_ids` | list | `[]` | 本插件目标会话 id，用于屏蔽「适配器把自己的发送失败记成别人的 WARN」回声。 |
-| `admin_users`（隐藏） | list | `[]` | 【本版本未实现】architecture §8.7 规划的 /lw status/ack/silence/remediate 管理命令与白名单尚未接线：当前版本不注册任何命令处理器（零事件入口），填了也不会生效。保留该键只为配置前向兼容，详见 README「未实现的功能」。 |
+| `self_guard.log_with_bot_id` | bool | `false` | 开启后插件日志会带 [platform:平台ID]，多 Bot 环境便于定位；平台 ID 取自提醒会话的 unified_msg_origin 前缀。 |
+| **① 主动提醒（`notify`）** | | | |
+| `notify.target_sessions` | list | `[]` | 命中日志时把提醒主动发到这些会话。**列表即优先级**：第 1 个是主出口，只有它失败才发第 2 个（不是双发）。填 unified_msg_origin：群 BOT1:group:10001、私聊 BOT1:private:10002。 |
+| `notify.send_mode` | string | `"auto"` | auto = 按通道能力选（默认）；text = 只发纯文本分片；forward = 优先合并转发（通道不支持时自动退回文本）。注意：旧配置里的 file/txt 会被映射成 text —— weixin_oc 通道只有 Plain 文本能送达，File 会被服务端 prepare 失败、No… |
+| `notify.prefer_forward` | bool | `false` | 通道同时支持文本与转发时优先用合并转发。 |
+| `notify.min_severity` | string | `"MEDIUM"` | 即时告警的最低等级（五级）。低于它的判定只进摘要或静默。 |
+| `notify.include_excerpt` | bool | `true` | 告警里是否附日志摘录正文。 |
+| `notify.max_excerpt_chars` | int | `6000` | 单条摘录字符上限（200-20000，代码夹紧）。 |
+| `notify.max_chars_per_message` | int | `0` | 覆盖通道分片长度；0 = 按通道能力表（推荐）。上限 8000（硬顶）。 |
+| **② 日志扫描（`scan`）** | | | |
+| `scan.log_dir` | string | `""` | 留空 = 用 AstrBot 自己的日志目录（跟随 log_file_path，默认 <data>/logs），一般不用改。 |
+| `scan.file_pattern` | string | `"*.log"` | 目录里扫哪些文件，glob 写法。默认只读当前日志文件；填 astrbot.log* 会把轮转出来的历史文件也扫一遍。 |
+| `scan.levels` | list | `["ERROR", "CRITICAL"]` | 只提醒列表里的等级，可填 DEBUG/INFO/WARNING/ERROR/CRITICAL（也认短名 DBUG/WARN/ERRO/CRIT，内部统一规整为规范长名）。 |
+| `scan.exclude_keywords` | list | `[]` | 行里包含任一关键字就不算命中（仍会作为前后文出现在摘录里）。本插件自己的日志固定被忽略，避免自触发循环。 |
+| `scan.poll_interval_seconds` | int | `30` | 扫描间隔秒（5-86400）。也是「文件末尾的报错等不到后文」的最长等待时间。 |
+| `scan.start_from_end` | bool | `true` | 开启（默认）= 跳过文件已有内容，不重放历史；关闭 = 从文件开头读。 |
+| `scan.context_before` | int | `5` | 0-200。命中行前面带几行日志。 |
+| `scan.context_after` | int | `5` | 0-200。命中行后面带几行日志（堆栈就靠它带出来）；前后文连成一片的多条命中会合并成一段，不会重复前文。同样也是发出的延迟（见 `scan.poll_interval_seconds`）。 |
+| `scan.max_lines_per_poll` | int | `200` | 20-5000。一轮最多展开多少行（含前后文），超出的只在汇总里计数。 |
+| **③ AI 威胁分级（`classify`）** | | | |
+| `classify.enable` | bool | `true` | 分级总开关。关闭后按日志等级直接触发（噪声 8.9:1 会直灌聊天）。 |
+| `classify.mode` | string | `"auto"` | auto = 配了 provider 走 LLM、否则本地规则；local = 永不调 LLM（最省、可离线）；llm = LLM 优先、失败降级。 |
+| `classify.provider_id` | string | `""` | AstrBot 的 provider id，供 llm_generate 使用。 |
+| `classify.timeout_seconds` | int | `20` | 5-300，单次 LLM 判定超时。 |
+| `classify.system_prompt` | text | `""` | 覆盖内置提示词（留空用 prompts/classify_system.md）。 |
+| `classify.fallback_severity` | string | `"MEDIUM"` | 降级地板（五级）：LLM 不可用/超时/输出非法时取 max(本地判定, 该值)。 |
+| `classify.unmatched_severity` | string | `"LOW"` | 本地模式「有 ERROR 等级但没有任何规则能解释」的等级。默认 LOW = 只进摘要、不即时推送；填 `MEDIUM` 恢复旧行为（2026-10-16 重放：全天 95 条即时推送＝未匹配错误 41 条 ＋ 可恢复抖动 54 条，两族都曾被判 MEDIUM 直推）。**这个键必须同时进 `main._engine_config()` 白名单**，否则生产链路上被静默丢弃（2026-10-18 漏过一次，见 §7.2 / §10）。 |
+| `classify.transient_severity` | string | `"MEDIUM"` | 本地模式可恢复抖动（上游 503 / 框架重试中）的等级。默认 MEDIUM = 验收基线（用例 TRANS-01，notes 写着「压成 LOW = 漏报」）；填 `LOW` = 抖动只进摘要。 |
+| `classify.max_block_lines` | int | `80` | 5-500，送 LLM 的最大行数。 |
+| `classify.max_calls_per_round` | int | `5` | 0-1000，单轮 LLM 调用上限（0 = 不限，不推荐）。 |
+| `classify.max_calls_per_hour` | int | `60` | 0-100000，每小时 LLM 调用上限（0 = 不限）。 |
+| `classify.noise_shortcut` | bool | `true` | 已知噪声短路（asyncio 回调异常等直接判 IGNORE，不付 token）。 |
+| `classify.kb_enabled` | bool | `true` | 指纹知识库：同一指纹复用上次判定。 |
+| `classify.kb_max_entries` | int | `500` | 50-100000，知识库条数上限（超出由 prune 清理）。 |
+| `classify.new_pattern_escalate` | bool | `false` | 新指纹升一级（见 architecture §4.3）。 |
+| `classify.route_map` | dict | `{}` | 等级→路由覆写，如 {"MEDIUM": "digest"}。非法值会被忽略并 warning；CRITICAL→store 被强制拒绝。 |
+| **（v2.2.0 起删除的键）** | | | 4 个隐藏兼容键（`llm_provider_id` / `chat_provider_id` / `llm_timeout` / `provider_id`）与占位键 `admin_users` 已从 schema 删除：它们从未被任何代码读过（`main._classify_provider_id()` 只读 `classify.provider_id`；`/lw` 命令族未实现）。旧配置里残留的这些键在换版后会被核心当 stale 键清掉，属预期行为。 |
+| **④ 通知预算 / 聚合 / 静默（`budget`）** | | | |
+| `budget.dedupe_window_seconds` | int | `900` | 0-604800，同指纹冷却窗口：窗口内重复命中不再单独告警。 |
+| `budget.digest_interval_seconds` | int | `1800` | 60-86400，LOW 级摘要聚合间隔。 |
+| `budget.digest_max_items` | int | `50` | 1-500，单个摘要桶最多条目数。 |
+| `budget.max_alerts_per_round` | int | `5` | 0-100，单轮发送上限。 |
+| `budget.max_alerts_per_minute` | int | `12` | 0-600，分钟预算。 |
+| `budget.max_alerts_per_hour` | int | `80` | 0-5000，小时预算。 |
+| `budget.max_alerts_per_day` | int | `300` | 0-50000，日预算（跨重启持久化）。 |
+| `budget.burst_window_seconds` | int | `60` | 1-3600，突发窗口长度。 |
+| `budget.burst_threshold` | int | `8` | 1-500，窗口内达到多少条告警就合并成一条突发消息。 |
+| `budget.burst_min_severity` | string | `"MEDIUM"` | 参与突发合并的最低等级（五级）。 |
+| `budget.silence_ranges` | list | `[]` | 静默时段（本机时区，支持跨夜），如 ["23:00-07:00"]。格式错会被忽略并 warning。 |
+| `budget.silence_min_severity` | string | `"HIGH"` | ≥ 此等级的告警可穿透静默时段（五级）。 |
+| `delivery.channel_overrides` | dict | `{}` | 按通道覆盖能力，如 {"weixin_oc": {"max_chars": 1000}}。 |
+| **⑤ 投递与通道能力（`delivery`）** | | | |
+| `delivery.max_attempts` | int | `4` | 1-20，单条消息最多重试次数（失败进重试队列，绝不静默丢）。 |
+| `delivery.base_delay_seconds` | int | `5` | 1-600，重试退避基数（指数退避起点，秒）。 |
+| `delivery.retry_batch` | int | `5` | 1-50，每轮最多重发多少条待重试消息。 |
+| **⑥ 状态 / 磁盘 / 留存（`state`）** | | | |
+| `state.db_path` | string | `""` | 留空 = <plugin_data>/log_watcher.sqlite3（推荐）。 |
+| `state.fingerprint_ttl_hours` | int | `72` | 1-720，指纹计数与知识库条目保留时长。 |
+| `state.history_retention_days` | int | `30` | 1-3650，alerts / remediation_runs 保留天数。 |
+| `state.history_max_rows` | int | `20000` | 1000-1000000，alerts 行数硬上限（超出按最旧删除）。 |
+| `state.outbox_max_bytes` | int | `33554432` | 1 MiB-1 GiB，摘录目录硬字节上限（与 `state.keep_excerpt_files` 同时生效，取更严）。 |
+| `state.excerpt_mode` | string | `"ledger_only"` | ledger_only = 摘录进 alerts.excerpt_path 指向的单文件（推荐）；file = 每轮一个文件（旧行为）；off = 不留摘录。 |
+| `state.keep_excerpt_files` | int | `50` | 1-1000，摘录目录保留文件数。 |
+| `state.outbox_max_age_hours` | int | `24` | 1-720，摘录最长留存小时。 |
+| `state.disk_report_interval_hours` | int | `24` | 1-168，磁盘占用报告的间隔（日志一行 usage）。 |
+| **⑦ 紧急修复（dsh headless，默认关）（`remediation`）** | | | |
+| `remediation.enable` | bool | `false` | 修复总开关，默认关。开启前必须先把 headless 凭据/路由配好（插件自带 dsh-headless-overlay.yml 已默认叠加），否则每次都是 unavailable（只发回执，不修）。 |
+| `remediation.dsh_command` | string | `"dsh"` | dsh 可执行文件/绝对路径。 |
+| `remediation.profile` | string | `"headless"` | 传给 dsh 的 --profile 值。 |
+| `remediation.patch_overlay` | string | `""` | 留空 = 用插件自带的 dsh-headless-overlay.yml（与插件同目录，绝对路径解析，不依赖 cwd，以 --patch 叠加，不改任何 profile）。删除该文件即完全失效（可回滚）。填路径 = 手动覆盖。 |
+| `remediation.workdir` | string | `"/root/AstrBot"` | 子进程 cwd = 工作区根。 |
+| `remediation.timeout_seconds` | int | `900` | 30-3600，看门狗超时（超时会 kill 整个进程组并回收）。默认 900 的依据与「超时 vs 卡死」的判据见 §5.5。 |
+| `remediation.max_concurrency` | int | `1` | 1-4，并发闸；建议恒为 1。 |
+| `remediation.cooldown_seconds` | int | `3600` | 0-86400，同指纹冷却，冷却期内不重复修复（会发 blocked 回执）。 |
+| `remediation.daily_limit` | int | `5` | 0-100，每日修复次数上限（跨重启持久）。 |
+| `remediation.permission_mode` | string | `"workspace-write"` | 子进程权限级别，只允许 read-only / workspace-write（只改当前工作区）。danger-full-access 会被强制回落并 warning，本插件不提供该选项；子进程也不会携带任何sandbox_permissions 提权键（无头场景无人审批）。 |
+| `remediation.env_refs` | list | `[]` | 额外传给子进程的环境变量名（值取自父进程 env）。 |
+| `remediation.inherit_env` | bool | `false` | 是否把父进程 os.environ 整体传给子进程。 |
+| `remediation.artifact_dir` | string | `""` | 轨迹与产物目录，留空 = <plugin_data>/remediation。 |
+| `remediation.artifact_keep` | int | `50` | 1-100000，轨迹目录保留文件数上限。由插件每轮自动调用 prune_artifacts() 清理（不需要手工 cron）。 |
+| `remediation.artifact_max_age` | int | `604800` | 0-315360000，轨迹最长留存秒数（默认 7 天）。同样由每轮的 prune_artifacts() 执行。 |
+| `remediation.artifact_max_bytes` | int | `67108864` | 0-1 TiB，轨迹目录字节上限。同样由每轮的 prune_artifacts() 执行。 |
+| `remediation.max_output_bytes` | int | `1048576` | 4096-16777216，单个轨迹文件落盘上限（超出截断并标记）。2026-10-19 起默认 256 KiB → 1 MiB：实测一次成功 run 的轨迹恰好封顶、结尾 `final` 被截。 |
+| `remediation.trace_raw` | bool | `false` | true = 轨迹保留 stdout/stderr 原文（默认 false 会做凭据掩码 <masked>）。 |
+| `remediation.prompt_template` | text | `""` | 覆盖 prompts/remediate_task.md（留空用自带模板）。 |
+| `remediation.receipt` | bool | `true` | 是否发修复回执。**强烈建议保持开启**：每一次修复尝试（含 skipped/blocked/unavailable/timeout/failed/cancelled/rejected）都必须回执，关掉等于修复结果不可见。 |
+| `remediation.confirm_count` | int | `2` | 1-10，HIGH 级需要连续命中多少次才触发修复（见 architecture §4.2）。 |
+| `remediation.confidence_threshold` | float | `0.8` | 0.0-1.0，置信度直通阈值（≥ 该值可跳过确认次数）。 |
+| **⑧ 自身识别 / 自反馈（`self_guard`）** | | | |
+| `self_guard.log_names` | list | `["log_watcher"]` | 本插件自身日志 tag，命中时不计入告警（防自触发循环）。 |
+| `self_guard.feedback_ids` | list | `[]` | 本插件目标会话 id，用于屏蔽「适配器把自己的发送失败记成别人的 WARN」回声。 |
 
 ### 3.0 老配置里残留的 `send_mode: "file"` 会怎样
 
 不会报错：`deliver.py` 把 `file`/`txt`/`attachment` 映射成文本并记一条 degradation 提示
 （`历史配置 file（txt 附件）已废弃…`）。但 WebUI 的下拉选项里已经没有 `file`，所以**存下来的旧值
 会一直留在 `data/config/log_watcher_config.json` 里**（实测：用真实 `AstrBotConfig` 加载本 schema +
-现有生产配置，`send_mode` 仍是 `'file'`，其余 79 个新键被自动补成默认值）。
+现有生产配置，`notify.send_mode` 仍是 `'file'`，其余 81 个叶子被自动补成默认值）。
 建议在 WebUI 下拉里改成 `auto` 把这个残值清掉。
 
 ### 3.1 推荐起步配置（照抄即可）
 
 ```jsonc
 {
-  "target_sessions": ["<你的会话 UMO>"],   // 必填，否则只扫描不发送（回执也发不出）
-  "levels": ["ERROR", "CRITICAL"],         // 别加 WARNING（每天上千条噪声）
-  "send_mode": "auto",                     // weixin_oc 上就是 Plain 文本
-  "classify_enable": true,
-  "classify_provider_id": "",              // 有 provider 再填；留空走本地规则
-  "notify_min_severity": "MEDIUM",
-  "remediation_enable": false,             // 先关着看几天告警质量，再决定要不要开
-  "remediation_receipt": true              // 永远保持 true
+  "notify": {
+    "target_sessions": ["<你的会话 UMO>"],  // 必填，否则只扫描不发送（回执也发不出）
+    "send_mode": "auto",                    // weixin_oc 上就是 Plain 文本
+    "min_severity": "MEDIUM"
+  },
+  "scan": {
+    "levels": ["ERROR", "CRITICAL"]         // 别加 WARNING（每天上千条噪声）
+  },
+  "classify": {
+    "enable": true,
+    "provider_id": ""                       // 有 provider 再填；留空走本地规则
+  },
+  "remediation": {
+    "enable": false,                        // 先关着看几天告警质量，再决定要不要开
+    "receipt": true                         // 永远保持 true
+  }
 }
 ```
+
+> 其余键不用写出来：`AstrBotConfig` 会按 schema 补默认值（新增键由插件下次加载时自动写入）。
 
 ### 3.2 三个「改之前先想清楚」的键
 
 | 键 | 为什么 |
 |---|---|
-| `remediation_enable` | 打开后插件会真的在 `remediation_workdir` 里调 `dsh` 改文件（权限 `workspace-write`）。先确认 §5 的前置条件与闸门数值 |
-| `remediation_env_refs` / `remediation_inherit_env` | 会把父进程环境变量交给子 agent（可能含 token）。默认空/关，推荐用 profile 侧凭据 |
-| `exclude_keywords` | 出站告警摘录**不做凭据掩码**（见 §10 F18），日志里含密钥的行只能靠它挡 |
+| `remediation.enable` | 打开后插件会真的在 `remediation.workdir` 里调 `dsh` 改文件（权限 `workspace-write`）。先确认 §5 的前置条件与闸门数值 |
+| `remediation.env_refs` / `remediation.inherit_env` | 会把父进程环境变量交给子 agent（可能含 token）。默认空/关，推荐用 profile 侧凭据 |
+| `scan.exclude_keywords` | 出站告警摘录**不做凭据掩码**（见 §10 F18），日志里含密钥的行只能靠它挡 |
 
 ---
 
@@ -249,10 +285,10 @@ sqlite3 log_watcher.sqlite3 "select fingerprint,severity,decision,route,summary 
 
 | 目录 | 内容 | 清理者 | 上限键 |
 |---|---|---|---|
-| `outbox/` | 摘录台账（`excerpt_mode: ledger_only` 下每轮一个文件） | `DiskGovernor`（每轮） | `outbox_max_bytes` + `keep_excerpt_files` + `outbox_max_age_hours`（取更严） |
+| `outbox/` | 摘录台账（`excerpt_mode: ledger_only` 下每轮一个文件） | `DiskGovernor`（每轮） | `state.outbox_max_bytes` + `state.keep_excerpt_files` + `state.outbox_max_age_hours`（取更严） |
 | `failed/` | 发送失败的摘录（人工取证用） | `DiskGovernor`（同上） | 同上 |
-| `remediation/` | 修复轨迹 JSONL（默认已掩码） | **插件自己**：`main._commit_round()` 每轮在独立线程调用 `remediate.prune_artifacts()` | `remediation_artifact_keep` / `_max_age` / `_max_bytes` |
-| `log_watcher.sqlite3` | 状态库（WAL） | `SqliteStore.prune()`（每轮） | `history_retention_days` / `history_max_rows` / `fingerprint_ttl_hours` / `kb_max_entries` |
+| `remediation/` | 修复轨迹 JSONL（默认已掩码） | **插件自己**：`main._commit_round()` 每轮在独立线程调用 `remediate.prune_artifacts()` | `remediation.artifact_keep` / `_max_age` / `_max_bytes` |
+| `log_watcher.sqlite3` | 状态库（WAL） | `SqliteStore.prune()`（每轮） | `state.history_retention_days` / `state.history_max_rows` / `state.fingerprint_ttl_hours` / `classify.kb_max_entries` |
 
 轨迹清理**不需要外部 cron**：`main.py` 的 `_prune_artifacts_hook()`（第 1054 行）在每轮
 `_commit_round()`（第 1000 行）里调用一次 `prune_artifacts(cfg, now=now)`，条数/年龄/字节三闸
@@ -267,7 +303,7 @@ ls -l /root/AstrBot/data/plugin_data/log_watcher/remediation        # 期望空�
 ### 4.4 手动重跑一轮（不重启）
 
 插件没有管理命令（见 §10「/lw 未实现」）。想立刻看一轮结果，最小动作是**重载插件**，
-或调小 `poll_interval_seconds`（下限 5）后重载：
+或调小 `scan.poll_interval_seconds`（下限 5）后重载：
 
 ```bash
 # 只读观察，不改配置：等下一个扫描周期，然后看日志
@@ -287,7 +323,7 @@ sleep 35; grep -a "\[log_watcher\]" /root/AstrBot/data/logs/astrbot.log | tail -
   dsh --profile headless --patch /root/AstrBot/data/plugins/log_watcher/dsh-headless-overlay.yml --json -- -
   ```
   即 `--patch` **叠加**在 profile 之上，**不修改任何 profile 文件**（`~/.dsh/profiles/` 保持原样）。
-- 配置 `remediation_patch_overlay` 留空 = 用自带 overlay（回执里来源写 `bundled`）；填路径 = 手动覆盖；
+- 配置 `remediation.patch_overlay` 留空 = 用自带 overlay（回执里来源写 `bundled`）；填路径 = 手动覆盖；
   文件缺失 = 回落 profile 自身配置 + warning。
 - **回滚开关 = 删文件**：删掉 `dsh-headless-overlay.yml` 后 headless 路由立即失效，
   修复会以 `unavailable` 终态结束（**仍然发回执**）。改 overlay 不需要重启 AstrBot（每次调用重新读）。
@@ -297,14 +333,14 @@ sleep 35; grep -a "\[log_watcher\]" /root/AstrBot/data/logs/astrbot.log | tail -
 
 ### 5.2 ② 权限固定 `workspace-write`
 
-- 只接受 `read-only` / `workspace-write`（`remediation_permission_mode`，remediate.py:220 `permission_mode()`）；
+- 只接受 `read-only` / `workspace-write`（`remediation.permission_mode`，remediate.py:220 `permission_mode()`）；
   写 `danger-full-access` 会被强制回落并 warning，**插件不提供该选项**，代码/配置里不出现该值。
-- 语义：**只允许改当前工作区**（`remediation_workdir`，默认 `/root/AstrBot`）。
+- 语义：**只允许改当前工作区**（`remediation.workdir`，默认 `/root/AstrBot`）。
   实测：区内写成功；区外写被拦并返回 `[sandbox: file access denied under workspace-write mode]`，文件不生成。
 - 子进程环境里**不带任何提权键**：`FORBIDDEN_ENV_KEYS`（remediate.py:78）硬剔除
   `sandbox_permissions` / `SANDBOX_PERMISSIONS` / `DSH_SANDBOX_PERMISSIONS` /
   `AGENT_SANDBOX_PERMISSIONS` / `DSH_PERMISSION_ESCALATE`，且 `DSH_PERMISSION_MODE` 最后写入、
-  不可被 `remediation_inherit_env` 覆盖。无头场景无人审批 ⇒ **不重试提权**。
+  不可被 `remediation.inherit_env` 覆盖。无头场景无人审批 ⇒ **不重试提权**。
 - 本插件不重启 AstrBot、不 `git push`。
 
 ### 5.3 前置条件自检（两条命令，人工执行一次）
@@ -324,12 +360,12 @@ dsh --profile headless --patch /root/AstrBot/data/plugins/log_watcher/dsh-headle
 
 | 闸门 reason | 回执 status | 含义 / 怎么解 |
 |---|---|---|
-| `off` | `skipped` | 修复总开关关着（默认）。要修才开 `remediation_enable` |
+| `off` | `skipped` | 修复总开关关着（默认）。要修才开 `remediation.enable` |
 | `not_candidate` | `skipped` | 该判定的路由不是修复候选（等级不够或路由被覆写） |
-| `confirm_count` | `skipped` | 未达到 `remediate_confirm_count` 次连续命中 |
+| `confirm_count` | `skipped` | 未达到 `remediation.confirm_count` 次连续命中 |
 | `busy` | `blocked` | 并发闸被占**或状态库不可写**（fail-closed） |
-| `cooldown` | `blocked` | 同指纹还在 `remediation_cooldown_seconds` 内 |
-| `daily_limit` | `blocked` | 当天已达 `remediation_daily_limit` |
+| `cooldown` | `blocked` | 同指纹还在 `remediation.cooldown_seconds` 内 |
+| `daily_limit` | `blocked` | 当天已达 `remediation.daily_limit` |
 | `storm` | `blocked` | 突发/风暴抑制中 |
 | `credential` | `unavailable` | headless 凭据/路由缺失（要配 provider 或恢复 overlay） |
 | 非上表（执行器终态） | `failed`/`timeout`/… | 已过闸，是子进程自己失败/超时/被取消，回执会写「非闸门拦截（已通过修复闸，执行器终态 X）」 |
@@ -338,7 +374,7 @@ dsh --profile headless --patch /root/AstrBot/data/plugins/log_watcher/dsh-headle
 
 **实测（2026-10-18）**：同一个真实修复任务，直接 `dsh` 跑 = **284.32 s**（exit 0 / 150 事件 /
 9 步 / 39 次工具调用），走插件 runner = **308.0 s**（`status=ok`）。所以
-`remediation_timeout_seconds` 的默认值从 300 抬到 **900**：300 是「约一半概率死在收尾前」，
+`remediation.timeout_seconds` 的默认值从 300 抬到 **900**：300 是「约一半概率死在收尾前」，
 不是安全余量。
 
 **为什么超时看着像卡死**：`asyncio.wait_for(proc.communicate())` 被取消时**内部缓冲区不返回**，
@@ -350,7 +386,7 @@ dsh --profile headless --patch /root/AstrBot/data/plugins/log_watcher/dsh-headle
 time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- - <<< "只回复 OK"; echo "exit=$?"
 ```
 
-手工跑得完、插件跑超时 ⇒ **看门狗太小**（调 `remediation_timeout_seconds`）；
+手工跑得完、插件跑超时 ⇒ **看门狗太小**（调 `remediation.timeout_seconds`）；
 手工跑也迟迟不结束 ⇒ 才是真卡死（看轨迹 JSONL 的最后事件）。
 
 ---
@@ -359,7 +395,7 @@ time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- 
 
 ### 6.1 契约（用户硬要求）
 
-> **每一次修复尝试都必须向 `target_sessions` 推送一条回执**，含没修成的那些；
+> **每一次修复尝试都必须向 `notify.target_sessions` 推送一条回执**，含没修成的那些；
 > **「未改动」不许省略**；**被闸拦下必须写明被哪一道闸拦下 + 后续怎么办**。
 
 代码落点：`remediate.build_receipt`（remediate.py:1610）是唯一实现；`main._receipt_plan`（main.py:811）
@@ -372,12 +408,12 @@ time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- 
 
 **出口链与重试**（2026-10-18 运营方定案）：`deliver.outlet_order`（deliver.py:473）保序去重，
 列表第 1 个是主出口；`deliver.deliver_over_outlets`（deliver.py:499）逐个出口试
-`delivery_max_attempts` 次（默认 **2** = 初投 + 1 次重试，配置里可改），用尽才切下一个出口，
+`delivery.max_attempts` 次（默认 **2** = 初投 + 1 次重试，配置里可改），用尽才切下一个出口，
 **第一个成功就停**（不再"两处都收到"）；全部失败才按主出口入队一次。
 
 **出口策略的三条硬约束**（同日定案，都已在代码里）：
 
-1. **至少两条出口**：`target_sessions` 不足两条 ⇒ 插件**停摆**（不扫描/不投递/不修复），
+1. **至少两条出口**：`notify.target_sessions` 不足两条 ⇒ 插件**停摆**（不扫描/不投递/不修复），
    日志打 ERROR ＋ 在状态目录写 `CONFIG-INVALID.txt`（含原因与怎么恢复）；配置合格后重启即恢复，
    合格时会把旧痕迹删掉。为什么不是"拒绝加载"：核心 loader 对实例化阶段的异常不保证醒目，
    而停摆＋状态目录里的文件是运营方**会看到的地方**。
@@ -389,7 +425,7 @@ time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- 
    带 `failure:` 证据的（例如那次 GMI `import-error`）**不受影响**；人工覆写（`source=manual`）永不封顶。
 
 **轨迹被输出上限截断时怎么验收**（2026-10-19 定，来自一次真实误判风险）：
-`remediation_max_output_bytes`（**2026-10-19 起默认 1048576 = 1 MiB**；旧装若仍是 262144）是**流式落盘上限**，超限会在文件尾追加
+`remediation.max_output_bytes`（**2026-10-19 起默认 1048576 = 1 MiB**；旧装若仍是 262144）是**流式落盘上限**，超限会在文件尾追加
 标记 `…（已截断）` 并截断后续行 —— agent 若读了大文件（例如去比对历史轨迹），一次**成功** run
 的轨迹也可能**恰好封顶**，结尾的 `{"type":"final"}` 与 `turn_end` 就都不在文件里了（实测：
 `r20261018-234346-9503f842`，`ok` / `exit 0` / 511.2 s，文件恰为 262144 字节）。
@@ -398,7 +434,7 @@ time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- 
   ② 该行 `summary` 非空（插件**流式**提取结论，不受文件截断影响）；③ `receipt_sent` 的语义（见上：
   **写回** ≠ **送达**；`remediation_receipt=false` 时仍写回但不投递）；④ arena 之外零写入。
 - 文件尾的 `…（已截断）` 标记可用于**事后**判读；想保住完整轨迹就把
-  `remediation_max_output_bytes` 调到 `1048576`（1 MiB）—— **2026-10-19 起这就是默认值**；旧装仍是 262144 时，面板保存一次即可、无需停机。
+  `remediation.max_output_bytes` 调到 `1048576`（1 MiB）—— **2026-10-19 起这就是默认值**；旧装仍是 262144 时，面板保存一次即可、无需停机。
 - ⚠️ 同类"绿灯陷阱"：`dsh --profile headless --dump-config` **exit 0 只证明"能组合"、不渲染提示词**
   ⇒ 它绿 ≠ 真能跑（2026-10-18 的 `{{cwd}}` 与 `MISSING_CREDENTIAL` 两处阻断都是**真跑**才暴露的）。
 
@@ -425,7 +461,7 @@ time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- 
 | 子进程被取消（插件重载/关闭） | `cancelled` | `remediate.run_remediation` 的 `CancelledError` 分支：先回收进程组、补账、再透传取消；`_send_receipt` 由调用方中断时不再发送（这是唯一不发回执的状态，原因见 §10.3） |
 
 边界（明确写下来，不藏着）：`remediation_receipt=false` 关掉回执（不建议）；
-`target_sessions` 为空则没有可推送对象（此时告警也发不出）；`off`/`not_candidate` 两种拦截
+`notify.target_sessions` 为空则没有可推送对象（此时告警也发不出）；`off`/`not_candidate` 两种拦截
 **同一指纹每进程只提示一次**（避免默认关闭状态下每轮刷屏），其余闸门每次都发。
 
 ### 6.2 真实样例（本轮亲手跑出来的，非手写）
@@ -561,8 +597,8 @@ time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- 
 
 | 回执字段 | 来源 |
 |---|---|
-| 渠道 | **插件**：`main._send_receipt(session, …)` 的 target_sessions |
-| 方案（profile/overlay 名+来源/权限/工作区） | **插件**：`resolve_overlay()` + `permission_mode()` + `remediation_workdir` |
+| 渠道 | **插件**：`main._send_receipt(session, …)` 的 `notify.target_sessions` |
+| 方案（profile/overlay 名+来源/权限/工作区） | **插件**：`resolve_overlay()` + `permission_mode()` + `remediation.workdir` |
 | 判定（严重度/指纹/component/新旧指纹） | **插件**：`ThreatVerdict`（本地规则或 LLM 判定产出） |
 | 诊断结论（根因） | **dsh 结论 JSON** 的 `root_cause`（经 `conclusion_from_trace()` 从轨迹恢复）；取不到时退回 `run.summary` 首段 |
 | 证据（最多 3 条） | **dsh 结论 JSON** 的 `evidence[]` |
@@ -638,6 +674,9 @@ asyncio.run(main())
 PATH=/root/AstrBot/.venv/bin:$PATH python /tmp/repro_receipt.py   # 输出 §6.2 样例 A
 ```
 
+> 片段里那个 `cfg` 字典是**内部 cfg 键**（`main._remediate_config()` 的产物，键名沿用扁平形态，
+> v2.2.0 未改），不是插件配置路径；插件配置路径见 §3（如 `remediation.enable`）。
+
 > 本节样例由本轮临时脚本产生（`/tmp/scribe-t18/`，按磁盘纪律收工已删），脚本要点已内联在上面，
 > 可原样复现；样例里的轨迹路径是当时的临时路径。
 > 上面这段片段用的结论文本比 §6.2 样例 A 的短（`CONCLUSION` 自己填），所以「诊断结论/证据/建议动作」的字面内容会不同 —— 结构、段落顺序与字段来源完全一致。
@@ -649,15 +688,15 @@ PATH=/root/AstrBot/.venv/bin:$PATH python /tmp/repro_receipt.py   # 输出 §6.2
 
 | 症状（日志/回执） | 原因 | 处置 |
 |---|---|---|
-| 没有任何告警，日志里也没有命中 | `levels` 与全局 `log_level` 不匹配；或 `log_dir`/`file_pattern` 扫不到文件 | 调 `levels`；`ls` 日志目录确认文件；看 `未配置 levels` / `找不到日志文件` warning |
+| 没有任何告警，日志里也没有命中 | `scan.levels` 与全局 `log_level` 不匹配；或 `scan.log_dir`/`scan.file_pattern` 扫不到文件 | 调 `scan.levels`；`ls` 日志目录确认文件；看 `未配置 scan.levels` / `找不到日志文件` warning |
 | 告警发了但群里看不到 | 通道本身失败（如 weixin_oc 的 `prepare failed`） | 看 `weixin_oc(...): sendmessage failed ... errmsg=...`；若是 `context token missing`，先给机器人发一条消息刷新 context_token；失败残留见 `failed/` |
 | `历史配置 file（txt 附件）已废弃…` | 配置里还是 `send_mode: file` | 改成 `auto`（或不管，插件已按文本发） |
 | 回执里「后续怎么办：headless 凭据/路由缺失」 | 真调 dsh 后凭据/路由不可用，或 overlay 被删 | §5.3 两条命令验证；恢复 `dsh-headless-overlay.yml` 或配 provider，然后重载插件 |
-| 回执里 `拦下原因：cooldown/daily_limit/storm/busy` | 被闸门拦下（预期行为） | 等冷却/改 `remediation_cooldown_seconds` / `remediation_daily_limit`；`busy` 还要看状态库是否可写 |
-| 回执里 `非闸门拦截（已通过修复闸，执行器终态 timeout）` | 看门狗超时，进程组已被 kill 回收 | 调大 `remediation_timeout_seconds`，或先人工查轨迹 JSONL 的最后事件 |
-| 状态库不可用 / 修复被强制关闭 | `state_db_path` 不可写（权限、磁盘满、schema 版本过高） | 看 error 日志；修磁盘/权限；插件会退回 JSON 内存态，告警照发、修复关（fail-closed） |
-| 磁盘一直涨 | 摘录或轨迹没有按预期清理 | 看 `清理修复轨迹：{...}` 与 `磁盘占用 … 是否超限`；调 `outbox_max_bytes`/`keep_excerpt_files`/`outbox_max_age_hours`/`remediation_artifact_*` |
-| 自反馈放大（自己发的失败被当成新告警） | `self_feedback_ids` 没填 | 填上目标会话 id（或把 `levels` 去掉 `WARNING`） |
+| 回执里 `拦下原因：cooldown/daily_limit/storm/busy` | 被闸门拦下（预期行为） | 等冷却/改 `remediation.cooldown_seconds` / `remediation.daily_limit`；`busy` 还要看状态库是否可写 |
+| 回执里 `非闸门拦截（已通过修复闸，执行器终态 timeout）` | 看门狗超时，进程组已被 kill 回收 | 调大 `remediation.timeout_seconds`，或先人工查轨迹 JSONL 的最后事件 |
+| 状态库不可用 / 修复被强制关闭 | `state.db_path` 不可写（权限、磁盘满、schema 版本过高） | 看 error 日志；修磁盘/权限；插件会退回 JSON 内存态，告警照发、修复关（fail-closed） |
+| 磁盘一直涨 | 摘录或轨迹没有按预期清理 | 看 `清理修复轨迹：{...}` 与 `磁盘占用 … 是否超限`；调 `state.outbox_max_bytes`/`state.keep_excerpt_files`/`state.outbox_max_age_hours`/`remediation_artifact_*` |
+| 自反馈放大（自己发的失败被当成新告警） | `self_guard.feedback_ids` 没填 | 填上目标会话 id（或把 `scan.levels` 去掉 `WARNING`） |
 | 想看插件到底收到了哪些配置 | 启动行只打印摘要 | WebUI 插件详情页；或 `cat /root/AstrBot/data/config/log_watcher_config.json` |
 
 ---
@@ -681,7 +720,7 @@ ls -l /root/backups/log_watcher/            # 确认三份都在
 
 ### 8.2 只停用修复（最小回滚，不动代码）
 
-1. WebUI 插件详情页把 `remediation_enable` 关掉；或直接删掉路由 overlay：
+1. WebUI 插件详情页把 `remediation.enable` 关掉；或直接删掉路由 overlay：
    ```bash
    mv /root/AstrBot/data/plugins/log_watcher/dsh-headless-overlay.yml \
       /root/backups/log_watcher/dsh-headless-overlay.yml.bak
@@ -709,7 +748,7 @@ cp -a "$SNAP"/. "$PLUG"/
 mv "$PLUG/../..//plugin_data/log_watcher" /root/backups/log_watcher/data-after-v2   # 或按下条精修
 #   想保留续读位置：把迁移前的 JSON 还回去
 #   cp /root/backups/log_watcher/data-*/tail_state.json.migrated-* /path/tail_state.json
-# else v1 会重新从文件末尾开始（start_from_end=true，不重放历史）
+# else v1 会重新从文件末尾开始（`scan.start_from_end=true`，不重放历史）
 # 5) 重载插件，验收启动行
 #   期望：… 形态 file，间隔 30s …（没有 overlay/SQLite/分级那一段）
 ```
@@ -725,6 +764,21 @@ mv "$PLUG/../..//plugin_data/log_watcher" /root/backups/log_watcher/data-after-v
 grep -a "日志监听启动" /root/AstrBot/data/logs/astrbot.log | tail -1     # v2 启动行含 overlay + 状态 SQLite
 cd /root/AstrBot/data/plugins/log_watcher && PATH=/root/AstrBot/.venv/bin:$PATH python -m pytest tests -q
 ```
+
+### 8.5 配置结构回滚（v2.1.0 扁平键 ⇄ v2.2.0 分组）—— **必须与代码一起回滚**
+
+- 换版前跑的迁移脚本已留一份原始扁平文件：`log_watcher_config.json.bak-pre-v2.2.0-<ts>`（只写一次）。
+- **代码与配置成对还原**：只回代码 ⇒ 旧 schema 会把新的分组键当 stale 键清掉（值回落默认）；
+  只回配置 ⇒ 新代码读不到扁平键（打 WARNING 并回落默认值）。两条路都会**静默丢设置**。
+- 回滚配置：
+  ```bash
+  cp -a /root/AstrBot/data/config/log_watcher_config.json.bak-pre-v2.2.0-* \
+        /root/AstrBot/data/config/log_watcher_config.json
+  ```
+  （先确认没有人在 WebUI 上保存配置，或直接按 §1.1 的窗口纪律操作。）
+- 判据：回滚后重载一次，日志中 log_watcher 相关不应出现 `Config key removed` / `Config key added default`；
+  `notify.target_sessions` 的条数、`scan.levels`、四个 `remediation.*` 键与回滚前一致（只比键名与计数，
+  **不打印值**）。
 
 ---
 
@@ -747,6 +801,11 @@ cd /root/AstrBot/data/plugins/log_watcher && PATH=/root/AstrBot/.venv/bin:$PATH 
 | 12a | 静态纪律 | `ruff check *.py tests/*.py` → **All checks passed! exit=0**；`python -m compileall -q` → exit=0；`ruff format --check` → 13 个文件「would reformat」 | 见 §10.5：format 是**前一轮就存在的**风格偏差（AstrBot 仓库 line-length=88），本任务故意不套用（会重排 100+ 行并让 findings/报告里的 `文件:行` 取证全部失效） |
 | 12b | 边界用例复跑（verification-1.md §5 的 7 条 + V1/V7 + 本轮 3 个回执缺陷） | 自写临时脚本（走插件自身 reader/remediate，非手搓对象；按磁盘纪律收工已删，用例与期望值见本表） | **14/14 PASS**（含「等长重写无 inode/size 变化 ⇒ 该轮 0 行」= 已知边界）。**诚实更正**：我最初的「超长单行」断言写错了（以为不产出任何行），实测是**一行 1 MiB 截断体 + 标记，下一轮从 EOL 后续读、无残片**，已按实测改写断言；verification-1 的表述偏宽，实际语义以本次实测为准 |
 | 12 | `_conf_schema.json` 能被 AstrBot 真正加载 | `$PY` 用 `astrbot.core.config.astrbot_config.AstrBotConfig(config_path=<副本>, schema=<本插件 schema>)`（与 `star_manager.py:1156` 同一代码路径） | 加载成功：**85 个真实配置键（80 可见 + 4 兼容 + 1 未实现占位）全部物化 + 8 个分组标题键**共 93 项，`admin_users=[]`、`route_map={}`、`channel_overrides={}`、`remediation_enable=false`、`remediation_permission_mode='workspace-write'`；旧 schema 已删的 `_basic_section/_scan_section/_content_section` 被自动清理；旧配置里的 `send_mode='file'` 保留（见 §3.0） |
+
+> **口径变更（v2.2.0）**：下表是当时那一轮的实测记录（保留原样）。其中「schema 扁平键」「`self.config.get`
+> 扫键」「85 键（80 可见 + 4 兼容 + 1 占位）」「8 个分组标题键」这些口径都已随 v2.2.0 的结构改造失效 ——
+> 现在的口径是 **8 组 / 82 叶子**，读取点走 `self.cfg.get("组.叶子")`，漏键守卫在
+> `tests/test_config_map.py`（本表的脚本仍可读，但会把新叶子判成「缺键」，不要按它下结论）。
 
 复验脚本（判据 2/3）：
 
@@ -785,15 +844,16 @@ EOF
 |---|---|---|
 | **F12** `classify.Rule` 与 `models.Rule` 双定义 | 未闭合（low） | 消费端全 duck-typing、`isinstance` 零命中，当前无活风险；统一需改 classify 规则表（`pattern: re.Pattern` → `str + is_regex=True`）与 58 条既有断言，属结构性重构 |
 | **F16** `flush_burst` 窗口受轮询节奏影响 | 未闭合（待证） | 需要「假 provider 延时 ≥ 轮询间隔」的复现案例才能定论，本轮未构造出 |
-| **F18** **出站告警摘录不做凭据掩码** | 未修（功能取舍） | 要发原始日志才能定位；**轨迹侧已掩码（F10），聊天侧没有**。缓解：`exclude_keywords` 过滤密钥行；或加保守掩码开关（后续版本） |
+| **F18** **出站告警摘录不做凭据掩码** | 未修（功能取舍） | 要发原始日志才能定位；**轨迹侧已掩码（F10），聊天侧没有**。缓解：`scan.exclude_keywords` 过滤密钥行；或加保守掩码开关（后续版本） |
 | **F19** 注入能否把 benign 指纹推进 `emergency` | 未闭合（待证） | F01/F02 的围栏与中性化已做实（注入面从「可物理逃逸围栏」降为「LLM 语义风险」）；定论需真实 provider 往返（`classify_mode=llm`），本轮未做 |
 
 ### 10.2 `/lw` 管理命令：**未实现**
 
 `architecture.md §8.7` 规划的 `/lw status`、`/lw ack <指纹>`、`/lw silence <分钟>`、
-`/lw remediate <指纹>` 与 `admin_users` 白名单**本版本没有实现**：插件不注册任何命令处理器
-（保持零事件入口）。schema 里的 `admin_users` 是**前向兼容占位键**（`invisible`，已标注未实现），
-填了不会生效。需要这些命令时请单独实现（实现后必须用非白名单用户调用一次，确认被拒且留日志）。
+`/lw remediate <指纹>` 与管理白名单**本版本没有实现**：插件不注册任何命令处理器（保持零事件入口）。
+v2.1.0 里那个前向兼容占位键 `admin_users` 已在 v2.2.0 从 schema 删除（从未被任何代码读过，留着一个
+没人读的隐藏键只会增加误解面）。需要这些命令时请单独实现（实现后必须用非白名单用户调用一次，
+确认被拒且留日志）。
 
 ### 10.3 `cancelled` 与回执的唯一例外
 
@@ -806,13 +866,13 @@ kill 并 `await` 回收子进程、补账（`ledger.finish(..., receipt_sent=rec
 ### 10.4 其它边界
 
 - 采集解析依赖 AstrBot 的日志格式；非 loguru/标准 logging 格式的第三方日志可能匹配不到等级。
-- `context_before`/`context_after` 决定了「末尾报错」的等待行数，也就决定了告警延迟。
+- `scan.context_before`/`scan.context_after` 决定了「末尾报错」的等待行数，也就决定了告警延迟。
 - 通道自身不可用时，告警与回执都送不出去（会进重试队列 + `failed/` 残留，不静默丢）。
 
 - **V7（low，固有边界）**：外部工具若用 `copytruncate` 把小文件**重写成等长或更长但无 inode 变化**
   的内容，`stat` 层无法与「无新增」区分 ⇒ 该轮读 0 行、这段新内容被跳过（后续轮次从旧 offset 续读，
   不会产生脏行）。真实 loguru 轮转是 rename 制（inode 变化），实测正常；只有「copytruncate + 极快写入」
-  才有静默丢行的可能。规避：让日志工具用 rename 轮转，或改用 `file_pattern` 扫描轮转出的新文件。
+  才有静默丢行的可能。规避：让日志工具用 rename 轮转，或改用 `scan.file_pattern` 扫描轮转出的新文件。
 
 - 插件目录下有一个**不属于插件的** `data/` 子目录（`data/cmd_config.json`、`data/t2i_templates/`，
   mtime 2026-10-14 04:44）：那是 AstrBot core 曾以「插件目录为 cwd」被导入时，把全局数据目录
@@ -839,8 +899,8 @@ kill 并 `await` 回收子进程、补账（`ledger.finish(..., receipt_sent=rec
 - **摘录留存与 `alerts.excerpt_path` 不一致**：16 条告警里 6 条的 `excerpt_path` 已不存在
   （含 21:00 那条 `outbox/astrbot-log-20261014-210102.txt`），而告警文案写的是「完整摘录见日志目录」。
   投递成功的那几条会被清理、失败的那几条留在 `failed/`，所以「事后按记录回查原文」不总能做到。
-  复盘请从 `data/logs/astrbot.log` 按指纹/时间重取，或调大 `keep_excerpt_files`（当前 50）与
-  `outbox_max_age_hours`。
+  复盘请从 `data/logs/astrbot.log` 按指纹/时间重取，或调大 `state.keep_excerpt_files`（当前 50）与
+  `state.outbox_max_age_hours`。
 - **`engine.py` 的日志器不在 AstrBot 日志管道里（本轮只修了一半）**：`engine.py:67` 的
   `logging.getLogger("log_watcher.engine")` 产生的 INFO/WARN，在 `astrbot.log` 与 journald 里都是
   **0 条命中**（`[log_watcher.engine]`），`engine.py:741` 的「LLM 判定超时（>20s）」因此在 21:00
@@ -882,7 +942,7 @@ kill 并 `await` 回收子进程、补账（`ledger.finish(..., receipt_sent=rec
 | `README.md` | 重写：删除「forward 可用」「32 项测试」等虚假声明；新增回执契约、overlay/权限既定事实、weixin_oc 段型事实、prune 归属、`/lw` 未实现 | 回执契约表；`weixin_oc` 章节；`未实现的功能` 章节 |
 | `CHANGELOG.md` | 新增 2.0.0；1.0.0 的虚假声明就地更正为「已在 2.0.0 修正」 | `## 2.0.0 — 2026-10-14`；`已由 2.0.0 一节取代` |
 | `metadata.yaml` | `version: 1.0.0 → 2.0.0`；desc 更新为完整闭环 | 第 11 行 `version: 2.0.0` |
-| `_conf_schema.json` | 12 键 → **80 个可见键（= main.py 读取的 80 键，一一对应）+ 4 兼容键 + 1 未实现键，共 93 项**，每键含 type/default/中文 hint/误配后果；`send_mode` 默认 `file → auto` | `send_mode.default == "auto"`；`remediation_enable.default == false`；`remediation_permission_mode.options == ["read-only","workspace-write"]` |
+| `_conf_schema.json` | 12 键 → **80 个可见键（= main.py 读取的 80 键，一一对应）+ 4 兼容键 + 1 未实现键，共 93 项**，每键含 type/default/中文 hint/误配后果；`notify.send_mode` 默认 `file → auto` | `send_mode.default == "auto"`；`remediation_enable.default == false`；`remediation_permission_mode.options == ["read-only","workspace-write"]` |
 | `runbook.md`（**新增**） | 本文档：部署/生效、配置速查、运维、修复通道三项事实、回执契约与真实样例、故障处置、回滚、复验清单、未闭合项、provenance、交付清单 | 全文 |
 | `main.py` | ① 新增 `_prune_artifacts_hook()` 并在每轮 `_commit_round()` 调用 `prune_artifacts`（登记三个轨迹保留键的周期调用者）；②（t17 起）七段回执与全部终态投递路径 | `main.py:1000`（调用）、`main.py:1054`（hook）、`main.py:754`（`_send_receipt`）、`main.py:822`（`_send_terminal_receipt`）、`main.py:1143`/`1174`（两条调用点） |
 | `remediate.py` | ① 新增 `conclusion_from_trace()`；② `build_receipt` 缺省 conclusion 时从轨迹恢复；③ `changed=true` 无文件名不再写成「未改动任何文件」；④ 执行器终态不再写「拦下原因：ok」 | `remediate.py:765`（新函数）、`remediate.py:1610`（`build_receipt`）、`remediate.py:1673`（「未改动任何文件」）、`remediate.py:1709`（非闸门拦截）、`remediate.py:78`（`FORBIDDEN_ENV_KEYS`）、`remediate.py:220`（权限回落）、`remediate.py:259`（overlay 解析）、`remediate.py:1256`（`prune_artifacts`） |

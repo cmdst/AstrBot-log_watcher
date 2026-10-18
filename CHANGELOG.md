@@ -1,5 +1,50 @@
 # Changelog
 
+## v2.2.0（2026-10-19）
+
+> 本版只做一件事：**把插件配置从「95 个扁平顶键」整成 8 个分组（`notify` / `scan` / `classify` /
+> `budget` / `delivery` / `state` / `remediation` / `self_guard`）**，写得跟插件市场的插件一样
+> （分组 `object` + 叶子带中文 hint 与「误配后果」），WebUI 插件详情页与
+> `data/config/log_watcher_config.json` 从此都是分块可读的。**行为零变化**：默认值逐字未动、
+> 内部 cfg 契约未动（`classify/deliver/detect/remediate/store` 一行没改）。
+
+### 为什么
+
+- 95 个顶键一条长列（外加 8 个 `_xxx_section` 文本键假装分组）：WebUI 上一屏看不完，配置文件里
+  从「主动提醒」到「紧急修复」中间隔了 70 多个键，四个**红线键**（`remediation.enable` /
+  `workdir` / `permission_mode` / `patch_overlay`）埋在中间（2026-10-19 面板两次把值写错键，
+  与这个布局是同一类问题：找不到、容易改错）。
+- 对照面：同机 29 个插件里只有 log_watcher 是纯扁平；市场插件（`pokepro` 8 组 / `livingmemory` 15 组 /
+  `self_learning` 23 组 / `bilivideo` 10 组 / `image_search`、`vision_router` 的 `object`+`template_list`）
+  一律分组。
+
+### 结构
+
+- **8 组 / 82 键**；组名已表达语境，叶子不再重复前缀（`remediation.workdir`，不是
+  `remediation.remediation_workdir`）。旧扁平键 → 新路径的完整映射只有一份，在 `config_map.KEY_MAP`。
+- 键名变更（改名 11 处）：`notify_min_severity`→`notify.min_severity`、`classify_*`→`classify.*`、
+  `llm_max_block_lines`/`llm_max_calls_per_round`/`llm_max_calls_per_hour`→`classify.max_block_lines`/
+  `max_calls_per_round`/`max_calls_per_hour`、`delivery_*`→`delivery.*`、`state_db_path`→`state.db_path`、
+  `remediation_*`→`remediation.*`、`remediate_confirm_count`/`remediate_confidence_threshold`→
+  `remediation.confirm_count`/`confidence_threshold`、`self_log_names`/`self_feedback_ids`→
+  `self_guard.log_names`/`feedback_ids`、`log_with_bot_id`→`self_guard.log_with_bot_id`。
+- **删除 13 个键**：8 个 `_xxx_section` 伪分组键 + 5 个死键（`llm_provider_id` / `chat_provider_id` /
+  `llm_timeout` / `provider_id` 从未被任何代码读过；`admin_users` 的 schema 描述里写着「未实现」）。
+- 新增 `config_map.py`（唯一映射 + 只读访问层 `ConfigView`：嵌套优先 → 旧扁平键兜底并告警 → 默认值）
+  与 `tools/migrate_config_v2.py`（离线迁移 CLI：干跑 / 落盘 / 对照复核 / 从备份重建，**任何模式都不打印配置值**）。
+
+### 升级要求（**顺序是硬的**）
+
+核心 `AstrBotConfig` 会在插件加载时把 schema 里没有的键当 stale 键**删掉**（`check_config_integrity()`
++ `save_config()`），所以必须**先迁移配置、再换插件版本**：`runbook.md` §1.4 给了可直接粘贴的 5 步
+（备份 → 干跑 → `--apply` → 换版 → 复核/自愈 → 重载），配置回滚见 §8.5（**代码与配置必须成对回滚**）。
+
+### 测试
+
+- `tests/test_config_map.py`（18 条）：schema ⇄ `KEY_MAP` ⇄ main 读取点三方一致、旧 95 键契约冻结、
+  默认值不注入、迁移 CLI 的干跑/落盘/复核/重建/拒绝未知键。
+- 全量门禁 **340 passed / 0 failed**（v2.1.0 基线 322 + 18）。
+
 ## v2.1.0（2026-10-19）
 
 > 本版把 `main` 上累积的八次改动收口成一个发布点并打 tag（此前 `v2.0.0` 停在 `a4eeef4`，
