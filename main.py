@@ -1568,8 +1568,8 @@ class LogWatcherPlugin(Star):
                 self.config.get("remediation_artifact_dir") or ""
             ),
             "remediation_max_output_bytes": _as_int(
-                self.config.get("remediation_max_output_bytes", 262144),
-                262144,
+                self.config.get("remediation_max_output_bytes", 1048576),
+                1048576,
                 4096,
                 16777216,
             ),

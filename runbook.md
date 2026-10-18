@@ -1,7 +1,7 @@
 # log_watcher v2 运行手册（runbook）
 
-适用版本：`metadata.yaml` → `version: 2.0.0`（2026-10-14 集成收口版）
-适用环境：本机 AstrBot（`/root/AstrBot`，venv 在 `/root/AstrBot/.venv`，实测 AstrBot v4.28.2）
+适用版本：`metadata.yaml` → `version: 2.1.0`（2026-10-19 收口；此前 2.0.0，v2.0.0 tag 在 `a4eeef4`）
+适用环境：本机 AstrBot（`/root/AstrBot`，venv 在 `/root/AstrBot/.venv`，实测 AstrBot **v4.29.1**／就地升级，判版本见 §1）
 
 **命令约定**：本容器 PATH 里没有裸 `python`，所有 Python 命令统一前缀
 `PATH=/root/AstrBot/.venv/bin:$PATH`（下文简写 `$PY`）。插件目录
@@ -173,7 +173,7 @@ grep -a "日志监听启动" /root/AstrBot/data/logs/astrbot.log | tail -1
 | `remediation_artifact_keep` | int | `50` | 1-100000，轨迹目录保留文件数上限。由插件每轮自动调用 prune_artifacts() 清理（不需要手工 cron）。 |
 | `remediation_artifact_max_age` | int | `604800` | 0-315360000，轨迹最长留存秒数（默认 7 天）。同样由每轮的 prune_artifacts() 执行。 |
 | `remediation_artifact_max_bytes` | int | `67108864` | 0-1 TiB，轨迹目录字节上限。同样由每轮的 prune_artifacts() 执行。 |
-| `remediation_max_output_bytes` | int | `262144` | 4096-16777216，单个轨迹文件落盘上限（超出截断并标记）。 |
+| `remediation_max_output_bytes` | int | `1048576` | 4096-16777216，单个轨迹文件落盘上限（超出截断并标记）。2026-10-19 起默认 256 KiB → 1 MiB：实测一次成功 run 的轨迹恰好封顶、结尾 `final` 被截。 |
 | `remediation_trace_raw` | bool | `false` | true = 轨迹保留 stdout/stderr 原文（默认 false 会做凭据掩码 <masked>）。 |
 | `remediation_prompt_template` | text | `""` | 覆盖 prompts/remediate_task.md（留空用自带模板）。 |
 | `remediation_receipt` | bool | `true` | 是否发修复回执。**强烈建议保持开启**：每一次修复尝试（含 skipped/blocked/unavailable/timeout/failed/cancelled/rejected）都必须回执，关掉等于修复结果不可见。 |
@@ -389,7 +389,7 @@ time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- 
    带 `failure:` 证据的（例如那次 GMI `import-error`）**不受影响**；人工覆写（`source=manual`）永不封顶。
 
 **轨迹被输出上限截断时怎么验收**（2026-10-19 定，来自一次真实误判风险）：
-`remediation_max_output_bytes`（默认 **262144** = 256 KiB）是**流式落盘上限**，超限会在文件尾追加
+`remediation_max_output_bytes`（**2026-10-19 起默认 1048576 = 1 MiB**；旧装若仍是 262144）是**流式落盘上限**，超限会在文件尾追加
 标记 `…（已截断）` 并截断后续行 —— agent 若读了大文件（例如去比对历史轨迹），一次**成功** run
 的轨迹也可能**恰好封顶**，结尾的 `{"type":"final"}` 与 `turn_end` 就都不在文件里了（实测：
 `r20261018-234346-9503f842`，`ok` / `exit 0` / 511.2 s，文件恰为 262144 字节）。
@@ -398,7 +398,7 @@ time dsh --profile headless --patch <副本>/dsh-headless-overlay.yml --json -- 
   ② 该行 `summary` 非空（插件**流式**提取结论，不受文件截断影响）；③ `receipt_sent` 的语义（见上：
   **写回** ≠ **送达**；`remediation_receipt=false` 时仍写回但不投递）；④ arena 之外零写入。
 - 文件尾的 `…（已截断）` 标记可用于**事后**判读；想保住完整轨迹就把
-  `remediation_max_output_bytes` 调到 `1048576`（1 MiB，面板保存即可、无需停机）。
+  `remediation_max_output_bytes` 调到 `1048576`（1 MiB）—— **2026-10-19 起这就是默认值**；旧装仍是 262144 时，面板保存一次即可、无需停机。
 - ⚠️ 同类"绿灯陷阱"：`dsh --profile headless --dump-config` **exit 0 只证明"能组合"、不渲染提示词**
   ⇒ 它绿 ≠ 真能跑（2026-10-18 的 `{{cwd}}` 与 `MISSING_CREDENTIAL` 两处阻断都是**真跑**才暴露的）。
 
