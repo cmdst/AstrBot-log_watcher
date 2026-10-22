@@ -339,10 +339,10 @@ def _run_status(db, run_id: str) -> str | None:
     return None if row is None else str(row[0])
 
 
-def test_sqlite_open_creates_schema_v2(tmp_path):
+def test_sqlite_open_creates_schema_v3(tmp_path):
     db = _sqlite(tmp_path)
     assert db.available and db.writable
-    assert db.schema_version == store.SCHEMA_VERSION == 2
+    assert db.schema_version == store.SCHEMA_VERSION == 3
     assert db.path.exists()
     # v2.3.0：`remediation_runs` 仍在建（历史审计证据，只留不写）
     for table in ("meta", "file_progress", "pattern_kb", "alerts", "rate_windows",
@@ -354,21 +354,21 @@ def test_sqlite_open_creates_schema_v2(tmp_path):
 def test_sqlite_migrate_is_idempotent(tmp_path):
     path = tmp_path / "log_watcher.sqlite3"
     first = store.SqliteStore(path).open()
-    assert first.migrate() == 2
-    assert first.migrate() == 2
+    assert first.migrate() == 3
+    assert first.migrate() == 3
     first.close()
     second = store.SqliteStore(path).open()
-    assert second.schema_version == 2 and second.writable
+    assert second.schema_version == 3 and second.writable
     second.close()
 
 
 def test_sqlite_refuses_newer_schema_without_touching_file(tmp_path):
-    """§9.5 第 3 条：user_version=3 的库进只读降级，文件不动。"""
+    """§9.5 第 3 条：比本实现更新的 user_version 进只读降级，文件不动。"""
     import sqlite3
 
     path = tmp_path / "log_watcher.sqlite3"
     conn = sqlite3.connect(path)
-    conn.execute("PRAGMA user_version = 3")
+    conn.execute(f"PRAGMA user_version = {store.SCHEMA_VERSION + 1}")
     conn.execute("CREATE TABLE keep_me(x INTEGER)")
     conn.commit()
     conn.close()
@@ -377,7 +377,7 @@ def test_sqlite_refuses_newer_schema_without_touching_file(tmp_path):
     db = store.SqliteStore(path).open()
     assert db.available is True
     assert db.writable is False and db.readonly is True
-    assert "版本 3" in db.last_error
+    assert f"版本 {store.SCHEMA_VERSION + 1}" in db.last_error
     assert db.meta_set("counters", {"a": 1}) is False
     assert db.record_alerts([{"ts": 1.0, "fingerprint": "fp"}]) == 0
     db.close()
@@ -587,7 +587,7 @@ def test_sqlite_usage_shape(tmp_path):
     db = _sqlite(tmp_path)
     db.record_alerts([{"ts": 1.0, "fingerprint": "fp"}])
     usage = db.usage()
-    assert usage["schema_version"] == 2
+    assert usage["schema_version"] == store.SCHEMA_VERSION
     assert usage["alerts"] == 1
     assert usage["bytes"] > 0
     assert set(usage) >= {"path", "bytes", "alerts", "pending", "kb", "runs", "rate"}
@@ -692,7 +692,7 @@ def test_sqlite_exposes_contract_api_surface():
     ]
     still_there = [name for name in removed if hasattr(store.SqliteStore, name)]
     assert not still_there, f"v2.3.0 应已移除的账本方法仍在: {still_there}"
-    assert store.SqliteStore.SCHEMA_VERSION == 2
+    assert store.SqliteStore.SCHEMA_VERSION == 3
     assert isinstance(store.SqliteStore.schema_version, property)
 
 
@@ -787,4 +787,95 @@ def test_pending_stats_reports_worst_severity_of_undelivered(tmp_path):
     assert stats2["recent_active"] == 3, "最近 24h 只算窗口内的"
     assert stats2["recent_max_severity"] == "HIGH", "窗口内的最高等级"
     assert stats2["window_hours"] == 24.0
+    db.close()
+
+
+# ---------- v3 判定链审计列（v2.3.0） ----------
+
+
+def test_sqlite_record_alerts_persists_judged_columns(tmp_path):
+    """台账必须能直接回答「这条结论有没有过模型」（judged 0/1，未知 = -1）。"""
+    db = _sqlite(tmp_path)
+    assert db.record_alerts(
+        [
+            {"ts": 1.0, "fingerprint": "fp-llm", "judged": 1, "judge_source": "llm"},
+            {"ts": 2.0, "fingerprint": "fp-local", "judged": 0, "judge_source": "local"},
+            {"ts": 3.0, "fingerprint": "fp-old"},
+        ]
+    ) == 3
+    conn = sqlite3.connect(db.path)
+    try:
+        rows = conn.execute(
+            "SELECT fingerprint, judged, judge_source FROM alerts ORDER BY ts"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [
+        ("fp-llm", 1, "llm"),
+        ("fp-local", 0, "local"),
+        ("fp-old", -1, ""),  # 没给的旧口径 = 未知，不得假装「没判」
+    ]
+    db.close()
+
+
+def test_sqlite_migrates_v2_db_and_adds_judge_columns(tmp_path):
+    """v2 旧库必须能补列（duplicate column 吞掉），历史行按「未知」处理，不回填。"""
+    path = tmp_path / "v2.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,"
+        " fingerprint TEXT NOT NULL, severity TEXT NOT NULL, route TEXT NOT NULL DEFAULT 'notify',"
+        " decision TEXT NOT NULL DEFAULT 'send', component TEXT NOT NULL DEFAULT '',"
+        " session TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '[]',"
+        " summary TEXT NOT NULL DEFAULT '', source_file TEXT NOT NULL DEFAULT '',"
+        " hit_count INTEGER NOT NULL DEFAULT 1, excerpt_path TEXT NOT NULL DEFAULT '',"
+        " excerpt_lines INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        "CREATE TABLE pattern_kb (fingerprint TEXT PRIMARY KEY, severity TEXT NOT NULL,"
+        " confidence REAL NOT NULL DEFAULT 0.5, component TEXT NOT NULL DEFAULT '',"
+        " tags TEXT NOT NULL DEFAULT '[]', reason TEXT NOT NULL DEFAULT '',"
+        " source TEXT NOT NULL DEFAULT 'llm', hits INTEGER NOT NULL DEFAULT 1,"
+        " first_seen REAL NOT NULL, last_seen REAL NOT NULL, manual INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute("INSERT INTO pattern_kb VALUES ('fp-old','HIGH',0.5,'','[]','旧理由','llm',1,1,1,0)")
+    conn.execute(
+        "INSERT INTO alerts(ts, fingerprint, severity) VALUES (1.0, 'fp-old', 'HIGH')"
+    )
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    conn.close()
+
+    db = store.SqliteStore(path).open()
+    assert db.schema_version == 3 and db.writable
+    assert db.kb_lookup("fp-old")["judge_source"] == ""
+    assert db.kb_lookup("fp-old")["last_judged_at"] == 0.0
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("SELECT judged, judge_source FROM alerts").fetchone() == (-1, "")
+    finally:
+        conn.close()
+    db.close()
+
+
+def test_sqlite_prune_uses_prior_ttl_for_kb(tmp_path):
+    """Q5=B：KB（先验）清理看 classify.prior_ttl_hours，fingerprint_ttl_hours 只管去重状态。"""
+    db = _sqlite(tmp_path)
+    now = time.time()
+    db.kb_upsert(
+        [
+            {"fingerprint": "fp-recent", "severity": "LOW", "source": "llm",
+             "last_seen": now - 3600},
+            {"fingerprint": "fp-stale", "severity": "LOW", "source": "llm",
+             "last_seen": now - 10 * 3600},
+        ]
+    )
+    # 只给 prior_ttl_hours=2 → 10 小时前的条目被清掉
+    removed = db.prune(
+        now=now,
+        cfg={"history_retention_days": 3650, "history_max_rows": 1000,
+             "prior_ttl_hours": 2, "kb_max_entries": 500},
+    )["kb"]
+    assert removed == 1
+    assert db.kb_lookup("fp-stale") is None and db.kb_lookup("fp-recent") is not None
     db.close()

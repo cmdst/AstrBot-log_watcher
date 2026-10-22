@@ -131,7 +131,13 @@ class LogBlock:
 
 @dataclass
 class ThreatVerdict:
-    """分级结论：本地模式与 LLM 模式必须给出同一形状。"""
+    """分级结论：本地模式与 LLM 模式必须给出同一形状。
+
+    ``judged`` / ``judge_source``（v2.3.0 新增）回答「这条结论到底有没有过一次模型判定」，
+    与 ``source``（谁写的这条结论）**分开**：报告首段据此分派「LLM 诊断」还是
+    「本次未经模型判定」。默认 ``judged=False`` 是 fail-closed —— 没有显式声明过过模型的
+    构造点，一律不得被渲染成模型结论（``parse_llm_verdict`` 是唯一把它置 True 的地方）。
+    """
 
     severity: Severity = Severity.MEDIUM
     confidence: float = 0.5
@@ -143,6 +149,10 @@ class ThreatVerdict:
     reason: str = ""
     route: Route = Route.NOTIFY
     source: str = "local"
+    #: 本条结论是否真的由模型给出（本地规则 / 噪声短路 / 预算排队 / 降级 / 人工覆写均为 False）。
+    judged: bool = False
+    #: 结论依据：``llm`` | ``degraded`` | ``local`` | ``manual`` | ``prior``（空串 = 未知）。
+    judge_source: str = ""
 
     def to_dict(self) -> dict:
         """序列化为可 JSON 落盘的 dict。"""
@@ -157,6 +167,8 @@ class ThreatVerdict:
             "reason": self.reason,
             "route": self.route.value,
             "source": self.source,
+            "judged": bool(self.judged),
+            "judge_source": self.judge_source,
         }
 
     @classmethod
@@ -199,6 +211,8 @@ class ThreatVerdict:
             reason=str(raw.get("reason", base.reason) or ""),
             route=route if raw.get("route") else ROUTE_BY_SEVERITY[severity],
             source=str(raw.get("source", base.source) or base.source),
+            judged=bool(raw.get("judged", base.judged)),
+            judge_source=str(raw.get("judge_source", base.judge_source) or ""),
         )
 
 

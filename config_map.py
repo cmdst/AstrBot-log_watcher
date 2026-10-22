@@ -126,6 +126,23 @@ DROPPED_LEGACY_KEYS: tuple[str, ...] = (
     "admin_users",
 )
 
+#: v2.3.0 新增、**在 v2.1.0 里没有旧扁平对应键**的叶子路径。
+#: 为什么不塞进 `KEY_MAP`：那 82 条是「旧扁平键 → 新路径」的迁移契约（95 条旧键的口径
+#: 被 `tests/test_config_map.py` 冻结）。新键没有旧值可搬，塞进去会污染迁移契约，
+#: 让老配置每次体检都报一堆「missing」。所以另立一份，schema 叶子 = KEY_MAP ∪ EXTRA_LEAVES。
+EXTRA_LEAVES: tuple[str, ...] = (
+    # 历史先验保留期（判定侧；与 state.fingerprint_ttl_hours 的「去重状态保留期」分开）
+    "classify.prior_ttl_hours",
+    # repeat_count 的统计窗口（只喂判定上下文；通知去重窗口是 budget.dedupe_window_seconds）
+    "classify.repeat_window_seconds",
+)
+
+
+def all_paths() -> set[str]:
+    """全部可知的点号路径（schema 叶子必须与它双射）。"""
+    return set(KEY_MAP) | set(EXTRA_LEAVES)
+
+
 #: 旧扁平键 -> 新点号路径（迁移与对照用）。
 LEGACY_TO_PATH: dict[str, str] = {legacy: path for path, legacy in KEY_MAP.items()}
 

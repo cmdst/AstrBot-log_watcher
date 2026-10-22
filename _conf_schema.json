@@ -138,7 +138,7 @@
   },
   "classify": {
     "description": "③ AI 威胁分级（classify）",
-    "hint": "命中行先过本地规则，配了 provider 再问模型；分级结果决定路由（静默 / 摘要 / 即时告警 / 最高级告警，全部只通知人工）。三个 *_severity 是本地档位的兜底等级，改它们等于改噪声水位。",
+    "hint": "**每条命中都送模型重新判定**（v2.3.0）：知识库只提供「上次判定」先验，不再复用结论；判定/去重分离 —— 通知被去重时判定照做。未配 provider 或模型不可用时显式降级（source=degraded、judged=false，报告会写「本次未经模型判定」）。分级结果决定路由（静默 / 摘要 / 即时告警 / 最高级告警，全部只通知人工）。三个 *_severity 是本地档位的兜底等级，改它们等于改噪声水位。",
     "type": "object",
     "items": {
       "enable": {
@@ -261,13 +261,13 @@
       },
       "noise_shortcut": {
         "description": "已知噪声短路（noise_shortcut）",
-        "hint": "已知噪声短路（asyncio 回调异常等直接判 IGNORE，不付 token）。误配后果：关掉后 88.9% 的噪声也要过一遍 LLM。",
+        "hint": "默认 **false**（v2.3.0 起）：每条命中都要送模型重新判定。填 true = 本地规则认定的良性噪声直接给结论、不付 token，但该结论会标 judged=false（台账与报告可见，不得当成模型判定）。误配后果：true 会让 88.9% 的噪声重新变成零成本短路，并放弃「每条错误必过 LLM」这条硬要求。",
         "type": "bool",
-        "default": true
+        "default": false
       },
       "kb_enabled": {
         "description": "启用指纹知识库（kb_enabled）",
-        "hint": "指纹知识库：同一指纹复用上次判定。误配后果：关掉后每条都重新判定（成本与噪声上升）。",
+        "hint": "知识库只记录命中次数/最近出现，并把历史结论作为**先验**注入提示词；**不再短路判定**（v2.3.0 起任何命中都会重新问模型）。填 false = 不读也不写先验，判定照旧每条都过模型。误配后果：false 会让提示词缺少「上次判定」参照、pattern_kb 不再增长；不影响判定次数。",
         "type": "bool",
         "default": true
       },
@@ -276,6 +276,18 @@
         "hint": "50-100000，知识库条数上限（超出由 prune 清理）。误配后果：过小=反复失忆；过大=库膨胀。",
         "type": "int",
         "default": 500
+      },
+      "prior_ttl_hours": {
+        "description": "历史先验保留期（小时，prior_ttl_hours）",
+        "hint": "1-720，知识库条目作为「历史判定（先验）」的保留期：超过就不再注入提示词、也不参与统计。人工覆写永不过期。它和 state.fingerprint_ttl_hours（通知去重状态保留期）是两件事。误配后果：过大 = 陈年旧结论一直挂在提示词里（模型可以推翻，但误导面变大）；过小 = 复查时拿不到历史参照。",
+        "type": "int",
+        "default": 72
+      },
+      "repeat_window_seconds": {
+        "description": "重复计数窗口（秒，repeat_window_seconds）",
+        "hint": "0-604800，统计「窗口内同指纹出现次数」（repeat_count）的窗口，只作为判定上下文与观测；**不影响判不判、也不影响发不发**（通知去重窗口是 budget.dedupe_window_seconds）。误配后果：调大 = 上下文里的重复次数更敏感（配合 new_pattern_escalate 时更难判为「新指纹」）；调小 = 重复次数偏低。",
+        "type": "int",
+        "default": 900
       },
       "new_pattern_escalate": {
         "description": "新指纹升一级（new_pattern_escalate）",
@@ -441,8 +453,8 @@
         "default": ""
       },
       "fingerprint_ttl_hours": {
-        "description": "指纹保留时长（小时，fingerprint_ttl_hours）",
-        "hint": "1-720，指纹计数与知识库条目保留时长。误配后果：过小=反复失忆；过大=库膨胀。",
+        "description": "指纹去重状态保留期（fingerprint_ttl_hours）",
+        "hint": "1-720，**只**用于清理「通知去重状态」（同一指纹多久没再出现就忘掉它的冷却记录）。判定先验的保留期是 classify.prior_ttl_hours，两者不要混。误配后果：调小 = 去重状态很快失忆、同一故障可能再次推送；调大 = 去重状态表增长。",
         "type": "int",
         "default": 72
       },

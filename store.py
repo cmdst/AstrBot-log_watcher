@@ -28,7 +28,16 @@ from pathlib import Path
 
 _WINDOW_MAX_AGE = 7200.0
 _WINDOW_MAX_LEN = 1024
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+"""状态库结构版本。
+
+- v1 → v2：补 ``alerts.excerpt_lines`` / ``remediation_runs.task_sha1|argv`` /
+  ``pending_delivery.excerpt_path``；
+- v2 → v3（v2.3.0 判定链）：``pattern_kb`` 补 ``last_judged_at`` / ``judge_source``
+  （某指纹最后一次**真判**的时间与依据），``alerts`` 补 ``judged`` / ``judge_source``
+  （台账里能区分「模型判过」与「本地/降级/人工」）。历史行**不回填**：
+  ``judge_source=''``、``judged=-1`` 表示「未知」，绝不假装当时判过（假审计）。
+"""
 _PRUNE_DELETE_CAP = 500
 #: v2.3.0：`remediation_runs` 只做历史保留与对账（不再写入）。孤儿 running 行的宽限秒数
 #: 固定为旧版「2 × 默认超时 300s」，配置键随自动修复通道一并移除。
@@ -908,7 +917,9 @@ _DDL: tuple[str, ...] = (
       source TEXT NOT NULL DEFAULT 'llm',
       hits INTEGER NOT NULL DEFAULT 1,
       first_seen REAL NOT NULL, last_seen REAL NOT NULL,
-      manual INTEGER NOT NULL DEFAULT 0
+      manual INTEGER NOT NULL DEFAULT 0,
+      last_judged_at REAL NOT NULL DEFAULT 0,
+      judge_source TEXT NOT NULL DEFAULT ''
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_pattern_kb_last_seen ON pattern_kb(last_seen)",
@@ -927,7 +938,9 @@ _DDL: tuple[str, ...] = (
       source_file TEXT NOT NULL DEFAULT '',
       hit_count INTEGER NOT NULL DEFAULT 1,
       excerpt_path TEXT NOT NULL DEFAULT '',
-      excerpt_lines INTEGER NOT NULL DEFAULT 0
+      excerpt_lines INTEGER NOT NULL DEFAULT 0,
+      judged INTEGER NOT NULL DEFAULT -1,
+      judge_source TEXT NOT NULL DEFAULT ''
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_alerts_fp_ts ON alerts(fingerprint, ts DESC)",
@@ -968,6 +981,15 @@ _ALTERS_V1_TO_V2: tuple[str, ...] = (
     "ALTER TABLE remediation_runs ADD COLUMN task_sha1 TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE remediation_runs ADD COLUMN argv TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pending_delivery ADD COLUMN excerpt_path TEXT NOT NULL DEFAULT ''",
+)
+
+# v2 → v3 补列（v2.3.0 判定链；同样吞掉「duplicate column」，旧库自动补）
+_ALTERS_V2_TO_V3: tuple[str, ...] = (
+    "ALTER TABLE pattern_kb ADD COLUMN last_judged_at REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE pattern_kb ADD COLUMN judge_source TEXT NOT NULL DEFAULT ''",
+    # -1 = 未知（历史行不回填；0/1 才是「没判 / 判过」）
+    "ALTER TABLE alerts ADD COLUMN judged INTEGER NOT NULL DEFAULT -1",
+    "ALTER TABLE alerts ADD COLUMN judge_source TEXT NOT NULL DEFAULT ''",
 )
 
 _PENDING_COLUMNS = (
@@ -1209,8 +1231,12 @@ class SqliteStore:
                 for statement in _DDL:
                     conn.execute(statement)
                 version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-                if version < SCHEMA_VERSION:
+                if version < 2:
                     for statement in _ALTERS_V1_TO_V2:
+                        with contextlib.suppress(sqlite3.Error):
+                            conn.execute(statement)
+                if version < SCHEMA_VERSION:
+                    for statement in _ALTERS_V2_TO_V3:
                         with contextlib.suppress(sqlite3.Error):
                             conn.execute(statement)
                     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -1262,8 +1288,9 @@ class SqliteStore:
             with self._transaction() as conn:
                 conn.executemany(
                     "INSERT INTO alerts(ts, fingerprint, severity, route, decision, component,"
-                    " session, tags, summary, source_file, hit_count, excerpt_path, excerpt_lines)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " session, tags, summary, source_file, hit_count, excerpt_path, excerpt_lines,"
+                    " judged, judge_source)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     [
                         (
                             float(row.get("ts", 0.0)),
@@ -1279,6 +1306,9 @@ class SqliteStore:
                             int(row.get("hit_count", 1) or 1),
                             str(row.get("excerpt_path", "")),
                             int(row.get("excerpt_lines", 0) or 0),
+                            # -1 = 未知（调用方没给 = 旧口径）；0/1 = 没判 / 判过
+                            int(row.get("judged", -1)),
+                            str(row.get("judge_source", "") or ""),
                         )
                         for row in rows
                     ],
@@ -1455,14 +1485,18 @@ class SqliteStore:
             "first_seen": float(row[8] or 0.0),
             "last_seen": float(row[9] or 0.0),
             "manual": bool(row[10]),
+            # v3 审计列：最后一次真判时间与依据（'' / 0 = 从未真判）
+            "last_judged_at": float(row[11] or 0.0),
+            "judge_source": str(row[12] or ""),
         }
 
     def kb_lookup(self, fingerprint: str) -> dict | None:
-        """按指纹取知识库条目。"""
+        """按指纹取知识库条目（v2.3.0 起只作**先验**与统计，不再是判决来源）。"""
         row = self._read(
             lambda: self._conn.execute(
                 "SELECT fingerprint, severity, confidence, component, tags, reason, source,"
-                " hits, first_seen, last_seen, manual FROM pattern_kb WHERE fingerprint = ?",
+                " hits, first_seen, last_seen, manual, last_judged_at, judge_source"
+                " FROM pattern_kb WHERE fingerprint = ?",
                 (str(fingerprint),),
             ).fetchone()
         )
@@ -1492,13 +1526,18 @@ class SqliteStore:
                     else:
                         conn.execute(
                             "INSERT INTO pattern_kb(fingerprint, severity, confidence, component,"
-                            " tags, reason, source, hits, first_seen, last_seen, manual)"
-                            " VALUES(?,?,?,?,?,?,?,?,?,?,0)"
+                            " tags, reason, source, hits, first_seen, last_seen, manual,"
+                            " last_judged_at, judge_source)"
+                            " VALUES(?,?,?,?,?,?,?,?,?,?,0,?,?)"
                             " ON CONFLICT(fingerprint) DO UPDATE SET"
                             " severity=excluded.severity, confidence=excluded.confidence,"
                             " component=excluded.component, tags=excluded.tags,"
                             " reason=excluded.reason, source=excluded.source,"
-                            " hits=pattern_kb.hits + 1, last_seen=excluded.last_seen",
+                            " hits=pattern_kb.hits + 1, last_seen=excluded.last_seen,"
+                            # 审计列只增不减：本地/降级写库不得把上一次「真判过」的事实抹掉
+                            " last_judged_at=MAX(pattern_kb.last_judged_at, excluded.last_judged_at),"
+                            " judge_source=CASE WHEN excluded.judge_source = ''"
+                            " THEN pattern_kb.judge_source ELSE excluded.judge_source END",
                             (
                                 fingerprint,
                                 str(entry.get("severity", "MEDIUM")),
@@ -1510,6 +1549,8 @@ class SqliteStore:
                                 int(entry.get("hits", 1) or 1),
                                 float(entry.get("first_seen", now)),
                                 now,
+                                float(entry.get("last_judged_at", 0.0) or 0.0),
+                                str(entry.get("judge_source", "") or ""),
                             ),
                         )
                     written += 1
@@ -1535,11 +1576,13 @@ class SqliteStore:
             with self._transaction() as conn:
                 conn.execute(
                     "INSERT INTO pattern_kb(fingerprint, severity, confidence, component, tags,"
-                    " reason, source, hits, first_seen, last_seen, manual)"
-                    " VALUES(?,?,?,'',?,?,'manual',1,?,?,1)"
+                    " reason, source, hits, first_seen, last_seen, manual, last_judged_at,"
+                    " judge_source)"
+                    " VALUES(?,?,?,'',?,?,'manual',1,?,?,1,0,'manual')"
                     " ON CONFLICT(fingerprint) DO UPDATE SET severity=excluded.severity,"
                     " confidence=excluded.confidence, tags=excluded.tags, reason=excluded.reason,"
-                    " source='manual', manual=1, last_seen=excluded.last_seen",
+                    " source='manual', manual=1, last_seen=excluded.last_seen,"
+                    " judge_source='manual'",
                     (
                         str(fingerprint),
                         str(getattr(severity, "value", severity)),
@@ -1829,7 +1872,11 @@ class SqliteStore:
         retention = max(0.0, _num("history_retention_days", 30.0)) * 86400.0
         max_rows = max(1, int(_num("history_max_rows", 20000)))
         kb_max_entries = max(0, int(_num("kb_max_entries", 500)))
-        ttl = max(0.0, _num("fingerprint_ttl_hours", 72.0)) * 3600.0
+        # v2.3.0（Q5=B）：先验保留期由 classify.prior_ttl_hours 管；state.fingerprint_ttl_hours
+        # 只表示「通知去重状态」的保留期，不再决定 KB 清理。旧调用方只传 fingerprint_ttl_hours
+        # 时按它兜底（兼容 v2.2.0 的调用点与既有单测）。
+        prior_hours = _num("prior_ttl_hours", _num("fingerprint_ttl_hours", 72.0))
+        ttl = max(0.0, prior_hours) * 3600.0
         moment = float(now)
         result = {"alerts": 0, "rate": 0, "kb": 0, "pending": 0}
 

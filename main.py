@@ -18,6 +18,7 @@ import contextlib
 import os
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -145,6 +146,8 @@ class LogWatcherPlugin(Star):
         self._no_level_notice = False
         self._store_error_notified = False
         self._store_error = ""
+        #: C5：engine 失效兜底只打一次 ERROR（避免每轮刷屏），但每次都要打标签
+        self._engine_unavailable_logged = False
 
     # ---------- 生命周期 ----------
 
@@ -484,6 +487,8 @@ class LogWatcherPlugin(Star):
             elif decision is detect.NotifyDecision.DIGEST_BUFFER:
                 logger.debug(f"{self._plat()}LOW 命中进入摘要聚合（{verdict.fingerprint}）")
 
+        self._log_judge_summary(len(blocks))
+
         if sendable:
             if sessions:
                 await self._deliver_round(sendable, excerpt, now)
@@ -494,34 +499,103 @@ class LogWatcherPlugin(Star):
                     "但未配置 notify.target_sessions，提醒被丢弃"
                 )
 
+    def _log_judge_summary(self, blocks: int) -> None:
+        """每轮一行审计 INFO：判了几段、复用几段、降级几段、还有多少排队（§5.2）。
+
+        这是「每条错误必过 LLM」与成本的唯一审计线：``llm_forced`` 是进入模型路径的段数，
+        ``llm_calls`` 是实际发起的模型调用，``llm_skipped`` 是完全没尝试模型的段数。
+        """
+        summary = getattr(self.engine, "round_stats", None)
+        if not callable(summary) or not blocks:
+            return
+        try:
+            stats = summary()
+        except Exception as exc:  # 汇总失败不得影响主循环
+            logger.debug(f"{self._plat()}判定汇总失败（忽略）：{exc!r}")
+            return
+        logger.info(
+            f"{self._plat()}本轮判定汇总：段 {blocks}，判定路径 {stats.get('llm_forced', 0)}"
+            f"（模型调用 {stats.get('llm_calls', 0)}），批内复用 {stats.get('batch_memo_hits', 0)}，"
+            f"降级 {stats.get('degraded', 0)}，未判 {stats.get('llm_skipped', 0)}，"
+            f"待判队列 {getattr(self.engine, 'deferred_judgements', 0)}"
+        )
+
     async def _classify(self, block: LogBlock, metrics: Mapping) -> ThreatVerdict:
-        """分级：优先 engine.ThreatEngine.classify（R3，含 LLM 与降级链），失败回本地规则。"""
+        """分级：优先 engine.ThreatEngine.classify（R3，含 LLM 与降级链），失败回本地规则。
+
+        C5（v2.3.0）：engine 构造失败 / 返回非 ``ThreatVerdict`` / 抛异常时的本地兜底
+        **必须打标签** —— ``source="degraded"``、``degraded:engine-unavailable``、
+        ``judged=False``，并打一次 ERROR。否则「每条错误必过 LLM」在 engine 起不来时
+        会静默失效，而台账/报告看不出这条结论根本没问过模型。
+        """
         if self.engine is not None:
             try:
                 verdict = await self.engine.classify(block, metrics)
                 if isinstance(verdict, ThreatVerdict):
                     return verdict
-                return ThreatVerdict.from_dict(
-                    verdict, default=detect.fallback_verdict(block, cfg=self._engine_config())
+                return self._degraded_fallback(
+                    block,
+                    ThreatVerdict.from_dict(verdict),
+                    reason="分级引擎返回了非 ThreatVerdict 的结论",
                 )
             except Exception as exc:
-                logger.warning(
-                    f"{self._plat()}分级引擎异常，回退本地规则: {type(exc).__name__}: {exc}"
+                return self._degraded_fallback(
+                    block,
+                    None,
+                    reason=f"分级引擎异常 {type(exc).__name__}: {exc}",
                 )
         hook = self._classify_hook()
         if hook is not None:
             try:
                 result = hook(block, metrics, self._engine_config())
                 if isinstance(result, ThreatVerdict):
-                    return result
-                return ThreatVerdict.from_dict(
-                    result, default=detect.fallback_verdict(block, cfg=self._engine_config())
+                    # classify 模块直接给了结论：它没有经过模型，同样按降级留痕
+                    return self._degraded_fallback(block, result, reason="分级引擎不可用，走 classify 兜底")
+                return self._degraded_fallback(
+                    block,
+                    ThreatVerdict.from_dict(result),
+                    reason="classify 兜底返回了非 ThreatVerdict 的结论",
                 )
             except Exception as exc:
-                logger.warning(
-                    f"{self._plat()}classify 模块异常，回退本地规则: {type(exc).__name__}: {exc}"
+                return self._degraded_fallback(
+                    block,
+                    None,
+                    reason=f"classify 兜底异常 {type(exc).__name__}: {exc}",
                 )
-        return detect.fallback_verdict(block, cfg=self._engine_config())
+        return self._degraded_fallback(block, None, reason="分级引擎不可用且 classify 兜底缺失")
+
+    def _degraded_fallback(
+        self, block: LogBlock, verdict: ThreatVerdict | None, *, reason: str
+    ) -> ThreatVerdict:
+        """把「没有模型参与」的兜底结论统一成显式降级形态（C5）。"""
+        base = verdict or detect.fallback_verdict(block, cfg=self._engine_config())
+        if not base.fingerprint:
+            base = replace(base, fingerprint=detect.fingerprint(block))
+        tags = [*base.tags, "degraded:engine-unavailable", "judged-skipped"]
+        if "engine-unavailable" not in tags:
+            tags.append("engine-unavailable")
+        if not self._engine_unavailable_logged:
+            self._engine_unavailable_logged = True
+            logger.error(
+                f"{self._plat()}分级引擎不可用，已退到本地规则兜底（本次降级结论标 "
+                f"degraded:engine-unavailable，不冒充模型判定）：{reason}"
+            )
+        else:
+            logger.debug(f"{self._plat()}分级引擎仍不可用，继续本地兜底：{reason}")
+        return ThreatVerdict(
+            severity=base.severity,
+            confidence=base.confidence,
+            tags=tags,
+            component=base.component,
+            fingerprint=base.fingerprint,
+            is_new_pattern=base.is_new_pattern,
+            evidence=base.evidence,
+            reason=f"{base.reason}；{reason}（本次未经模型判定）",
+            route=base.route,
+            source="degraded",
+            judged=False,
+            judge_source="degraded",
+        )
 
     def _classify_hook(self):
         """classify.classify_block 的兜底入口（engine 不可用时才走）。"""
@@ -536,11 +610,15 @@ class LogWatcherPlugin(Star):
         return self._classify_fn
 
     async def _refresh_fingerprint_stats(self, fingerprints: list[str], now: float) -> None:
-        """每轮最多一次 `metrics_for` 聚合查询（§9.4 第 2 条）。"""
+        """每轮最多一次 `metrics_for` 聚合查询（§9.4 第 2 条）。
+
+        v2.3.0（Q5=B）：``repeat_count`` 的统计窗口用 ``classify.repeat_window_seconds``；
+        通知去重窗口仍是 ``budget.dedupe_window_seconds``。两者分开，**都不影响判不判**。
+        """
         if not self._store_ready() or not fingerprints:
             self._fingerprint_stats = {}
             return
-        window = self._gate_config().dedupe_window
+        window = self._repeat_window()
         self._fingerprint_stats = await asyncio.to_thread(
             self.sqlite.metrics_for, sorted(set(fingerprints)), window=window, now=now
         )
@@ -637,6 +715,10 @@ class LogWatcherPlugin(Star):
                 "hit_count": block.hit_count,
                 "excerpt_path": excerpt_path,
                 "excerpt_lines": excerpt_lines,
+                # v2.3.0 审计列：台账直接回答「这条结论有没有过模型」，
+                # 不再靠 tags 里混写的 llm / local:* 反推（AGENTS.md §4 的误读教训）。
+                "judged": 1 if verdict.judged else 0,
+                "judge_source": verdict.judge_source or "",
             }
         )
 
@@ -1184,7 +1266,17 @@ class LogWatcherPlugin(Star):
             "kb_max_entries": _as_int(
                 self.cfg.get("classify.kb_max_entries", 500), 500, 50, 100000
             ),
-            "noise_shortcut": bool(self.cfg.get("classify.noise_shortcut", True)),
+            # v2.3.0：默认 **False** —— 每条命中都必须过模型（C2）；true 是显式逃生阀，
+            # 走它的结论会标 judged=False。schema 默认值必须与这里逐字一致。
+            "noise_shortcut": bool(self.cfg.get("classify.noise_shortcut", False)),
+            # v2.3.0 新增（Q5=B）：判定先验保留期。engine 用它过滤过期的历史先验。
+            "prior_ttl_hours": _as_int(
+                self.cfg.get("classify.prior_ttl_hours", 72), 72, 1, 720
+            ),
+            # ``repeat_window_seconds`` 的消费方是 _refresh_fingerprint_stats（repeat_count
+            # 统计窗口）。这里一并转发，保证「schema / KEY_MAP / 本白名单」三处不漏键；
+            # 它**不参与**判不判，也**不参与**发不发（通知去重窗口是 budget.dedupe_window）。
+            "repeat_window_seconds": self._repeat_window(),
             "route_map": route_map if isinstance(route_map, dict) else {},
             "new_pattern_escalate": bool(self.cfg.get("classify.new_pattern_escalate", False)),
             "notify_min_severity": str(self.cfg.get("notify.min_severity") or "MEDIUM"),
@@ -1204,8 +1296,10 @@ class LogWatcherPlugin(Star):
             "history_max_rows": _as_int(
                 self.cfg.get("state.history_max_rows", 20000), 20000, 1000, 1000000
             ),
-            "fingerprint_ttl_hours": _as_int(
-                self.cfg.get("state.fingerprint_ttl_hours", 72), 72, 1, 720
+            # Q5=B：知识库（先验）保留期归 classify.prior_ttl_hours；
+            # state.fingerprint_ttl_hours 收窄为「通知去重状态」保留期（见 _fingerprint_ttl）。
+            "prior_ttl_hours": _as_int(
+                self.cfg.get("classify.prior_ttl_hours", 72), 72, 1, 720
             ),
             "kb_max_entries": _as_int(
                 self.cfg.get("classify.kb_max_entries", 500), 500, 50, 100000
@@ -1242,8 +1336,24 @@ class LogWatcherPlugin(Star):
         return _as_int(self.cfg.get("delivery.retry_batch", 5), 5, 1, 50)
 
     def _fingerprint_ttl(self) -> float:
+        """通知去重状态的保留期（Q5=B：``state.fingerprint_ttl_hours`` 语义收窄后的唯一用途）。
+
+        它清理的是 ``counters`` 里的指纹冷却记录（决定「还发不发」），与判定先验
+        （``classify.prior_ttl_hours``）无关。**不要**把它接回判定链。
+        """
         return float(
             _as_int(self.cfg.get("state.fingerprint_ttl_hours", 72), 72, 1, 24 * 30) * 3600
+        )
+
+    def _repeat_window(self) -> float:
+        """``repeat_count`` 的统计窗口（秒；v2.3.0 新配置 ``classify.repeat_window_seconds``）。
+
+        只喂判定上下文与观测；判定本身不被它跳过，通知去重也不看它。
+        """
+        return float(
+            _as_int(
+                self.cfg.get("classify.repeat_window_seconds", 900), 900, 0, 7 * 86400
+            )
         )
 
     def _excerpt_mode(self) -> str:

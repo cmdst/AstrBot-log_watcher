@@ -6,8 +6,11 @@
 本文件把三处钉在一起，并且把 v2.1.0 的旧键集合**冻结**成迁移契约：任何键的搬迁缺失都会红。
 
 v2.3.0 又删了一层：自动修复通道整体移除 ⇒ `remediation` 组（22 键）整组消失，schema
-变成 **7 组 / 60 键**。历史契约仍冻结在 95 条（那是 v2.1.0 的事实），所以迁移契约从
-「两分量并集」改成分量并集：`KEY_MAP` ∪ `DROPPED_LEGACY_KEYS`(v2.2.0) ∪ `DROPPED_IN_V230`。
+变成 **7 组 / 60 键**；判定链再加两个**没有旧扁平对应键**的新键
+（`classify.prior_ttl_hours` / `classify.repeat_window_seconds`）⇒ 现在 **7 组 / 62 键**，
+其中 `KEY_MAP` 仍是 60 条迁移契约、新键住在 `config_map.EXTRA_LEAVES`。历史契约仍冻结在
+95 条（那是 v2.1.0 的事实），所以迁移契约是分量并集：`KEY_MAP` ∪ `DROPPED_LEGACY_KEYS`(v2.2.0)
+∪ `DROPPED_IN_V230`。
 """
 
 from __future__ import annotations
@@ -192,8 +195,38 @@ def test_schema_is_object_groups_in_declared_order() -> None:
 
 def test_schema_leaves_match_key_map_exactly() -> None:
     leaves = {path for path, _ in _leaves(_schema())}
-    assert leaves == set(config_map.KEY_MAP), "schema 叶子与 KEY_MAP 必须双射"
-    assert len(leaves) == 60, "v2.3.0：8 组 82 键 − remediation 组 22 键 = 7 组 60 键"
+    assert leaves == config_map.all_paths(), (
+        "schema 叶子必须 = KEY_MAP（82 条迁移契约）∪ EXTRA_LEAVES（v2.3.0 新增 2 键）"
+    )
+    assert len(leaves) == 62, (
+        "v2.3.0：8 组 82 键 − remediation 组 22 键 = 60，再 + classify 新增 2 键 = 62"
+    )
+    assert len(config_map.KEY_MAP) == 60, "KEY_MAP 仍是 v2.1.0 的迁移契约（只搬旧键）"
+
+
+def test_extra_leaves_have_no_legacy_counterpart_and_do_not_pollute_key_map() -> None:
+    """v2.3.0 新键没有旧扁平对应键：它们进 EXTRA_LEAVES，不能混进 95 条迁移契约。"""
+    extra = set(config_map.EXTRA_LEAVES)
+    assert extra == {"classify.prior_ttl_hours", "classify.repeat_window_seconds"}
+    assert not (extra & set(config_map.KEY_MAP))
+    assert not (extra & set(config_map.LEGACY_TO_PATH.values()))
+    leaves = {path: spec for path, spec in _leaves(_schema())}
+    for path in extra:
+        assert path in leaves, f"{path} 没写进 schema"
+        assert isinstance(leaves[path].get("default"), int), "默认值必须是整数（键要写进 schema）"
+    assert leaves["classify.prior_ttl_hours"]["default"] == 72
+    assert leaves["classify.repeat_window_seconds"]["default"] == 900
+
+
+def test_noise_shortcut_default_is_false_everywhere() -> None:
+    """C2：schema 与代码默认值必须同步为 false（每条错误必过 LLM）。"""
+    leaf = _leaves(_schema())
+    defaults = {path: spec["default"] for path, spec in leaf}
+    assert defaults["classify.noise_shortcut"] is False
+    engine_src = (_PLUGIN_DIR / "engine.py").read_text(encoding="utf-8")
+    assert '_bool_cfg(cfg, "noise_shortcut", False)' in engine_src
+    main_src = _main_src()
+    assert 'self.cfg.get("classify.noise_shortcut", False)' in main_src
 
 
 def test_every_leaf_keeps_description_hint_and_default() -> None:
@@ -283,8 +316,11 @@ def test_main_reads_only_mapped_dotted_paths() -> None:
     assert 'self.config.get(' not in src, "读取点必须走 self.cfg（点号路径），不能再用扁平键"
     paths = set(__import__("re").findall(r'self\.cfg\.get\(\s*"([^"]+)"', src))
     assert paths, "没扫到任何读取点？正则或写法变了"
-    unknown = sorted(paths - set(config_map.KEY_MAP))
-    assert not unknown, f"main.py 读了 KEY_MAP 之外的路径：{unknown}"
+    unknown = sorted(paths - config_map.all_paths())
+    assert not unknown, f"main.py 读了 KEY_MAP / EXTRA_LEAVES 之外的路径：{unknown}"
+    # v2.3.0 的两个新键必须真的被读到（否则就是「写了 schema 但没人消费」）
+    assert "classify.prior_ttl_hours" in paths
+    assert "classify.repeat_window_seconds" in paths
     assert "self.cfg = config_map.ConfigView(" in src, "ConfigView 必须挂到 self.cfg"
 
 

@@ -1,20 +1,29 @@
 """威胁分级引擎：本地判定、指纹知识库与 LLM 判定的编排（纯逻辑，不导入 astrbot）。
 
-判定顺序（短路优先，避免对同一指纹重复付 LLM 的钱）：
+判定顺序（v2.3.0：**每条错误都必须经模型重新下结论**，知识库只当先验）：
 
-1. 人工覆写：知识库里 ``source == "manual"`` 的指纹直接返回，优先级最高，
-   不会被任何自动结果覆盖，也不经过安全闸；
-2. 知识库短路：命中已缓存指纹（LLM 判定或本地噪声规则）直接复用，不再调用 LLM；
-3. 已知噪声短路（``noise_shortcut``，默认开）：本地规则认定为良性噪声时直接给结论，
-   最吵的一类噪声不消耗 token；
-4. LLM 判定：``classify_mode == "llm"`` 且配置了 provider id 时调用
-   ``Context.llm_generate``（显式传 ``chat_provider_id``），带超时；
-   输出经 :func:`classify.apply_safety_guards` 修正后写入知识库；
-5. 本地兜底：``classify_mode == "local"``、未配置 provider、LLM 超时/异常/输出非法时，
-   一律退到 :func:`classify.classify_block`，降级等级取 ``max(本地等级, fallback_severity)``
-   （默认 MEDIUM），保证「不静默放行」。
+1. 人工覆写：知识库里 ``source == "manual"`` 的指纹直接返回（唯一豁免），
+   优先级最高，不会被任何自动结果覆盖，也不经过安全闸；
+2. 批内复用（``begin_round()`` 之后、同一轮之内）：同一指纹在本轮已经真判过一次时
+   复用那条结论，但 ``evidence`` 用本次片段重建 —— 同一批的同一指纹是**同一次观察**，
+   这是唯一允许的判定去重；
+3. 知识库先验：命中历史条目**不再 return**，只把条目作为「历史判定（仅供参考，可推翻）」
+   注入提示词（``build_classification_prompt(prior=...)``）。历史结论不参与判决；
+4. 显式 ``local`` 模式：本地规则给结论（``judged=False``），只作观测/先验写库；
+5. 需要 LLM 但没有 provider/context：显式降级（``degraded:llm-unconfigured``），
+   **不写库** —— 否则「没配 provider」的本地结论会被永久固化成历史先验；
+6. 已知噪声短路只在 ``noise_shortcut=true``（默认 **false**）时生效，
+   且结论标 ``judged=False``（不得伪装成模型判定）；
+7. LLM 判定：``classify_mode`` 允许且 provider 可用时调用 ``Context.llm_generate``，
+   输出经 :func:`classify.apply_safety_guards` 修正后写入知识库（``judged=True``）；
+8. 预算用尽：**只延迟、不取消** —— 该指纹进待判队列，下一轮优先判定；本轮返回
+   ``source="degraded"`` + ``degraded:llm-budget``（绝不静默用本地结论定案）；
+9. 降级：LLM 超时/异常/输出非法/安全闸异常/未配置 provider 时返回 ``source="degraded"``，
+   ``judged=False``，``judge_source="degraded"``，标签带 ``degraded:*`` 前缀。
 
-降级结果与本地兜底结果都不写知识库：provider 抖动或临时没配好，不该把某个指纹永久钉死。
+知识库（``pattern_kb``）仍然保留：记录命中次数/最近出现，供统计、先验注入与去重使用；
+它**不再是判决来源**。人工覆写与本地结论的写入语义不变；
+降级结果、预算排队结果一律不写库（provider 抖动不该把某个指纹永久钉死）。
 异常隔离：LLM 与知识库的任何异常都在本层吞掉并转成结构化结论，不影响调用方主循环。
 """
 
@@ -23,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Protocol
@@ -74,6 +84,12 @@ DEFAULT_LLM_MAX_CALLS_ROUND = 5
 DEFAULT_LLM_MAX_CALLS_HOUR = 60
 """每小时 LLM 调用上限（F04；0 = 不限）。"""
 
+_JUDGE_QUEUE_MAX = 500
+"""待判队列长度上限（内存态；超出丢最旧，防止日志风暴把内存拖垮）。"""
+
+DEFAULT_PRIOR_TTL_HOURS = 72
+"""历史先验的保留期（``classify.prior_ttl_hours``；人工覆写永不过期）。"""
+
 def _bool_cfg(cfg: Mapping | object | None, key: str, default: bool) -> bool:
     """读布尔配置（字符串 "false"/"0" 也当假，避免配置面把假值读成真）。"""
     value = cfg_get(cfg, key, default)
@@ -108,11 +124,15 @@ _MAX_LLM_TIMEOUT = 600.0
 class KnowledgeBase(Protocol):
     """指纹知识库的最小接口（store.py 的 SQLite 版本照此实现即可）。
 
+    v2.3.0：本接口**只**用于「记录 / 统计 / 先验 / 人工覆写」，
+    :meth:`get` 的返回值**不得**直接变成判决结论。
+
     条目形状::
 
         {"fingerprint": str, "severity": str, "confidence": float, "tags": list[str],
-         "component": str, "reason": str, "source": "manual"|"llm"|"local-noise",
-         "hits": int, "updated_at": float}
+         "component": str, "reason": str, "source": "manual"|"llm"|"local"|"local-noise",
+         "hits": int, "updated_at": float,
+         "last_judged_at": float, "judge_source": "llm"|"degraded"|"local"|"manual"|""}
     """
 
     def get(self, fingerprint: str) -> Mapping[str, Any] | None:
@@ -287,6 +307,9 @@ class SqliteKnowledgeBase:
             "source": MANUAL_SOURCE if row.get("manual") else str(row.get("source") or "llm"),
             "hits": int(row.get("hits") or 0),
             "updated_at": float(row.get("last_seen") or 0.0),
+            # 审计两列（v2.3.0 schema v3）：何时真判过、依据是什么
+            "last_judged_at": float(row.get("last_judged_at") or 0.0),
+            "judge_source": str(row.get("judge_source") or ""),
         }
 
     def prime(self, fingerprints: Any) -> int:
@@ -436,8 +459,10 @@ class ThreatEngine:
             context: AstrBot ``Context``（只需提供 ``llm_generate``），可为 None（纯本地）。
             cfg: 插件配置，支持 ``classify_mode`` / ``llm_provider_id`` /
                 ``llm_timeout`` / ``fallback_severity`` / ``kb_enabled`` /
-                ``kb_max_entries`` / ``noise_shortcut`` / ``llm_max_block_lines`` /
-                ``classify_system_prompt`` / ``route_map``。
+                ``kb_max_entries`` / ``prior_ttl_hours`` / ``noise_shortcut`` /
+                ``llm_max_block_lines`` / ``llm_max_calls_per_round`` /
+                ``llm_max_calls_per_hour`` / ``classify_system_prompt`` / ``route_map``。
+                ``repeat_window_seconds`` 只由 main 的统计窗口消费（判定层不因它跳过模型）。
             kb: 知识库实现，缺省用进程内 :class:`FingerprintKnowledgeBase`。
             system_prompt: 分级系统提示词，缺省用 ``classify.DEFAULT_SYSTEM_PROMPT``。
         """
@@ -458,29 +483,112 @@ class ThreatEngine:
         )
         self._stats = {
             "llm_calls": 0,
+            #: 历史先验命中次数（知识库里有条目；只观测，**不再**是判决出口）
             "kb_hits": 0,
+            #: 真正把历史条目注进提示词的次数
+            "prior_injected": 0,
             "manual_hits": 0,
             "noise_shortcut": 0,
             "local": 0,
             "degraded": 0,
             "guarded": 0,
             "llm_budget_skipped": 0,
+            #: 进入 LLM 路径（含随后超时/异常/非法输出而降级）的段数
+            "llm_forced": 0,
+            #: 完全没有尝试模型的段数（显式 local / 未配 provider / 噪声短路 / 预算排队 / 批内复用）
+            "llm_skipped": 0,
+            #: 同一轮内同指纹复用（唯一允许的判定去重；跨轮必重判）
+            "batch_memo_hits": 0,
+            #: 跨轮复用次数的留位（默认 0：v2.3.0 不提供跨轮复用开关）
+            "judge_reused": 0,
         }
-        # F04：LLM 调用预算（按轮 + 按小时），超限的块走本地规则并打 llm-budget 标签
+        # F04：LLM 调用预算（按轮 + 按小时）。预算用尽**只延迟判定**（进待判队列），
+        # 不再把「没判」伪装成「已判」的本地结论。
         self._round_llm_calls = 0
         self._llm_call_times: list[float] = []
+        #: 当前是否处于一轮扫描里（由 :meth:`begin_round` 开启）。只有一轮之内才允许
+        #: 批内复用；调用方没开轮（例如单测直接 classify）时按「每次都是新一轮」处理。
+        self._round_active = False
+        #: 本轮已真判过的指纹 -> (结论, 时间)。跨轮由 begin_round 清空 ⇒ 跨轮必重判。
+        self._round_memo: dict[str, tuple[ThreatVerdict, float]] = {}
+        #: 因预算/小时窗没判成的指纹（FIFO，去重，有界），下一轮优先判定
+        self._judge_queue: deque[str] = deque()
+        #: 本轮享有「预算优先权」的指纹（上一轮排队的产物）
+        self._priority: set[str] = set()
+        self._round_snapshot: dict[str, int] = {}
 
     def begin_round(self) -> None:
-        """每轮扫描开始前调用：重置「每轮 LLM 调用数」（F04 的轮内预算）。"""
+        """每轮扫描开始前调用：清空批内复用 + 提升上一轮的待判队列。
+
+        - 清空 ``_round_memo``：**同批同指纹只判一次，跨轮必重判**（TTL 复用被明确禁止）；
+        - 把上一轮因预算排队下来的指纹提升为本轮优先判定（预算只延迟、不取消）。
+        """
         self._round_llm_calls = 0
+        self._round_active = True
+        self._round_memo.clear()
+        self._round_snapshot = dict(self._stats)
+        self._promote_priority()
+
+    def round_stats(self) -> dict[str, int]:
+        """本轮增量计数器（供 main 每轮写一行审计 INFO：判了多少、复用多少、降级多少）。"""
+        return {
+            key: int(value) - int(self._round_snapshot.get(key, 0))
+            for key, value in self._stats.items()
+        }
+
+    @property
+    def deferred_judgements(self) -> int:
+        """待判队列长度（预算排队中、下一轮优先判定的指纹数）。"""
+        return len(self._judge_queue) + len(self._priority)
+
+    def _promote_priority(self) -> None:
+        """把待判队列提升为本轮优先集合（每次最多提升一轮预算的量，避免排队放大成本）。"""
+        capacity = _int_cfg(
+            self._cfg, "llm_max_calls_per_round", DEFAULT_LLM_MAX_CALLS_ROUND, 0, 1000
+        )
+        if capacity <= 0:
+            capacity = DEFAULT_LLM_MAX_CALLS_ROUND
+        self._priority = set()
+        while self._judge_queue and len(self._priority) < capacity:
+            self._priority.add(self._judge_queue.popleft())
+
+    def _defer_judgement(self, fingerprint: str) -> None:
+        """把「本轮没判成」的指纹放进待判队列（有界、去重；0 长度指纹不入队）。"""
+        key = str(fingerprint or "").strip()
+        if not key or key in self._judge_queue or key in self._priority:
+            return
+        if len(self._judge_queue) >= _JUDGE_QUEUE_MAX:
+            self._judge_queue.popleft()
+            _log.warning("待判队列已满（%d），丢弃最旧的一条排队指纹", _JUDGE_QUEUE_MAX)
+        self._judge_queue.append(key)
+
+    def _memo_get(self, fingerprint: str) -> ThreatVerdict | None:
+        """取本轮早先那次真判的结论（只在轮内有效；跨轮由 begin_round 清空）。"""
+        if not self._round_active or not fingerprint:
+            return None
+        item = self._round_memo.get(fingerprint)
+        return item[0] if item is not None else None
+
+    def _memo_put(self, fingerprint: str, verdict: ThreatVerdict, now: float) -> None:
+        """记录本轮该指纹的结论（只记录真判成功的结论）。"""
+        if not self._round_active or not fingerprint or not verdict.judged:
+            return
+        self._round_memo[fingerprint] = (verdict, now)
 
     @property
     def llm_calls(self) -> int:
         """累计 LLM 调用次数（观测用）。"""
         return int(self._stats["llm_calls"])
 
-    def _llm_budget_allows(self, *, now: float | None = None) -> tuple[bool, str]:
-        """LLM 预算闸（F04）：**调用前**判定，超限的块走本地规则。
+    def _llm_budget_allows(
+        self, *, now: float | None = None, priority: bool = False
+    ) -> tuple[bool, str]:
+        """LLM 预算闸（F04）：**调用前**判定；超限的块进待判队列，不再本地定案。
+
+        Args:
+            now: 计时基准（测试注入）。
+            priority: 该指纹是否享有本轮优先权（上一轮排队的产物）。优先指纹不受
+                **轮**预算限制（它的额度本来就该在本轮兑现），但仍受**小时**预算约束。
 
         Returns:
             ``(是否允许调用, 拒绝原因)``；原因 ∈ {``round``, ``hour``}。
@@ -491,10 +599,10 @@ class ThreatEngine:
         self._llm_call_times = [
             item for item in self._llm_call_times if moment - item < 3600.0
         ]
-        if per_round > 0 and self._round_llm_calls >= per_round:
-            return False, "round"
         if per_hour > 0 and len(self._llm_call_times) >= per_hour:
             return False, "hour"
+        if not priority and per_round > 0 and self._round_llm_calls >= per_round:
+            return False, "round"
         return True, ""
 
     def _note_llm_call(self, *, now: float | None = None) -> None:
@@ -626,7 +734,7 @@ class ThreatEngine:
             return ThreatVerdict(
                 severity=floor,
                 confidence=0.0,
-                tags=["classify-error", "local-mode"],
+                tags=["classify-error", "local-mode", "degraded:engine-error"],
                 component="unknown",
                 fingerprint="",
                 is_new_pattern=False,
@@ -637,81 +745,168 @@ class ThreatEngine:
                 ),
                 route=route_for_severity(floor, cfg_get(self._cfg, "route_map", None)),
                 source="degraded",
+                judged=False,
+                judge_source="degraded",
             )
 
     async def _classify(
         self, block: LogBlock, metrics: Mapping | None = None
     ) -> ThreatVerdict:
-        """判定主流程：知识库短路 → 噪声短路 → LLM → 安全闸 → 落库。"""
+        """判定主流程：人工覆写 → 批内复用 → 先验注入 → LLM → 安全闸 → 落库。
+
+        v2.3.0 的铁律（逐行可查）：
+
+        - **知识库命中不是出口**：命中只把条目作为 ``prior`` 注进提示词，结论必须由模型
+          （或显式降级）给出；原来的 ``return _verdict_from_entry(...)`` 已删除；
+        - **批内复用只在轮内**（``begin_round`` 清空），跨轮必重判；
+        - **通知去重不影响判定**：``repeat_count`` / ``budget.dedupe_window_seconds`` 只决定
+          「发不发」，本函数从不因为「最近通知过」而跳过模型调用；
+        - **降级不写库、不冒充已判**：``source="degraded"`` + ``judged=False``。
+        """
         cfg = self._cfg
+        now = time.time()
         local = classify_block(block, metrics, cfg)
+        fingerprint = local.fingerprint
+        # 本轮是否享有「预算优先权」（上一轮排队的产物）。取完立刻用掉：无论后面走哪条
+        # 分支，这条排队记录都算在本轮兑现，不会永远挂在 _priority 里。
+        is_priority = fingerprint in self._priority
+        self._priority.discard(fingerprint)
 
         if not _bool_cfg(cfg, "classify_enable", True):
-            # F15：分级总开关关闭 ⇒ 直接按等级触发（不查 KB、不调 LLM）；
-            # §5.1 第 4 行：本地结论**要写知识库**（source=local），否则 V1 的
-            # 「跑一轮后 pattern_kb 行数 > 0」在关闭分级时永远不成立
+            # F15：分级总开关关闭 ⇒ 直接按等级触发（不查 KB、不调 LLM）。
+            # 本地结论仍写库（只作统计与先验；V1 的「跑一轮后 pattern_kb 非空」仍成立）。
             self._stats["local"] += 1
+            self._stats["llm_skipped"] += 1
             verdict = replace(
                 local,
-                tags=[*local.tags, "classify-disabled"],
+                tags=[*local.tags, "classify-disabled", "judged-skipped"],
                 reason=local.reason + "；classify_enable=false，跳过知识库与 LLM 判定",
+                judged=False,
+                judge_source="local",
             )
             self._remember(verdict, source=LOCAL_SOURCE)
             return verdict
 
-        entry = self._kb_lookup(local.fingerprint)
-        if entry is not None:
-            manual = str(entry.get("source") or "") == MANUAL_SOURCE
-            self._stats["manual_hits" if manual else "kb_hits"] += 1
-            self._touch(entry)
-            return self._verdict_from_entry(entry, local)
+        # ① 人工覆写是唯一豁免：它是人的决定，不是「历史自动结论」。
+        prior = self._kb_lookup(fingerprint)
+        if prior is not None and str(prior.get("source") or "") == MANUAL_SOURCE:
+            self._stats["manual_hits"] += 1
+            self._stats["llm_skipped"] += 1
+            self._touch(prior)
+            return replace(
+                self._verdict_from_entry(prior, local),
+                judged=False,
+                judge_source="manual",
+            )
+
+        # ② 批内复用：同一轮里同一指纹只判一次（同一次观察）；跨轮由 begin_round 清空。
+        memo = self._memo_get(fingerprint)
+        if memo is not None:
+            self._stats["batch_memo_hits"] += 1
+            self._stats["llm_skipped"] += 1
+            tags = list(memo.tags)
+            if "batch-reused" not in tags:
+                tags.append("batch-reused")
+            return replace(
+                memo,
+                component=memo.component or local.component,
+                fingerprint=fingerprint,
+                evidence=local.evidence,
+                tags=tags,
+            )
+
+        if prior is not None:
+            # ③ 知识库命中：只当观测与先验，绝不当判决出口。
+            self._stats["kb_hits"] += 1
 
         mode = self._mode()
         provider_id = self._provider_id()
-        if not self._llm_wanted(mode) or not provider_id or self._context is None:
+
+        if not self._llm_wanted(mode):
+            # 显式 local 模式：用户选择不调模型。结论是本地判定（judged=False）。
             self._stats["local"] += 1
-            verdict = local
-            if self._llm_wanted(mode):
-                verdict = replace(
-                    local,
-                    tags=[*local.tags, "llm-unconfigured"],
-                    reason=local.reason
-                    + f"；模式 {mode} 需要 LLM，但未配置可用的 provider/context，退到本地模式",
-                )
-            # §5.1 第 4 行：本地模式结论同样写知识库（V1：跑一轮后 pattern_kb 必须非空）
+            self._stats["llm_skipped"] += 1
+            verdict = replace(
+                local,
+                tags=[*local.tags, "local-judged", "judged-skipped"],
+                reason=local.reason + f"；classify_mode={mode}（显式本地模式，未调用模型）",
+                judged=False,
+                judge_source="local",
+            )
             self._remember(verdict, source=LOCAL_SOURCE)
             return verdict
 
-        if bool(cfg_get(cfg, "noise_shortcut", True)) and is_benign_noise(block):
+        if not provider_id or self._context is None:
+            # C4（真缺陷）：需要 LLM 但没有 provider/context ⇒ 显式降级，**不写库**。
+            # 否则这条本地结论会被永久固化成历史先验，等 provider 配好也不会被重判。
+            self._stats["degraded"] += 1
+            self._stats["llm_skipped"] += 1
+            missing = "未配置 provider_id" if not provider_id else "没有可用的 Context"
+            _log.warning(
+                "模式 %s 需要 LLM，但%s；本块降级且不写知识库（指纹 %s）",
+                mode,
+                missing,
+                fingerprint[:12],
+            )
+            return degraded_verdict(
+                block,
+                metrics,
+                cfg,
+                error=f"模式 {mode} 需要 LLM，但{missing}",
+                tag="llm-unconfigured",
+                local=local,
+            )
+
+        if _bool_cfg(cfg, "noise_shortcut", False) and is_benign_noise(block):
+            # C2：零成本短路必须由运营方显式打开（默认 false），且不得伪装成模型判定。
             self._stats["noise_shortcut"] += 1
+            self._stats["llm_skipped"] += 1
             verdict = replace(
                 local,
-                tags=[*local.tags, "noise-shortcut"],
-                reason=local.reason + "；命中已知良性噪声规则，短路返回（不调用 LLM）",
+                tags=[*local.tags, "noise-shortcut", "judged-skipped"],
+                reason=local.reason
+                + "；命中已知良性噪声规则，短路返回（noise_shortcut=true，未调用模型）",
+                judged=False,
+                judge_source="local",
             )
             self._remember(verdict, source=NOISE_SOURCE)
             return verdict
 
-        allowed, budget_reason = self._llm_budget_allows()
+        self._stats["llm_forced"] += 1
+        allowed, budget_reason = self._llm_budget_allows(priority=is_priority)
         if not allowed:
-            # F04：预算用尽 ⇒ 本块走本地规则（先过闸再调 LLM，绝不「先花 token 再判」）
+            # F04（v2.3.0 语义）：预算只延迟判定，不取消判定 —— 排队 + 显式降级，
+            # 绝不用本地结论「看起来像已判」地定案。
             self._stats["llm_budget_skipped"] += 1
-            self._stats["local"] += 1
+            self._stats["degraded"] += 1
+            self._stats["llm_skipped"] += 1
+            self._defer_judgement(fingerprint)
             _log.warning(
-                "LLM 预算用尽（%s），本块走本地规则；指纹 %s",
+                "LLM 预算用尽（%s），本块已排队到下一轮优先判定；指纹 %s（待判队列 %d）",
                 budget_reason,
-                local.fingerprint[:12],
+                fingerprint[:12],
+                self.deferred_judgements,
             )
-            return replace(
-                local,
-                tags=[*local.tags, "llm-budget", f"llm-budget:{budget_reason}"],
-                reason=local.reason + f"；LLM 预算用尽（{budget_reason}），本块未调用 LLM",
+            return degraded_verdict(
+                block,
+                metrics,
+                cfg,
+                error=(
+                    f"LLM 预算用尽（{budget_reason}），本块已排队到下一轮优先判定"
+                    "（预算只延迟判定，不取消判定）"
+                ),
+                tag="llm-budget",
+                local=local,
+                extra_tags=[f"llm-budget:{budget_reason}", "judged-deferred"],
             )
-
         timeout = self._timeout()
         try:
-            prompt = build_classification_prompt(block, metrics, cfg, local=local)
-            self._note_llm_call()
+            prompt = build_classification_prompt(
+                block, metrics, cfg, local=local, prior=prior
+            )
+            if prior is not None:
+                self._stats["prior_injected"] += 1
+            self._note_llm_call(now=now)
             text = await asyncio.wait_for(
                 self._call_llm(provider_id, prompt), timeout=timeout
             )
@@ -743,7 +938,7 @@ class ThreatEngine:
             )
 
         try:
-            verdict = parse_llm_verdict(text, block, metrics, cfg, local=local)
+            verdict = parse_llm_verdict(text, block, metrics, cfg, local=local, prior=prior)
         except LLMOutputError as exc:
             self._stats["degraded"] += 1
             _log.warning("LLM 输出非法，保守降级：%s", exc)
@@ -788,6 +983,7 @@ class ThreatEngine:
                 guarded.severity.value,
             )
         self._remember(guarded, source=LLM_SOURCE)
+        self._memo_put(guarded.fingerprint, guarded, now)
         return guarded
 
     async def _call_llm(self, provider_id: str, prompt: str) -> str:
@@ -853,19 +1049,36 @@ class ThreatEngine:
         return min(_MAX_LLM_TIMEOUT, max(_MIN_LLM_TIMEOUT, value))
 
     def _kb_lookup(self, fingerprint: str) -> Mapping[str, Any] | None:
-        """读知识库（异常隔离：知识库坏了也不影响判定）。"""
+        """读知识库先验（异常隔离：知识库坏了也不影响判定）。
+
+        v2.3.0：返回值**只用于两件事** —— 人工覆写豁免、历史先验注入提示词；
+        它不再是判决出口。超过 ``classify.prior_ttl_hours`` 的自动条目不再当先验
+        （人工覆写永不过期）。
+        """
         if not self._kb_active or not fingerprint:
             return None
         try:
-            return self._kb.get(fingerprint)
+            entry = self._kb.get(fingerprint)
         except Exception as exc:
             _log.warning(
                 "指纹知识库读取失败（忽略并继续）：%s: %s", type(exc).__name__, exc
             )
             return None
+        if entry is None:
+            return None
+        if str(entry.get("source") or "") == MANUAL_SOURCE:
+            return entry
+        try:
+            seen = float(entry.get("updated_at") or 0.0)
+        except (TypeError, ValueError):
+            seen = 0.0
+        ttl = _int_cfg(self._cfg, "prior_ttl_hours", DEFAULT_PRIOR_TTL_HOURS, 1, 720) * 3600
+        if seen > 0 and time.time() - seen > ttl:
+            return None  # 先验过期：不作提示，也不作判决（判决本来就不看它）
+        return entry
 
     def _remember(self, verdict: ThreatVerdict, *, source: str) -> None:
-        """把结论写回知识库（异常隔离）。"""
+        """把结论写回知识库（异常隔离；只作统计/先验，不再是判决来源）。"""
         if not self._kb_active:
             return
         try:
@@ -880,6 +1093,9 @@ class ThreatEngine:
                     "source": source,
                     "hits": 1,
                     "updated_at": time.time(),
+                    # 审计两列（v2.3.0）：真判时间与依据；非模型结论不写判时间
+                    "last_judged_at": time.time() if verdict.judged else 0.0,
+                    "judge_source": verdict.judge_source or source,
                 }
             )
         except Exception as exc:
@@ -904,9 +1120,14 @@ class ThreatEngine:
     def _verdict_from_entry(
         self, entry: Mapping[str, Any], local: ThreatVerdict
     ) -> ThreatVerdict:
-        """把知识库条目还原成结论（``evidence`` 用本次片段的实时摘录）。"""
-        source = str(entry.get("source") or "kb")
-        manual = source == MANUAL_SOURCE
+        """把**人工覆写**条目还原成结论（``evidence`` 用本次片段的实时摘录）。
+
+        v2.3.0：自动条目（``source=llm`` / ``local`` / ``local-noise``）**不再**走本函数
+        —— 它们只作先验。非 manual 条目传进来时直接返回本地结论，避免「历史自动结论
+        被当成判决」的老病灶从别的调用点绕回来。
+        """
+        if str(entry.get("source") or "") != MANUAL_SOURCE:
+            return local
         severity = Severity.parse(entry.get("severity"), local.severity)
         try:
             confidence = min(1.0, max(0.0, float(entry.get("confidence", 0.0))))
@@ -917,8 +1138,7 @@ class ThreatEngine:
             str(tag)
             for tag in (raw_tags if isinstance(raw_tags, (list, tuple)) else [raw_tags])
         ]
-        tags.append("manual-override" if manual else f"kb-hit:{source}")
-        entry_source = MANUAL_SOURCE if manual else "kb"
+        tags.append("manual-override")
         try:
             hits = int(entry.get("hits", 0) or 0)
         except (TypeError, ValueError):
@@ -932,9 +1152,11 @@ class ThreatEngine:
             is_new_pattern=False,
             evidence=local.evidence,
             reason=(
-                f"知识库命中（{'人工覆写' if manual else source}，已命中 {hits} 次）："
-                f"{entry.get('reason') or '无历史理由'}；指纹 {local.fingerprint[:12]}"
+                f"人工覆写（已命中 {hits} 次）："
+                f"{entry.get('reason') or '无人工理由'}；指纹 {local.fingerprint[:12]}"
             ),
             route=route_for_severity(severity, cfg_get(self._cfg, "route_map", None)),
-            source=entry_source,
+            source=MANUAL_SOURCE,
+            judged=False,
+            judge_source="manual",
         )
