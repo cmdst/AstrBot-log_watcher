@@ -3,7 +3,7 @@
 
 【输出】
 只输出一个 JSON 对象。不要 markdown 代码块、不要前缀说明、不要尾随解释、不要第二个对象。
-{"severity":"IGNORE|LOW|MEDIUM|HIGH|CRITICAL","confidence":0.0,"tags":["短标签"],"component":"来源组件","evidence":"关键证据行原文","reason":"中文研判理由","remediate":false}
+{"severity":"IGNORE|LOW|MEDIUM|HIGH|CRITICAL","confidence":0.0,"tags":["短标签"],"component":"来源组件","evidence":"关键证据行原文","reason":"中文研判理由"}
 - severity 必须是 IGNORE、LOW、MEDIUM、HIGH、CRITICAL 之一（逐字大写）。
 - confidence 是 0.0~1.0 的数；tags 是短标签数组（可含 repeat 等统计事实），最多 6 个。
 - reason 必须引用片段里的具体证据（异常类型、错误码、组件、重试行），不得空泛、不得编造片段里没有的内容。
@@ -13,8 +13,8 @@
 - IGNORE：已被框架吞掉、无人受影响。典型：asyncio「Future exception was never retrieved」且内层是超时/连接类异常、启动竞态自愈。反例：没看懂的 ERROR 行不得丢进 IGNORE。
 - LOW：局部降级、有 fallback 或只影响可选功能。典型：MCP 服务初始化失败后被跳过、通知通道发送失败、deprecation 警告、性能耗时告警。反例：不要因为"像协议问题"就升到 HIGH。
 - MEDIUM：真故障但多为可恢复抖动。典型：上游 503/429、请求超时、连接被拒、空内容重试、单次数据库连接失败。反例：不要因为"框架在重试"就压成 LOW（重试不代表已恢复）。
-- HIGH：功能已中断，需要带证据告警并进入修复候选。典型：未捕获异常与 Traceback、插件/组件加载失败、状态库不可用（database is locked）、数据落库或整合持续失败。反例：不要把主机级急停降到这里。
-- CRITICAL：主机级/进程级急停，必须立即修复。典型：磁盘写满（No space left on device）、内存耗尽或 oom-kill、主循环异常退出、进程被终止。反例：把 asyncio 噪声、deprecation、慢查询判成 CRITICAL 是严重误报（本部署实测噪声:风险≈8.9:1，误报会直接触发一次无人值守修复调用）。
+- HIGH：功能已中断，需要带证据告警并由人工介入处置。典型：未捕获异常与 Traceback、插件/组件加载失败、状态库不可用（database is locked）、数据落库或整合持续失败。反例：不要把主机级急停降到这里。
+- CRITICAL：主机级/进程级急停，必须立即修复。典型：磁盘写满（No space left on device）、内存耗尽或 oom-kill、主循环异常退出、进程被终止。反例：把 asyncio 噪声、deprecation、慢查询判成 CRITICAL 是严重误报（本部署实测噪声:风险≈8.9:1，误报会直接推给值守人员）。
 
 【判定原则】
 1. 必须读上下文：命中行 + 前后文 + 异常链 + 重复次数一起看，不要只匹配关键词。

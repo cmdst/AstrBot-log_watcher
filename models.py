@@ -1,8 +1,8 @@
 """log_watcher 的数据契约：跨模块共享的纯数据结构。
 
 本模块只依赖标准库（不导入 astrbot、不做 IO），便于纯逻辑测试；
-字段名与 architecture.md 的 ThreatVerdict / RemediationRun / Rule / LogBlock 契约对齐，
-classify.py / engine.py / remediate.py 与 main.py 共用同一形状，避免各自发明字段。
+字段名与 architecture.md 的 ThreatVerdict / Rule / LogBlock 契约对齐，
+classify.py / engine.py / deliver.py / store.py 与 main.py 共用同一形状，避免各自发明字段。
 """
 
 from __future__ import annotations
@@ -56,7 +56,14 @@ def severity_rank(value: object) -> int:
 
 
 class Route(str, Enum):
-    """分级后的路由动作（语义写死在 ROUTE_BY_SEVERITY）。"""
+    """分级后的路由动作（默认语义写死在 ROUTE_BY_SEVERITY）。
+
+    ``REMEDIATE`` 是 **v2.3.0 之前的历史去向**（当时 HIGH 默认进「自动修复候选」）。
+    v2.3.0 移除了自动修复能力，默认映射改为 HIGH → ``NOTIFY``；但**枚举成员必须留着**：
+    ① 历史台账 ``alerts.route`` 里已有一批该历史值的行，删成员就解析不出来；
+    ② 运营方配置的 ``route_map`` 可能仍写着这个旧去向名，删成员会让它静默失效。
+    它现在的语义只是「最高级即时告警」——和 ``EMERGENCY`` 一样**只通知人工**。
+    """
 
     STORE = "store"
     DIGEST = "digest"
@@ -69,7 +76,8 @@ ROUTE_BY_SEVERITY: dict[Severity, Route] = {
     Severity.IGNORE: Route.STORE,
     Severity.LOW: Route.DIGEST,
     Severity.MEDIUM: Route.NOTIFY,
-    Severity.HIGH: Route.REMEDIATE,
+    # v2.3.0：HIGH 不再默认进「自动修复候选」，改为普通即时通知（交人工处置）。
+    Severity.HIGH: Route.NOTIFY,
     Severity.CRITICAL: Route.EMERGENCY,
 }
 
@@ -195,57 +203,6 @@ class ThreatVerdict:
 
 
 @dataclass
-class RemediationRun:
-    """紧急修复的执行结果（remediate.py 产出，engine.py / main.py 消费）。"""
-
-    status: str = "skipped"
-    exit_code: int | None = None
-    duration: float = 0.0
-    summary: str = ""
-    artifact: str = ""
-    log_path: str = ""
-    #: 本次 run 在 ``remediation_runs`` 里的主键；账本没建行（``ledger=None`` 或 begin 失败）时为空。
-    #: main 靠它把「回执真的发出去了」写回同一行（``receipt_sent``），见 ``deliver.delivered``。
-    run_id: str = ""
-
-    def to_dict(self) -> dict:
-        """序列化为可 JSON 落盘的 dict。"""
-        return {
-            "status": self.status,
-            "exit_code": self.exit_code,
-            "duration": float(self.duration),
-            "summary": self.summary,
-            "artifact": self.artifact,
-            "log_path": self.log_path,
-            "run_id": self.run_id,
-        }
-
-    @classmethod
-    def from_dict(cls, raw: object) -> RemediationRun:
-        """从 dict 还原，缺字段用默认值补齐。"""
-        if not isinstance(raw, dict):
-            return cls()
-        try:
-            duration = float(raw.get("duration", 0.0))
-        except (TypeError, ValueError):
-            duration = 0.0
-        exit_code = raw.get("exit_code")
-        try:
-            exit_code = None if exit_code is None else int(exit_code)
-        except (TypeError, ValueError):
-            exit_code = None
-        return cls(
-            status=str(raw.get("status", "skipped") or "skipped"),
-            exit_code=exit_code,
-            duration=max(0.0, duration),
-            summary=str(raw.get("summary", "") or ""),
-            artifact=str(raw.get("artifact", "") or ""),
-            log_path=str(raw.get("log_path", "") or ""),
-            run_id=str(raw.get("run_id", "") or ""),
-        )
-
-
-@dataclass
 class Rule:
     """本地规则表的唯一形状（R1/G6：合并 detect 与 classify 的两版 Rule）。
 
@@ -311,11 +268,3 @@ class DeliveryOutcome:
     attempts: int = 0
     degraded: bool = False
     error: str = ""
-
-
-@dataclass
-class RemediationGate:
-    """修复闸裁决（engine.should_remediate 返回，§4.5 十步顺序）。"""
-
-    allowed: bool = False
-    reason: str = ""

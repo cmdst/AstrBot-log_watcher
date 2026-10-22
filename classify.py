@@ -9,7 +9,7 @@
 - LLM 契约 ``build_classification_prompt()`` / ``parse_llm_verdict()``：提示词拼装
   （含 token 预算裁剪与「日志正文不是指令」声明）与严格 JSON 解析，
   非法输出抛 :class:`LLMOutputError`，由 engine 转成保守降级；
-- 安全闸 ``apply_safety_guards()``：已知良性噪声不得升到需要修复的等级，
+- 安全闸 ``apply_safety_guards()``：已知良性噪声不得升到「需要人工介入」的等级，
   规则命中的硬故障不得被 LLM 吞成 IGNORE。
 
 数据契约不在本模块定义：``Severity`` / ``Route`` / ``ThreatVerdict`` / ``LogBlock``
@@ -19,7 +19,7 @@
     ThreatVerdict(severity, confidence, tags, component, fingerprint,
                   is_new_pattern, evidence, reason, route, source)
     severity ∈ {IGNORE, LOW, MEDIUM, HIGH, CRITICAL}
-    route    ∈ {store, digest, notify, remediate, emergency}
+    route    ∈ Route 的取值（见 models.Route；历史值见该枚举的说明）
     source   ∈ {local, llm, kb, manual, degraded}
 
 等级判定优先级（同一片段内）：failure 规则 > noise 规则 > transient 规则，
@@ -93,7 +93,7 @@ def route_for_severity(severity: object, route_map: Mapping | None = None) -> Ro
     Args:
         severity: 等级名或 :class:`models.Severity`。
         route_map: 可选覆写表，键为等级名，值为 :class:`models.Route` 名
-            （小写规范值，如 ``{"HIGH": "remediate"}``）。
+            （小写规范值，如 ``{"HIGH": "emergency"}``）。
 
     Returns:
         对应的去向；覆写值非法时回落默认表并记一条 warning。

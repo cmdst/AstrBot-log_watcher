@@ -45,7 +45,7 @@ try:
         severity_max,
     )
     from .log_reader import LogBlock
-    from .models import RemediationGate, Severity, ThreatVerdict
+    from .models import Severity, ThreatVerdict
 except ImportError:  # 平铺导入（tests 直接 import engine）
     from classify import (
         DEFAULT_SYSTEM_PROMPT,
@@ -64,7 +64,7 @@ except ImportError:  # 平铺导入（tests 直接 import engine）
         severity_max,
     )
     from log_reader import LogBlock
-    from models import RemediationGate, Severity, ThreatVerdict
+    from models import Severity, ThreatVerdict
 
 _log = logging.getLogger("log_watcher.engine")
 
@@ -417,32 +417,6 @@ class SqliteKnowledgeBase:
             if victim is None:
                 return
             del self._cache[victim]
-
-
-def should_remediate(
-    verdict: ThreatVerdict,
-    metrics: Mapping | None,
-    cfg: Mapping | object | None,
-    *,
-    ledger: Any = None,
-    now: float = 0.0,
-) -> RemediationGate:
-    """§6.6 ★：修复闸的唯一入口（一行委派到账本的十步裁决 ``can_start``）。
-
-    Args:
-        verdict: 分级结论。
-        metrics: 窗口统计（``repeat_count`` / ``self_feedback`` / ``trigger_window``）。
-        cfg: 插件配置（账本自己在 ``ledger`` 里持有；此处仅作未来扩展位）。
-        ledger: :class:`remediate.RemediationLedger`；缺省时 **fail-closed**（off）。
-        now: 当前时刻。
-
-    Returns:
-        :class:`~models.RemediationGate`。
-    """
-    if ledger is None:
-        # 没有账本 = 没有任何持久闸（并发/冷却/日限/风暴全不可查）⇒ 不允许修复
-        return RemediationGate(False, "off")
-    return ledger.can_start(verdict, now=now, metrics=metrics)
 
 
 class ThreatEngine:

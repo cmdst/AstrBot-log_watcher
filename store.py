@@ -30,6 +30,9 @@ _WINDOW_MAX_AGE = 7200.0
 _WINDOW_MAX_LEN = 1024
 SCHEMA_VERSION = 2
 _PRUNE_DELETE_CAP = 500
+#: v2.3.0：`remediation_runs` 只做历史保留与对账（不再写入）。孤儿 running 行的宽限秒数
+#: 固定为旧版「2 × 默认超时 300s」，配置键随自动修复通道一并移除。
+_LEGACY_RUN_GRACE = 600.0
 
 DEFAULT_COUNTERS: dict = {
     "rounds": 0,
@@ -48,7 +51,6 @@ DEFAULT_COUNTERS: dict = {
     "delivery_failed": 0,
     "delivery_retries": 0,
     "delivery_abandoned": 0,
-    "remediation_runs": 0,
     "fingerprints": {},
     "windows": {},
     "digest_buffer": [],
@@ -1117,8 +1119,8 @@ class SqliteStore:
     ) -> int:
         """把**上一次进程遗留**的 ``running`` 行对账成 ``aborted``（F06）。
 
-        任何非正常结束（进程被杀、插件重载、断电）都会留下永久 ``running`` 行，
-        导致 ``remediation_active()`` 恒非空、修复闸永久 ``busy``（A 方案失效）。
+        v2.3.0 移除了自动修复能力：这张表**只读不写**，本方法保留的唯一目的是把升级前
+        崩溃/重载留下的 ``running`` 行一次性收口，免得审计时把历史行误读成「还在跑」。
 
         启动对账的判定依据是「**本进程之外**不可能有 run 在跑」：状态库是单写者，
         当前进程刚起来、尚未发起任何 run，所以此刻所有 ``running`` 行都是孤儿 ——
@@ -1333,7 +1335,7 @@ class SqliteStore:
         self._write(run, None)
 
     def push_rate(self, scope: str, ts: float) -> None:
-        """记录一次速率事件（sent_minute/sent_hour/sent_day/sent_burst/remediation_trigger）。"""
+        """记录一次速率事件（sent_minute/sent_hour/sent_day/sent_burst）。"""
         self._write(
             lambda: self._conn.execute(
                 "INSERT INTO rate_windows(scope, ts) VALUES(?, ?)", (str(scope), float(ts))
@@ -1808,106 +1810,6 @@ class SqliteStore:
 
         return int(self._write(run, 0) or 0)
 
-    # ---------- 修复账本 ----------
-
-    def remediation_count(self, *, since: float) -> int:
-        """统计某时刻之后的修复 run 数（日限用）。"""
-        row = self._read(
-            lambda: self._conn.execute(
-                "SELECT COUNT(*) FROM remediation_runs WHERE started_at >= ?", (float(since),)
-            ).fetchone()
-        )
-        return int(row[0] or 0) if row else 0
-
-    def remediation_active(self) -> str | None:
-        """当前在跑的 run_id（并发闸用）。"""
-        row = self._read(
-            lambda: self._conn.execute(
-                "SELECT run_id FROM remediation_runs WHERE status = 'running'"
-                " ORDER BY started_at DESC LIMIT 1"
-            ).fetchone()
-        )
-        return str(row[0]) if row else None
-
-    def remediation_begin(
-        self,
-        run_id: str,
-        fingerprint: str,
-        severity: str,
-        *,
-        task_sha1: str,
-        argv: Sequence[str],
-    ) -> None:
-        """记录一次修复开始。"""
-        self._write(
-            lambda: self._conn.execute(
-                "INSERT INTO remediation_runs(run_id, fingerprint, severity, started_at, status,"
-                " task_sha1, argv) VALUES(?,?,?,?, 'running', ?, ?)",
-                (
-                    str(run_id),
-                    str(fingerprint),
-                    str(severity),
-                    time.time(),
-                    str(task_sha1),
-                    json.dumps(list(argv), ensure_ascii=False),
-                ),
-            )
-        )
-
-    def remediation_finish(self, run_id: str, run, *, receipt_sent: bool) -> None:
-        """记录一次修复结束（`run` 为 models.RemediationRun 或同形状对象）。"""
-        self._write(
-            lambda: self._conn.execute(
-                "UPDATE remediation_runs SET finished_at = ?, status = ?, exit_code = ?,"
-                " duration = ?, summary = ?, artifact = ?, log_path = ?, receipt_sent = ?"
-                " WHERE run_id = ?",
-                (
-                    time.time(),
-                    str(getattr(run, "status", "failed")),
-                    getattr(run, "exit_code", None),
-                    float(getattr(run, "duration", 0.0) or 0.0),
-                    str(getattr(run, "summary", ""))[:2000],
-                    str(getattr(run, "artifact", "")),
-                    str(getattr(run, "log_path", "")),
-                    1 if receipt_sent else 0,
-                    str(run_id),
-                ),
-            )
-        )
-
-    def remediation_mark_receipt_sent(self, run_id: str) -> int:
-        """把某个 run 的 ``receipt_sent`` 置 1（只动这一列），返回受影响行数。
-
-        为什么要单独一个方法：``remediation_finish`` 是**整行 UPDATE**，而回执是在 finish
-        **之后**才发的；再调一次 finish 就得保证传进来的 ``run`` 与首次逐字段一致，容易踩坑。
-        这里只更新「有没有告诉人」这一个事实，未知 ``run_id`` 是 no-op（返回 0）。
-
-        Args:
-            run_id: ``remediation_begin`` 返回的主键。
-
-        Returns:
-            受影响行数（0 表示没有这一行，或它已经是 1）。
-        """
-        rowcount = self._write(
-            lambda: self._conn.execute(
-                "UPDATE remediation_runs SET receipt_sent = 1"
-                " WHERE run_id = ? AND receipt_sent = 0",
-                (str(run_id),),
-            ).rowcount,
-            default=0,
-        )
-        return int(rowcount or 0)
-
-    def remediation_last_at(self, fingerprint: str) -> float:
-        """某指纹最近一次 run 的开始时间（冷却闸用）。"""
-        row = self._read(
-            lambda: self._conn.execute(
-                "SELECT MAX(started_at) FROM remediation_runs WHERE fingerprint = ?",
-                (str(fingerprint),),
-            ).fetchone()
-        )
-        return float(row[0] or 0.0) if row else 0.0
-
     # ---------- 保留清理与占用 ----------
 
     def prune(self, *, now: float, cfg: Mapping | None = None) -> dict:
@@ -1928,9 +1830,8 @@ class SqliteStore:
         max_rows = max(1, int(_num("history_max_rows", 20000)))
         kb_max_entries = max(0, int(_num("kb_max_entries", 500)))
         ttl = max(0.0, _num("fingerprint_ttl_hours", 72.0)) * 3600.0
-        timeout = max(0.0, _num("remediation_timeout_seconds", 300.0))
         moment = float(now)
-        result = {"alerts": 0, "rate": 0, "kb": 0, "runs": 0, "pending": 0}
+        result = {"alerts": 0, "rate": 0, "kb": 0, "pending": 0}
 
         def run() -> dict:
             with self._transaction() as conn:
@@ -1959,16 +1860,12 @@ class SqliteStore:
                     (moment - 7 * 86400.0, _PRUNE_DELETE_CAP),
                 )
                 result["pending"] += int(cursor.rowcount or 0)
-                cursor = conn.execute(
-                    "DELETE FROM remediation_runs WHERE run_id IN ("
-                    " SELECT run_id FROM remediation_runs WHERE started_at < ? LIMIT ?)",
-                    (moment - retention, _PRUNE_DELETE_CAP),
-                )
-                result["runs"] += int(cursor.rowcount or 0)
+                # v2.3.0：历史 run 行是取证材料，**永不删除**；这里只保留「孤儿 running
+                # 自愈成 timeout」这一条（升级前崩溃遗留的行；宽限期沿用旧默认 300s 的两倍）。
                 conn.execute(
                     "UPDATE remediation_runs SET status = 'timeout', finished_at = ?"
                     " WHERE status = 'running' AND started_at < ?",
-                    (moment, moment - timeout * 2),
+                    (moment, moment - _LEGACY_RUN_GRACE),
                 )
             return result
 

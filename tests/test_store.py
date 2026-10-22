@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -309,11 +310,41 @@ def _sqlite(tmp_path, name="log_watcher.sqlite3"):
     return store.SqliteStore(tmp_path / name).open()
 
 
+def _insert_legacy_run(db, run_id: str, *, status: str = "running", started_at: float = 0.0) -> None:
+    """往历史台账直接插一行（v2.3.0 没有任何写入口，测试只能手工造历史行）。
+
+    这张表 v2.3.0 起「只留不写」：表与列仍在（历史审计证据），写入面随自动修复通道一并删除。
+    """
+    conn = sqlite3.connect(db.path)
+    try:
+        conn.execute(
+            "INSERT INTO remediation_runs(run_id, fingerprint, severity, started_at, status)"
+            " VALUES(?, 'fp', 'HIGH', ?, ?)",
+            (str(run_id), float(started_at), str(status)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _run_status(db, run_id: str) -> str | None:
+    """读某历史行的状态（表已无读取 API，测试直接查）。"""
+    conn = sqlite3.connect(db.path)
+    try:
+        row = conn.execute(
+            "SELECT status FROM remediation_runs WHERE run_id = ?", (str(run_id),)
+        ).fetchone()
+    finally:
+        conn.close()
+    return None if row is None else str(row[0])
+
+
 def test_sqlite_open_creates_schema_v2(tmp_path):
     db = _sqlite(tmp_path)
     assert db.available and db.writable
     assert db.schema_version == store.SCHEMA_VERSION == 2
     assert db.path.exists()
+    # v2.3.0：`remediation_runs` 仍在建（历史审计证据，只留不写）
     for table in ("meta", "file_progress", "pattern_kb", "alerts", "rate_windows",
                   "pending_delivery", "remediation_runs"):
         assert db.count_rows(table) == 0
@@ -476,51 +507,6 @@ def test_sqlite_pending_import_from_json(tmp_path):
     db.close()
 
 
-def test_sqlite_remediation_ledger_flow(tmp_path):
-    db = _sqlite(tmp_path)
-    import models
-
-    db.remediation_begin("run1", "fp1", "HIGH", task_sha1="sha", argv=["dsh", "--", "-"])
-    assert db.remediation_active() == "run1"
-    assert db.remediation_count(since=0.0) == 1
-    db.remediation_finish(
-        "run1",
-        models.RemediationRun(status="unavailable", exit_code=1, duration=1.9, summary="凭据缺失"),
-        receipt_sent=True,
-    )
-    assert db.remediation_active() is None
-    assert db.remediation_last_at("fp1") > 0
-    db.close()
-
-
-def test_sqlite_remediation_mark_receipt_sent_only_touches_one_column(tmp_path):
-    """回执送达只补 ``receipt_sent``：0→1、幂等、未知 run_id 是 no-op，其它列一律不动。"""
-    import sqlite3
-
-    import models
-
-    db = _sqlite(tmp_path)
-    path = db.path
-    db.remediation_begin("run1", "fp1", "HIGH", task_sha1="sha", argv=["dsh", "--", "-"])
-    db.remediation_finish(
-        "run1",
-        models.RemediationRun(status="ok", exit_code=0, duration=2.5, summary="改了一处"),
-        receipt_sent=False,
-    )
-    assert db.remediation_mark_receipt_sent("run1") == 1, "0 → 1 要真写一行"
-    assert db.remediation_mark_receipt_sent("run1") == 0, "已经是 1 就不再写（幂等）"
-    assert db.remediation_mark_receipt_sent("nope") == 0, "未知 run_id 不得报错"
-    db.close()
-
-    conn = sqlite3.connect(path)
-    row = conn.execute(
-        "select status, exit_code, summary, receipt_sent from remediation_runs"
-        " where run_id = 'run1'"
-    ).fetchone()
-    conn.close()
-    assert tuple(row) == ("ok", 0, "改了一处", 1), "只动 receipt_sent，finish 写的列必须原样"
-
-
 def test_sqlite_prune_enforces_limits_and_orphans(tmp_path):
     db = _sqlite(tmp_path)
     now = time.time() + 1
@@ -534,16 +520,16 @@ def test_sqlite_prune_enforces_limits_and_orphans(tmp_path):
     db.push_rate("sent_minute", now)
     item = db.pending_add(store.PendingItem(session="s1", fingerprint="fp", text="t"))
     db.pending_update(item.item_id, state="sent")
-    db.remediation_begin("stuck", "fp", "HIGH", task_sha1="s", argv=[])
+    _insert_legacy_run(db, "stuck", started_at=time.time() - 7200)  # 远超 600s 宽限
     removed = db.prune(now=now, cfg={"history_retention_days": 30, "history_max_rows": 1000,
-                                     "fingerprint_ttl_hours": 72, "kb_max_entries": 500,
-                                     "remediation_timeout_seconds": 0})
+                                     "fingerprint_ttl_hours": 72, "kb_max_entries": 500})
     assert removed["alerts"] == 1
     assert removed["rate"] == 1
     assert removed["pending"] == 1
     assert db.count_rows("alerts") == 1
     assert db.rate_count("sent_minute", seconds=86400, now=now) == 1
-    assert db.remediation_active() is None, "孤儿 running 行要自愈成 timeout"
+    assert _run_status(db, "stuck") == "timeout", "孤儿 running 行要自愈成 timeout"
+    assert db.count_rows("remediation_runs") == 1, "自愈只改状态，不删历史行（取证材料）"
     db.close()
 
 
@@ -655,16 +641,6 @@ def test_sqlite_pending_due_orders_by_created_at(tmp_path):
     db.close()
 
 
-def test_sqlite_remediation_daily_count(tmp_path):
-    db = _sqlite(tmp_path)
-    for index in range(3):
-        db.remediation_begin(f"run{index}", "fp", "HIGH", task_sha1="s", argv=[])
-    assert db.remediation_count(since=0.0) == 3
-    assert db.remediation_count(since=time.time() + 100) == 0
-    assert db.remediation_last_at("missing") == 0.0
-    db.close()
-
-
 def test_sqlite_prune_trim_to_history_max_rows(tmp_path):
     db = _sqlite(tmp_path)
     now = time.time()
@@ -700,16 +676,22 @@ def test_sqlite_kb_prune_overflow_keeps_recent(tmp_path):
 
 
 def test_sqlite_exposes_contract_api_surface():
-    """§6.8 逐条签名核对：缺方法就是集成断路（t14 的 KB/账本依赖这些入口）。"""
+    """§6.8 逐条签名核对：缺方法就是集成断路（KB / 待发队列 / 保留清理依赖这些入口）。"""
     required = [
         "open", "close", "migrate", "checkpoint", "record_alerts", "upsert_progress",
         "bump_counters", "push_rate", "progress", "metrics_for", "counters", "rate_count",
         "kb_lookup", "kb_upsert", "kb_set_manual", "kb_prune", "pending_add", "pending_due",
-        "pending_update", "pending_stats", "remediation_count", "remediation_active",
-        "remediation_begin", "remediation_finish", "remediation_last_at", "prune", "usage",
+        "pending_update", "pending_stats", "prune", "usage",
     ]
     missing = [name for name in required if not callable(getattr(store.SqliteStore, name, None))]
     assert not missing, f"SqliteStore 缺契约方法: {missing}"
+    # v2.3.0 反向断言：账本写入面随自动修复通道一并删除，留一个都不算完成
+    removed = [
+        "remediation_count", "remediation_active", "remediation_begin",
+        "remediation_finish", "remediation_mark_receipt_sent", "remediation_last_at",
+    ]
+    still_there = [name for name in removed if hasattr(store.SqliteStore, name)]
+    assert not still_there, f"v2.3.0 应已移除的账本方法仍在: {still_there}"
     assert store.SqliteStore.SCHEMA_VERSION == 2
     assert isinstance(store.SqliteStore.schema_version, property)
 
@@ -722,19 +704,19 @@ def test_sqlite_open_and_close_are_idempotent(tmp_path):
     assert db.pending_due(0.0) == []
 
 
-# ------------------------------------------------- t17 修复回归（F06 对账 / F09 权限）
+# ------------------------------------------------- 历史台账对账 / 权限
 
 
 def test_sqlite_reconcile_marks_orphan_running_as_aborted(tmp_path):
-    """F06：进程被杀留下的 running 行必须被对账成 aborted，否则修复永久 busy。"""
+    """F06 → v2.3.0：历史台账只读，启动对账只把遗留 running 收口成 aborted。"""
     db = _sqlite(tmp_path)
-    db.remediation_begin("orphan", "fp", "HIGH", task_sha1="s", argv=["dsh", "--", "-"])
-    assert db.remediation_active() == "orphan"
+    _insert_legacy_run(db, "orphan", started_at=time.time() - 10)
+    assert _run_status(db, "orphan") == "running"
     assert db.reconcile_runs(now=time.time() + 1) == 1
-    assert db.remediation_active() is None
+    assert _run_status(db, "orphan") == "aborted"
     assert db.reconcile_runs(now=time.time() + 2) == 0, "幂等"
     # 崩溃后「很快重启」的孤儿同样必须对账（年龄判定会漏）
-    db.remediation_begin("fresh-orphan", "fp2", "HIGH", task_sha1="s", argv=[])
+    _insert_legacy_run(db, "fresh-orphan", started_at=time.time())
     assert db.reconcile_runs(now=time.time()) == 1
     assert db.usage()["runs"] == 2, "对账只改状态，不删证据（保留历史行）"
     db.close()

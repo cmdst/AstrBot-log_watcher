@@ -28,9 +28,11 @@ import test_classify as samples  # noqa: E402
 from classify import Route, Severity, classify_block, severity_rank  # noqa: E402
 from engine import FingerprintKnowledgeBase, ThreatEngine  # noqa: E402
 from log_reader import LogBlock  # noqa: E402
-from models import RemediationGate, ThreatVerdict  # noqa: E402
+from models import ThreatVerdict  # noqa: E402
 
-REPAIR_ROUTES = (Route.REMEDIATE, Route.EMERGENCY)
+#: 「被抬到最高一级」的去向集合：v2.3.0 起 HIGH 不再进修复候选（→ NOTIFY），唯一还会被
+#: 抬到顶的是 CRITICAL 的 ``EMERGENCY``；``Route.REMEDIATE`` 只作为历史值保留。
+ESCALATED_ROUTES = (Route.EMERGENCY,)
 BASE_CFG = {
     "classify_mode": "llm",
     "llm_provider_id": "test-provider",
@@ -235,7 +237,7 @@ def test_manual_override_has_highest_priority_and_skips_llm() -> None:
 
     assert context.call_count == 0
     assert verdict.severity is Severity.HIGH
-    assert verdict.route is Route.REMEDIATE
+    assert verdict.route is Route.NOTIFY  # v2.3.0：HIGH 只通知人工
     assert "manual-override" in verdict.tags
     assert "人工覆写" in verdict.reason
     assert engine.stats()["manual_hits"] == 1
@@ -288,7 +290,7 @@ def test_noise_shortcut_skips_llm_for_known_noise() -> None:
 
     assert context.call_count == 0
     assert verdict.severity in (Severity.IGNORE, Severity.LOW)
-    assert verdict.route not in REPAIR_ROUTES
+    assert verdict.route not in ESCALATED_ROUTES
     assert "noise-shortcut" in verdict.tags
     assert engine.stats()["noise_shortcut"] == 1
 
@@ -318,7 +320,7 @@ def test_real_noise_family_needs_zero_llm_calls() -> None:
         "同一噪声族应折叠成同一指纹"
     )
     assert all(item.severity in (Severity.IGNORE, Severity.LOW) for item in verdicts)
-    assert all(item.route not in REPAIR_ROUTES for item in verdicts)
+    assert all(item.route not in ESCALATED_ROUTES for item in verdicts)
     assert verdicts[0].source == "local", "首条由本地噪声规则给出"
     assert all(item.source == "kb" for item in verdicts[1:]), "其余由知识库短路给出"
     stats = engine.stats()
@@ -357,7 +359,7 @@ def test_local_mode_never_calls_llm() -> None:
     verdict = asyncio.run(engine.classify(samples.plugin_load_traceback_block()))
     assert context.call_count == 0
     assert verdict.severity in (Severity.HIGH, Severity.CRITICAL)
-    assert verdict.route in (Route.REMEDIATE, Route.EMERGENCY)
+    assert verdict.route in (Route.NOTIFY, Route.EMERGENCY)
 
 
 def test_missing_provider_falls_back_to_local_without_llm() -> None:
@@ -427,7 +429,7 @@ def test_engine_clamps_llm_escalation_on_benign_noise() -> None:
     verdict = asyncio.run(engine.classify(samples.mcp_init_block()))
 
     assert verdict.severity in (Severity.IGNORE, Severity.LOW)
-    assert verdict.route not in REPAIR_ROUTES
+    assert verdict.route not in ESCALATED_ROUTES
     assert "guard:noise-clamp" in verdict.tags
     assert engine.stats()["guarded"] == 1
 
@@ -624,26 +626,6 @@ def test_llm_budget_hour_window_is_enforced() -> None:
     verdict = asyncio.run(engine.classify(_error_block("second unique")))
     assert len(context.calls) == 1
     assert "llm-budget:hour" in verdict.tags
-
-
-def test_should_remediate_delegates_to_ledger() -> None:
-    """F07：engine.should_remediate 一行委派到账本；没有账本时 fail-closed。"""
-    calls: list[tuple] = []
-
-    class FakeLedger:
-        def can_start(self, verdict, *, now, metrics=None):  # noqa: ANN001
-            calls.append((verdict.fingerprint, now, metrics))
-            return RemediationGate(False, "cooldown")
-
-    verdict = ThreatVerdict(
-        severity=Severity.HIGH, fingerprint="fp1", confidence=0.9, route=Route.REMEDIATE
-    )
-    gate = engine.should_remediate(
-        verdict, {"repeat_count": 3}, {}, ledger=FakeLedger(), now=123.0
-    )
-    assert (gate.allowed, gate.reason) == (False, "cooldown")
-    assert calls == [("fp1", 123.0, {"repeat_count": 3})]
-    assert engine.should_remediate(verdict, {}, {}).reason == "off"
 
 
 def test_classify_enable_false_skips_kb_and_llm() -> None:

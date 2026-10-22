@@ -333,13 +333,6 @@ def build_send_plan(
         card = f"【AstrBot 日志告警｜{verdict.severity.value}】\n指纹：{verdict.fingerprint}"
     if extra_note:
         card = f"{card}\n{extra_note}"
-    if verdict.route in (Route.REMEDIATE, Route.EMERGENCY):
-        notes.append(
-            "已进入修复候选，修复结论会作为回执单独发送"
-            if verdict.route is Route.REMEDIATE
-            else "已触发紧急修复流程，修复结论会作为回执单独发送"
-        )
-
     body = card
     if excerpt and settings.include_excerpt:
         trimmed = excerpt.strip("\n")
@@ -489,7 +482,7 @@ def delivered(outcomes) -> bool:
 
     为什么不是「全部成功」：投递模型从"双发到每个目标"改成"按优先级 fallback"
     （2026-10-18 定案）—— 成功路径上 ``outcomes`` 里通常只有一条记录，用「全部成功」
-    会把"主出口失败、备出口成功"误判成没送达（``remediation_runs.receipt_sent`` 会恒 0）。
+    会把"主出口失败、备出口成功"误判成没送达。
     空列表 = 没有出口发出 ⇒ 没告诉人。
     """
     items = list(outcomes or [])

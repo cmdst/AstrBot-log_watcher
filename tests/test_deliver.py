@@ -349,7 +349,7 @@ def test_plan_forwards_only_when_caps_allow_and_mode_asks():
 
 
 def test_all_delivered_requires_every_target_ok():
-    """``remediation_runs.receipt_sent`` 的判定规则：**任一出口成功**即算送达。
+    """送达判定规则：**任一出口成功**即算送达。
 
     这条判定住在投递层（而不是 main）的原因：main 在库里没有测试夹具（顶部 import astrbot），
     抽成纯函数才钉得住（fix 派单 20261018-dispatch-dev-receipt-sent.md 要求回归覆盖）。

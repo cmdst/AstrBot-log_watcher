@@ -1,7 +1,7 @@
 """log_watcher：定期扫描 AstrBot 日志目录，命中指定等级时按通道能力主动告警。
 
 运行时入口在本文件，纯逻辑在同目录的 log_reader / detect / deliver / classify /
-engine / remediate / models / store（这些模块不导入 astrbot，可离线单测）。本文件只做四件事：
+engine / models / store（这些模块不导入 astrbot，可离线单测）。本文件只做四件事：
 
 1. 编排：定时扫描 → 增量读取 → 检测 → 分级（engine.ThreatEngine，R3）→ 闸门 → 投递 → 落盘；
 2. 唯一发送者：所有消息都经 `_send_plan()` 发出，段型按通道能力挑（weixin_oc 只发纯文本，
@@ -30,8 +30,6 @@ from .log_reader import block_lines, new_lines, normalize_levels, render_lines
 from .models import (
     DeliveryOutcome,
     LogBlock,
-    RemediationGate,
-    RemediationRun,
     Route,
     SendPlan,
     Severity,
@@ -59,14 +57,6 @@ _CHECKPOINT_INTERVAL = 24 * 3600.0
 def _as_int(value: object, default: int, minimum: int, maximum: int) -> int:
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(maximum, parsed))
-
-
-def _as_float(value: object, default: float, minimum: float, maximum: float) -> float:
-    try:
-        parsed = float(value)
     except (TypeError, ValueError):
         return default
     return max(minimum, min(maximum, parsed))
@@ -133,15 +123,7 @@ class LogWatcherPlugin(Star):
         )
 
         self.engine = None
-        self.ledger = None
-        self._remediate_fn = None
-        self._remediate_loaded = False
-        self._should_remediate_fn = None
-        self._should_remediate_loaded = False
-        self._receipt_fn = None
         self._classify_fn = None
-        self._prune_artifacts_fn = None
-        self._prune_artifacts_loaded = False
 
         self._task: asyncio.Task | None = None
         self._detectors: dict[str, detect.Detector] = {}
@@ -156,16 +138,13 @@ class LogWatcherPlugin(Star):
         self._pending_stats: dict = {}
         #: 出口策略不合格时的停摆原因（空串＝正常）；见 _check_outlet_policy（Q8=b / Q15=b）
         self._config_blocked = ""
-        self._last_metrics: dict = {}
         self._missing_notice_at = 0.0
         self._disk_report_at = 0.0
         self._checkpoint_at = 0.0
-        self._unavailable_notified = False
         self._no_session_notice = False
         self._no_level_notice = False
         self._store_error_notified = False
         self._store_error = ""
-        self._receipt_notified: set[str] = set()
 
     # ---------- 生命周期 ----------
 
@@ -174,14 +153,12 @@ class LogWatcherPlugin(Star):
         await self._startup_maintenance()
         await self._hydrate_state()
         self.engine = self._build_engine()
-        self.ledger = self._build_ledger()
         self.gate = detect.NotifyGate(self.counters, self._gate_config())
         backlog = self._pending_stats_value()
         caps = {session: self._caps_for(session).platform for session in self._sessions()}
         state = "SQLite" if self._store_ready() else "内存态（状态库不可用）"
         if self._store_ready() and not self._store_writable():
-            state = "只读（状态库拒绝写入：修复强制关闭）"
-        overlay, overlay_source = self._overlay_info()
+            state = "只读（状态库拒绝写入）"
         kb = getattr(self.engine, "kb", None)
         kb_state = type(kb).__name__ if kb is not None else "无"
         if self.sqlite is not None and self.sqlite.last_error:
@@ -194,9 +171,7 @@ class LogWatcherPlugin(Star):
             f"（{'/'.join(sorted({str(item) for item in caps.values()})) or '未配置'}）；"
             f"状态 {state}，分级 {self._classify_mode()}"
             f"（provider {'已配置' if self._classify_provider_id() else '未配置'}），"
-            f"修复 {'开启' if self._remediation_enabled() else '关闭'}；"
-            f"知识库 {kb_state}；overlay {overlay or '无'}（{overlay_source}）；"
-            f"{self.disk.report()}"
+            f"知识库 {kb_state}；{self.disk.report()}"
         )
         if backlog.get("active") or backlog.get("abandoned"):
             logger.info(
@@ -217,8 +192,8 @@ class LogWatcherPlugin(Star):
                 logger.warning(f"{self._plat()}孤儿 run 对账失败（忽略并继续）: {exc!r}")
             if reconciled:
                 logger.warning(
-                    f"{self._plat()}启动对账：{reconciled} 条遗留 running 修复记录标记为 aborted"
-                    "（避免并发闸被永久占住）"
+                    f"{self._plat()}启动对账：{reconciled} 条遗留的 running 历史记录标记为"
+                    " aborted（v2.3.0 起不再写入该表，只做一次性对账）"
                 )
         try:
             hardened = await asyncio.to_thread(store.harden_tree, self.data_dir)
@@ -242,7 +217,7 @@ class LogWatcherPlugin(Star):
 
     async def _loop(self) -> None:
         if self._config_blocked:
-            # 停摆：不扫描、不投递、不修复（原因已在 initialize 里 ERROR ＋ 写进 CONFIG-INVALID.txt）
+            # 停摆：不扫描、不投递（原因已在 initialize 里 ERROR ＋ 写进 CONFIG-INVALID.txt）
             logger.warning(f"{self._plat()}插件处于停摆状态，扫描线程不启动")
             return
         while True:
@@ -289,7 +264,7 @@ class LogWatcherPlugin(Star):
         except OSError as exc:
             logger.warning(f"{self._plat()}写 CONFIG-INVALID.txt 失败（仍然停摆）: {exc!r}")
         logger.error(
-            f"{self._plat()}{self._config_blocked} ⇒ **插件停摆**：不扫描、不投递、不修复；"
+            f"{self._plat()}{self._config_blocked} ⇒ **插件停摆**：不扫描、不投递；"
             f"填够两条并重启即恢复（详见 {marker}）"
         )
 
@@ -333,7 +308,7 @@ class LogWatcherPlugin(Star):
         """状态库是否**可写**（F08）。
 
         只读库（版本过高降级 / 权限只读 / 磁盘满）下 ``SqliteStore._write`` 会静默返回
-        默认值，冷却、日限、风暴三条持久闸全部退化成空操作 —— 所以修复必须要求可写。
+        默认值，去重/预算/速率这些持久状态全部退化成空操作 —— 所以可写性是行为前提。
         """
         return bool(self.sqlite is not None and self.sqlite.writable)
 
@@ -370,17 +345,6 @@ class LogWatcherPlugin(Star):
             return ThreatEngine(self.context, cfg=self._engine_config(), kb=kb)
         except Exception as exc:
             logger.warning(f"{self._plat()}ThreatEngine 构造失败，分级退回本地规则: {exc!r}")
-            return None
-
-    def _build_ledger(self):
-        """构造修复账本（remediate.RemediationLedger），模块未就位返回 None。"""
-        if not self._store_ready():
-            return None
-        try:
-            from .remediate import RemediationLedger
-
-            return RemediationLedger(self.sqlite, self._remediate_config())
-        except Exception:
             return None
 
     # ---------- 扫描 ----------
@@ -488,7 +452,6 @@ class LogWatcherPlugin(Star):
         await self._refresh_pending_stats(now)
         await self._prime_knowledge_base(fingerprints)
         metrics = self._metrics(blocks, now, fingerprints=fingerprints)
-        self._last_metrics = metrics
         excerpt = self._render_excerpt(blocks)
         excerpt_lines = len(excerpt.splitlines()) if excerpt else 0
         excerpt_path = str(self._round_excerpt) if self._round_excerpt else ""
@@ -521,7 +484,6 @@ class LogWatcherPlugin(Star):
             elif decision is detect.NotifyDecision.DIGEST_BUFFER:
                 logger.debug(f"{self._plat()}LOW 命中进入摘要聚合（{verdict.fingerprint}）")
 
-        # 先投递告警，再触发修复：修复流程再慢也不能把告警压在后面
         if sendable:
             if sessions:
                 await self._deliver_round(sendable, excerpt, now)
@@ -531,8 +493,6 @@ class LogWatcherPlugin(Star):
                     f"{self._plat()}命中 {sum(b.hit_count for b, _ in sendable)} 条日志，"
                     "但未配置 notify.target_sessions，提醒被丢弃"
                 )
-        for block, verdict in sendable:
-            await self._maybe_remediate(block, verdict, now)
 
     async def _classify(self, block: LogBlock, metrics: Mapping) -> ThreatVerdict:
         """分级：优先 engine.ThreatEngine.classify（R3，含 LLM 与降级链），失败回本地规则。"""
@@ -633,8 +593,6 @@ class LogWatcherPlugin(Star):
                 "pending": int(pending.get("active", 0)),
                 "abandoned": int(pending.get("abandoned", 0)),
             },
-            "remediation_running": bool(self._ledger_running()),
-            # F07：修复闸第 9 步的「本插件自身失败回声」分支靠这个键，缺了它该闭锁不可达
             "self_feedback": self._self_feedback_in(blocks),
         }
 
@@ -647,14 +605,6 @@ class LogWatcherPlugin(Star):
             for line in block.lines:
                 if detect.is_self_feedback_line(line, echo_ids):
                     return True
-        return False
-
-    def _ledger_running(self) -> bool:
-        hook = getattr(self.ledger, "running", None)
-        if not callable(hook):
-            return False
-        with contextlib.suppress(Exception):
-            return bool(hook())
         return False
 
     def _summary_of(self, block: LogBlock) -> str:
@@ -874,120 +824,6 @@ class LogWatcherPlugin(Star):
         elif kind == "skipped":
             logger.debug(f"{plat}{label}本轮不进这个出口（计划为空）")
 
-    def _receipt_plan(
-        self,
-        session: str,
-        run: RemediationRun,
-        verdict: ThreatVerdict,
-        *,
-        gate_reason: str = "",
-    ) -> SendPlan:
-        """§4.6 + 用户定案 B：修复回执（渠道/方案/判定/诊断/改动清单/建议/轨迹）。
-
-        ``build_receipt`` 是回执格式的唯一实现（remediate.py）；模块缺失时退化为最小
-        文本，保证「结果一定回执」这条链路不因模块缺失而断。所有终态都走这里。
-
-        Args:
-            session: 目标会话（渠道名进回执）。
-            run: 修复结果（含 status/summary/artifact/log_path）。
-            verdict: 分级结论（判定段）。
-            gate_reason: 被闸门拦下时的原因（§4.5 枚举；成功时为 ``ok``）。
-
-        Returns:
-            该出口的发送计划（只构造、不发送；发送与 fallback 由 ``_send_receipt`` 走出口链）。
-        """
-        text = ""
-        builder = self._receipt_builder()
-        if builder is not None:
-            try:
-                text = builder(
-                    run,
-                    verdict,
-                    cfg=self._remediate_config(),
-                    channel=session,
-                    gate_reason=gate_reason,
-                )
-            except Exception as exc:
-                logger.warning(f"{self._plat(session)}生成回执失败，用最小文本兜底: {exc!r}")
-        if not text:
-            text = (
-                f"【修复回执｜{run.status}】指纹 {verdict.fingerprint} {verdict.severity.value}\n"
-                f"摘要：{run.summary or '（无）'}\n"
-                f"轨迹：{run.log_path or '（无轨迹：未创建子进程）'}"
-            )
-        return SendPlan(session=session, kind="text", chunks=[text])
-
-    async def _send_receipt(
-        self, run: RemediationRun, verdict: ThreatVerdict, *, gate_reason: str = ""
-    ) -> tuple[bool, list]:
-        """把修复回执按出口链投出去（主出口失败才走备用出口）。
-
-        为什么回执也要 fallback：用户定案 B —— 每次修复尝试都必须让运营方知道结果
-        （「未改动」也不许省略）。一个出口死了，另一个还能把回执送到。
-
-        Returns:
-            ``(是否有出口成功, 每次尝试的结果)``；全失败时按**主出口**入队一次
-            （不再按出口各堆一条，避免历史那种 81 条 abandoned）。
-        """
-        all_ok, outcomes, planned = await self._deliver_outlets(
-            lambda session: self._receipt_plan(
-                session, run, verdict, gate_reason=gate_reason
-            ),
-            "修复回执",
-        )
-        if not all_ok and planned:
-            session, plan = planned[0]
-            outcome = outcomes[-1] if outcomes else DeliveryOutcome(session=session)
-            await self._enqueue_failure(session, plan, verdict, outcome, time.time())
-        return all_ok, outcomes
-
-    def _receipt_builder(self):
-        """remediate.build_receipt 的惰性入口（模块缺失返回 None）。"""
-        if self._receipt_fn is not None:
-            return self._receipt_fn
-        try:
-            from .remediate import build_receipt
-
-            self._receipt_fn = build_receipt
-        except Exception:
-            self._receipt_fn = None
-        return self._receipt_fn
-
-    def _status_by_reason(self, reason: str) -> str:
-        """闸门 reason → 终态 status（唯一映射在 remediate.STATUS_BY_GATE_REASON）。"""
-        try:
-            from .remediate import STATUS_BY_GATE_REASON
-
-            return STATUS_BY_GATE_REASON.get(reason, "skipped")
-        except Exception:
-            return "blocked" if reason in {"busy", "cooldown", "daily_limit", "storm"} else "skipped"
-
-    async def _send_terminal_receipt(
-        self, verdict: ThreatVerdict, gate_reason: str, now: float
-    ) -> None:
-        """闸门拦下的终态也要回执（B：写清被哪道闸拦下 + 后续怎么办）。
-
-        ``off``/``not_candidate`` 属默认路径（修复默认关），同一指纹**每进程只提示一次**，
-        避免每次命中都刷屏；其余拦截原因每次都发。
-        """
-        if not bool(self.cfg.get("remediation.receipt", True)):
-            return
-        if not self._sessions():
-            return
-        status = self._status_by_reason(gate_reason)
-        if gate_reason in {"off", "not_candidate"}:
-            key = f"{status}:{verdict.fingerprint or '-'}"
-            if key in self._receipt_notified:
-                return
-            self._receipt_notified.add(key)
-        run = RemediationRun(
-            status=status,
-            duration=0.0,
-            exit_code=None,
-            summary=f"修复闸拦截（{gate_reason}）：未创建子进程",
-        )
-        await self._send_receipt(run, verdict, gate_reason=gate_reason)
-
     async def _enqueue_failure(
         self,
         session: str,
@@ -1137,23 +973,11 @@ class LogWatcherPlugin(Star):
         self._round_rates.clear()
         self._round_deltas.clear()
 
-        # §8.6 轨迹保留三键（remediation.artifact_keep / artifact_max_age /
-        # artifact_max_bytes）的唯一周期调用点：
-        # 每轮一次、放独立线程；状态库不可用时也要清（修复恰恰常在这种时候发生）。
-        prune_artifacts = self._prune_artifacts_hook()
-        if prune_artifacts is not None:
-            with contextlib.suppress(Exception):
-                pruned = await asyncio.to_thread(
-                    prune_artifacts, self._remediate_config(), now=now
-                )
-                if any(pruned.values()):
-                    logger.info(f"{self._plat()}清理修复轨迹：{pruned}")
-
         if not self._store_ready():
             if not self._store_error_notified:
                 self._store_error_notified = True
                 logger.error(
-                    f"{self._plat()}状态库不可用，进入内存态降级（告警照发、修复关闭、"
+                    f"{self._plat()}状态库不可用，进入内存态降级（告警照发、"
                     "进度与计数用 JSON 兜底）"
                 )
             self.tail.save()
@@ -1194,21 +1018,6 @@ class LogWatcherPlugin(Star):
                 return flush
         return None
 
-    def _prune_artifacts_hook(self):
-        """修复轨迹清理入口（§8.6 三键的周期调用者；模块缺失返回 None）。"""
-        if self._prune_artifacts_fn is not None:
-            return self._prune_artifacts_fn
-        if self._prune_artifacts_loaded:
-            return None
-        self._prune_artifacts_loaded = True
-        try:
-            from .remediate import prune_artifacts
-
-            self._prune_artifacts_fn = prune_artifacts
-        except Exception:
-            self._prune_artifacts_fn = None
-        return self._prune_artifacts_fn
-
     def _bump_delta(self, name: str, delta: int = 1) -> None:
         """记录本轮的计数增量（每轮一次性 bump 到 SQLite）。"""
         self._round_deltas[name] = self._round_deltas.get(name, 0) + int(delta)
@@ -1217,7 +1026,7 @@ class LogWatcherPlugin(Star):
         self.counters.window_push(scope, now)
         self._round_rates.append((scope, float(now)))
 
-    # ---------- 聚合与回执 ----------
+    # ---------- 聚合 ----------
 
     async def _flush_aggregates(self, now: float) -> None:
         digest = self.gate.flush_digest(now)
@@ -1272,149 +1081,6 @@ class LogWatcherPlugin(Star):
                 route=route,
             )
             await self._enqueue_failure(session, plan, verdict, outcomes[-1], now)
-
-    async def _maybe_remediate(
-        self, block: LogBlock, verdict: ThreatVerdict, now: float
-    ) -> None:
-        """修复闸（§4.5）：拒绝也要留痕；不可用要做成可观测降级（R10）。"""
-        if verdict.route not in (Route.REMEDIATE, Route.EMERGENCY):
-            return
-        gate = self._remediation_gate(verdict, now)
-        if not gate.allowed:
-            self.counters.bump_sub("decisions", f"remediate_{gate.reason or 'denied'}")
-            logger.info(
-                f"{self._plat()}修复未触发（{gate.reason}）：指纹 {verdict.fingerprint} "
-                f"{verdict.severity.value}"
-            )
-            await self._send_terminal_receipt(verdict, gate.reason or "denied", now)
-            return
-        hook = self._remediation_hook()
-        if hook is None:
-            run = RemediationRun(
-                status="unavailable", summary="remediate 模块未就位（t13/t14 交付）"
-            )
-        else:
-            try:
-                run = await hook(
-                    verdict,
-                    self._remediate_config(),
-                    block=block,
-                    ledger=self.ledger,
-                    now=now,
-                )
-            except Exception as exc:
-                run = RemediationRun(
-                    status="failed", summary=f"执行器异常: {type(exc).__name__}: {exc}"
-                )
-        self.counters.bump("remediation_runs")
-        self._bump_delta("remediation_runs")
-        self._record_rate("remediation_trigger", now)
-        if run.status == "unavailable":
-            self._notice_unavailable_once()
-        logger.info(
-            f"{self._plat()}修复回执：{run.status} exit={run.exit_code} "
-            f"（{run.summary or '无摘要'}）指纹 {verdict.fingerprint}"
-        )
-        if bool(self.cfg.get("remediation.receipt", True)):
-            _, outcomes = await self._send_receipt(
-                run, verdict, gate_reason=gate.reason or "ok"
-            )
-            self._mark_receipt_sent(run, outcomes)
-
-    def _mark_receipt_sent(self, run: RemediationRun, outcomes: list) -> None:
-        """回执**真的**发出去之后，才把 ``remediation_runs.receipt_sent`` 置 1。
-
-        为什么必须补这一步：该字段由 ``remediation_finish`` 写，而 finish 发生在回执**之前**
-        （回执要等 run 结束），设计里留的「发完再覆盖」一直没人接 ⇒ 7/7 行恒 0，
-        看上去像「从没通知过运营方」，既不能当审计、也不能当报警（fix 派单
-        ``20261018-dispatch-dev-receipt-sent.md``）。
-
-        只置 1、不置 0：本方法只在发送成功时被调用；失败路径保持 finish 写入的 0
-        （进 ``pending_delivery`` 重试；重试不补记，见 ``deliver.delivered``）。
-
-        Args:
-            run: 本次 run（``run_id`` 为空说明账本没建行，跳过）。
-            outcomes: 每个目标会话的投递结果。
-        """
-        run_id = str(getattr(run, "run_id", "") or "")
-        if not run_id or not deliver.delivered(outcomes):
-            return
-        marker = getattr(self.ledger, "mark_receipt_sent", None)
-        if not callable(marker):
-            return
-        try:
-            marker(run_id)
-        except Exception as exc:
-            logger.warning(f"{self._plat()}登记回执发送状态失败（不影响投递）: {exc!r}")
-
-    def _remediation_gate(self, verdict: ThreatVerdict, now: float) -> RemediationGate:
-        """engine.should_remediate（§6.6 ★）；engine 不可用时退回「仅看开关」。"""
-        hook = self._should_remediate_hook()
-        if hook is not None:
-            try:
-                gate = hook(
-                    verdict,
-                    self._last_metrics or {},
-                    self._engine_config(),
-                    ledger=self.ledger,
-                    now=now,
-                )
-                if isinstance(gate, RemediationGate):
-                    return gate
-                return RemediationGate(
-                    allowed=bool(getattr(gate, "allowed", False)),
-                    reason=str(getattr(gate, "reason", "unknown")),
-                )
-            except Exception as exc:
-                logger.warning(f"{self._plat()}修复闸异常，按关闭处理: {exc!r}")
-        if not self._store_writable():
-            # F08：没有可写状态库 = 三条持久闸全失效 ⇒ fail-closed（busy 而不是 off，
-            # 便于在回执里区分「没开」与「库坏了」）
-            return RemediationGate(False, "busy" if self._remediation_enable_requested() else "off")
-        enabled = self._remediation_enabled()
-        return RemediationGate(allowed=enabled, reason="ok" if enabled else "off")
-
-    def _remediation_enable_requested(self) -> bool:
-        """配置里是否打开了修复（不看状态库；用于区分「没开」与「库不可写」）。"""
-        return bool(self.cfg.get("remediation.enable", False))
-
-    def _should_remediate_hook(self):
-        if self._should_remediate_fn is not None:
-            return self._should_remediate_fn
-        if self._should_remediate_loaded:
-            return None
-        self._should_remediate_loaded = True
-        try:
-            from .engine import should_remediate
-
-            self._should_remediate_fn = should_remediate
-        except Exception:
-            self._should_remediate_fn = None
-        return self._should_remediate_fn
-
-    def _remediation_hook(self):
-        """remediate.run_remediation 入口（t13/t14 交付后自动生效）。"""
-        if self._remediate_fn is not None:
-            return self._remediate_fn
-        if self._remediate_loaded:
-            return None
-        self._remediate_loaded = True
-        try:
-            from .remediate import run_remediation
-
-            self._remediate_fn = run_remediation
-        except Exception:
-            self._remediate_fn = None
-        return self._remediate_fn
-
-    def _notice_unavailable_once(self) -> None:
-        if self._unavailable_notified:
-            return
-        self._unavailable_notified = True
-        logger.warning(
-            f"{self._plat()}headless 修复不可用（MISSING_CREDENTIAL 等）：修复保持关闭，"
-            "告警与回执不受影响；启用前置条件见运行手册"
-        )
 
     # ---------- 日志前缀 ----------
 
@@ -1530,96 +1196,6 @@ class LogWatcherPlugin(Star):
             ),
         }
 
-    def _remediate_config(self) -> dict:
-        """remediate.py 的内部 cfg 键（§6.7/§8.6）。"""
-        permission = str(self.cfg.get("remediation.permission_mode") or "workspace-write")
-        if permission not in {"read-only", "workspace-write"}:
-            # R9：权限级别写死，越权值一律回落并告警（子进程 env 是调用方可控的）
-            logger.warning(
-                f"{self._plat()}remediation.permission_mode={permission!r} 不被允许，"
-                "已回落 workspace-write"
-            )
-            permission = "workspace-write"
-        return {
-            "remediation_enable": self._remediation_enabled(),
-            "remediation_dsh_command": str(
-                self.cfg.get("remediation.dsh_command") or "dsh"
-            ),
-            "remediation_profile": str(self.cfg.get("remediation.profile") or "headless"),
-            "remediation_patch_overlay": str(
-                self.cfg.get("remediation.patch_overlay") or ""
-            ),
-            "remediation_workdir": str(
-                self.cfg.get("remediation.workdir") or "/root/AstrBot"
-            ),
-            "remediation_timeout_seconds": _as_int(
-                self.cfg.get("remediation.timeout_seconds", 300), 300, 30, 3600
-            ),
-            "remediation_max_concurrency": _as_int(
-                self.cfg.get("remediation.max_concurrency", 1), 1, 1, 4
-            ),
-            "remediation_cooldown_seconds": _as_int(
-                self.cfg.get("remediation.cooldown_seconds", 3600), 3600, 0, 86400
-            ),
-            "remediation_daily_limit": _as_int(
-                self.cfg.get("remediation.daily_limit", 5), 5, 0, 100
-            ),
-            "remediation_permission_mode": permission,
-            "remediation_env_refs": _as_list(self.cfg.get("remediation.env_refs")),
-            "remediation_inherit_env": bool(
-                self.cfg.get("remediation.inherit_env", False)
-            ),
-            "remediation_artifact_dir": str(
-                self.cfg.get("remediation.artifact_dir") or ""
-            ),
-            "remediation_max_output_bytes": _as_int(
-                self.cfg.get("remediation.max_output_bytes", 1048576),
-                1048576,
-                4096,
-                16777216,
-            ),
-            "remediation_prompt_template": str(
-                self.cfg.get("remediation.prompt_template") or ""
-            ),
-            "remediation_receipt": bool(self.cfg.get("remediation.receipt", True)),
-            "remediation_trace_raw": bool(self.cfg.get("remediation.trace_raw", False)),
-            "remediation_artifact_keep": _as_int(
-                self.cfg.get("remediation.artifact_keep", 50), 50, 0, 100000
-            ),
-            "remediation_artifact_max_age": _as_int(
-                self.cfg.get("remediation.artifact_max_age", 7 * 86400),
-                7 * 86400,
-                0,
-                365 * 86400,
-            ),
-            "remediation_artifact_max_bytes": _as_int(
-                self.cfg.get("remediation.artifact_max_bytes", 64 * 1024 * 1024),
-                64 * 1024 * 1024,
-                0,
-                1 << 40,
-            ),
-            "remediate_confirm_count": _as_int(
-                self.cfg.get("remediation.confirm_count", 2), 2, 1, 10
-            ),
-            "remediate_confidence_threshold": _as_float(
-                self.cfg.get("remediation.confidence_threshold", 0.8), 0.8, 0.0, 1.0
-            ),
-            "new_pattern_escalate": bool(self.cfg.get("classify.new_pattern_escalate", False)),
-            "max_alerts_per_minute": _as_int(
-                self.cfg.get("budget.max_alerts_per_minute", 12), 12, 0, 600
-            ),
-            "self_feedback_ids": self._self_echo_ids(),
-        }
-
-    def _overlay_info(self) -> tuple[str, str]:
-        """修复 overlay 的解析结果（A：默认使用插件自带 overlay）。"""
-        try:
-            from .remediate import resolve_overlay
-
-            return resolve_overlay(self._remediate_config())
-        except Exception:
-            return "", "unavailable"
-
     def _prune_config(self) -> dict:
         return {
             "history_retention_days": _as_int(
@@ -1634,9 +1210,6 @@ class LogWatcherPlugin(Star):
             "kb_max_entries": _as_int(
                 self.cfg.get("classify.kb_max_entries", 500), 500, 50, 100000
             ),
-            "remediation_timeout_seconds": _as_int(
-                self.cfg.get("remediation.timeout_seconds", 300), 300, 30, 3600
-            ),
         }
 
     def _classify_mode(self) -> str:
@@ -1645,12 +1218,6 @@ class LogWatcherPlugin(Star):
 
     def _classify_provider_id(self) -> str:
         return str(self.cfg.get("classify.provider_id") or "").strip()
-
-    def _remediation_enabled(self) -> bool:
-        """R9/R10/F08：默认关；状态库不可用**或不可写**时强制关（fail-closed）。"""
-        if not self._store_writable():
-            return False
-        return bool(self.cfg.get("remediation.enable", False))
 
     def _before(self) -> int:
         return _as_int(self.cfg.get("scan.context_before", 5), 5, 0, _MAX_CONTEXT_LINES)
