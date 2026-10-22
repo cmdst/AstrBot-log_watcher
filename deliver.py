@@ -477,18 +477,6 @@ def outlet_order(sessions) -> list[str]:
     return chain
 
 
-def delivered(outcomes) -> bool:
-    """**至少一个出口**把消息交出去了 ⇒ 算送达。
-
-    为什么不是「全部成功」：投递模型从"双发到每个目标"改成"按优先级 fallback"
-    （2026-10-18 定案）—— 成功路径上 ``outcomes`` 里通常只有一条记录，用「全部成功」
-    会把"主出口失败、备出口成功"误判成没送达。
-    空列表 = 没有出口发出 ⇒ 没告诉人。
-    """
-    items = list(outcomes or [])
-    return any(bool(getattr(item, "ok", False)) for item in items)
-
-
 async def deliver_over_outlets(
     sessions,
     build_plan,

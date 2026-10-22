@@ -348,23 +348,6 @@ def test_plan_forwards_only_when_caps_allow_and_mode_asks():
     assert forced.kind == "forward"
 
 
-def test_all_delivered_requires_every_target_ok():
-    """送达判定规则：**任一出口成功**即算送达。
-
-    这条判定住在投递层（而不是 main）的原因：main 在库里没有测试夹具（顶部 import astrbot），
-    抽成纯函数才钉得住（fix 派单 20261018-dispatch-dev-receipt-sent.md 要求回归覆盖）。
-    2026-10-18 语义从「全部成功」改成「任一成功」：投递模型变成按优先级 fallback，
-    成功路径上 outcomes 里通常只有一条记录。
-    """
-    ok = models.DeliveryOutcome(session="s1", ok=True, attempts=1)
-    bad = models.DeliveryOutcome(session="s2", ok=False, attempts=3, error="prepare failed")
-    assert deliver.delivered([bad, ok]) is True, "主出口失败、备出口成功也算送达"
-    assert deliver.delivered([bad, bad]) is False
-    assert deliver.delivered([]) is False, "没有目标 = 没人被告知"
-    assert deliver.delivered(None) is False
-    assert deliver.delivered([object()]) is False, "非 outcome 形状一律当没送达"
-
-
 def test_outlet_order_keeps_priority_and_dedupes():
     """出口列表**即优先级**（第 1 个是主出口）：保序、去空白、去重。"""
     assert deliver.outlet_order(["main", " backup ", "", "main", None, "third"]) == [
