@@ -252,7 +252,7 @@ NOISE_RULES: tuple[Rule, ...] = (
     ),
 )
 
-#: 可恢复抖动：没有噪声规则命中时按 MEDIUM 处理（提醒一次，不触发修复）。
+#: 可恢复抖动：没有噪声规则命中时按 MEDIUM 处理（提醒一次，不升级为高危）。
 TRANSIENT_RULES: tuple[Rule, ...] = (
     _rule(
         "transient",
@@ -584,7 +584,7 @@ CLAMP_TAG = "transient-escalation-capped"
 def clamp_transient_escalation(
     verdict: ThreatVerdict, cfg: Mapping | object | None = None
 ) -> ThreatVerdict:
-    """把「**纯**可恢复抖动」的最终等级封顶在 MEDIUM —— 不许它触发自动修复。
+    """把「**纯**可恢复抖动」的最终等级封顶在 MEDIUM —— 不许它升级成需人工处置的高危。
 
     规则（运营方 2026-10-18 定案，Q11=b）：**同时**满足三条才封顶
       ① tags 里有抖动族锚点（`transient:` 前缀：本地初判已把它认成可恢复抖动）；
@@ -622,7 +622,7 @@ def clamp_transient_escalation(
         tags=[*tags, CLAMP_TAG],
         reason=(
             verdict.reason
-            + "；本地锚点只有可恢复抖动（无 failure: 族证据）⇒ 等级封顶 MEDIUM，不进自动修复"
+            + "；本地锚点只有可恢复抖动（无 failure: 族证据）⇒ 等级封顶 MEDIUM，只提醒不升级"
         ),
     )
 
@@ -871,7 +871,7 @@ DEFAULT_SYSTEM_PROMPT = """你是 AstrBot 部署的运维值守分析师，负�
 - IGNORE：已被框架吞掉、对使用者无影响的噪声（例如 asyncio Future exception was never retrieved）。
 - LOW：可自愈或降级的小问题，进摘要即可（例如可选 MCP 服务初始化失败、平台段型不支持导致的发送失败）。
 - MEDIUM：真实故障但多为可恢复抖动，需要即时提醒（例如上游 503/超时重试、连接被拒、返回空内容重试）。
-- HIGH：功能已中断，需要带证据的告警并进入修复候选（例如未捕获异常、数据库不可用、插件加载失败）。
+- HIGH：功能已中断，需要带证据的告警并由人工介入处置（例如未捕获异常、数据库不可用、插件加载失败）。
 - CRITICAL：主机级急停，需要立即修复（例如磁盘写满、内存耗尽、进程被 OOM 杀掉）。
 
 【判定要求】
