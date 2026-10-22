@@ -879,7 +879,8 @@ def degraded_verdict(
         evidence=local.evidence,
         reason=(
             f"LLM 判定不可用（{error}），保守降级为 {severity.value}"
-            f"（降级地板 {floor.value}，本地信号 {local.tags or ['无']}）；指纹 {local.fingerprint[:12]}"
+            f"（降级地板 {floor.value}，本地信号 {local.tags or ['无']}）；"
+            f"指纹 {local.fingerprint[:12]}；本次未经模型判定"
         ),
         route=route_for_severity(severity, cfg_get(cfg, "route_map", None)),
         source="degraded",
