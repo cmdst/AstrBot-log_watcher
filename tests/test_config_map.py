@@ -4,6 +4,10 @@
 的读取点），漏一处就是**静默故障** —— 本仓库已经吃过一次：两个等级旋钮只写进了 schema 与消费方，
 漏了 `main._engine_config()` 的显式白名单，生产链路上被丢弃一整天（父手册 §3 第 8 条）。
 本文件把三处钉在一起，并且把 v2.1.0 的旧键集合**冻结**成迁移契约：任何键的搬迁缺失都会红。
+
+v2.3.0 又删了一层：自动修复通道整体移除 ⇒ `remediation` 组（22 键）整组消失，schema
+变成 **7 组 / 60 键**。历史契约仍冻结在 95 条（那是 v2.1.0 的事实），所以迁移契约从
+「两分量并集」改成分量并集：`KEY_MAP` ∪ `DROPPED_LEGACY_KEYS`(v2.2.0) ∪ `DROPPED_IN_V230`。
 """
 
 from __future__ import annotations
@@ -126,6 +130,38 @@ LEGACY_KEYS_V210: tuple[str, ...] = (
 )
 
 
+#: v2.3.0 删掉的 22 个旧扁平键（自动修复通道整体移除）。
+#: 它们**不在** `KEY_MAP`（已无对应新路径），也**不在** v2.2.0 的 `DROPPED_LEGACY_KEYS`
+#: （那一份是"结构改造时丢弃的伪分组/死键"）。**兼容性登记**：老用户配置里可能仍有
+#: `remediation.*` 组 —— 核心加载时会按 stale 键删除（值回落默认，不再有行为），离线
+#: 迁移工具（`tools/migrate_config_v2.py`）目前会把它们算进 `unknown` 而不是 `dropped`，
+#: 这件事已移交 T6 的迁移工具处理；本文件先把键名冻结住，免得以后想加都加不回来。
+DROPPED_IN_V230: tuple[str, ...] = (
+    "remediation_enable",
+    "remediation_dsh_command",
+    "remediation_profile",
+    "remediation_patch_overlay",
+    "remediation_workdir",
+    "remediation_timeout_seconds",
+    "remediation_max_concurrency",
+    "remediation_cooldown_seconds",
+    "remediation_daily_limit",
+    "remediation_permission_mode",
+    "remediation_env_refs",
+    "remediation_inherit_env",
+    "remediation_artifact_dir",
+    "remediation_artifact_keep",
+    "remediation_artifact_max_age",
+    "remediation_artifact_max_bytes",
+    "remediation_max_output_bytes",
+    "remediation_trace_raw",
+    "remediation_prompt_template",
+    "remediation_receipt",
+    "remediate_confirm_count",
+    "remediate_confidence_threshold",
+)
+
+
 def _schema() -> dict:
     return json.loads((_PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
 
@@ -157,7 +193,7 @@ def test_schema_is_object_groups_in_declared_order() -> None:
 def test_schema_leaves_match_key_map_exactly() -> None:
     leaves = {path for path, _ in _leaves(_schema())}
     assert leaves == set(config_map.KEY_MAP), "schema 叶子与 KEY_MAP 必须双射"
-    assert len(leaves) == 82
+    assert len(leaves) == 60, "v2.3.0：8 组 82 键 − remediation 组 22 键 = 7 组 60 键"
 
 
 def test_every_leaf_keeps_description_hint_and_default() -> None:
@@ -192,9 +228,16 @@ def test_no_pseudo_section_keys_left() -> None:
 def test_migration_contract_covers_all_95_legacy_keys() -> None:
     assert len(LEGACY_KEYS_V210) == 95
     assert len(set(LEGACY_KEYS_V210)) == 95
-    assert set(LEGACY_KEYS_V210) == set(config_map.KEY_MAP.values()) | set(
-        config_map.DROPPED_LEGACY_KEYS
-    ), "旧键要么被搬进新结构，要么在 DROPPED_LEGACY_KEYS 里明示丢弃"
+    assert set(LEGACY_KEYS_V210) == (
+        set(config_map.KEY_MAP.values())
+        | set(config_map.DROPPED_LEGACY_KEYS)
+        | set(DROPPED_IN_V230)
+    ), "旧键要么被搬进新结构，要么在 DROPPED_LEGACY_KEYS / DROPPED_IN_V230 里明示丢弃"
+    # 三分量必须互不相交，否则「丢弃」与「映射」会互相掩盖
+    mapped = set(config_map.KEY_MAP.values())
+    dropped = set(config_map.DROPPED_LEGACY_KEYS)
+    v230 = set(DROPPED_IN_V230)
+    assert not (mapped & dropped) and not (mapped & v230) and not (dropped & v230)
 
 
 def test_baseline_schema_keys_equal_the_frozen_contract() -> None:
@@ -217,6 +260,19 @@ def test_dropped_keys_are_only_sections_and_dead_keys() -> None:
     assert sum(1 for key in dropped if key.startswith("_")) == 8, "8 个伪分组标题"
     assert {"llm_provider_id", "chat_provider_id", "llm_timeout", "provider_id"} <= dropped
     assert "admin_users" in dropped
+
+
+def test_v230_dropped_keys_are_exactly_the_removed_group() -> None:
+    """v2.3.0 删除面必须是「一整组」：22 条、全部来自同一个前缀，且 schema 里没有任何残留。"""
+    assert len(DROPPED_IN_V230) == 22
+    assert len(set(DROPPED_IN_V230)) == 22
+    assert all(key.startswith(("remediation_", "remediate_")) for key in DROPPED_IN_V230)
+    leaves = {path for path, _ in _leaves(_schema())}
+    assert not [path for path in leaves if path.startswith("remediation.")], (
+        "remediation 组必须整组消失（不是只删几个键）"
+    )
+    assert not [path for path in config_map.KEY_MAP if path.startswith("remediation.")]
+    assert "remediation" not in config_map.GROUPS
 
 
 # ---------- main.py 读取点 ----------
@@ -259,9 +315,15 @@ def test_configview_tolerates_empty_and_odd_config() -> None:
 
 
 def _flat_sample() -> dict:
-    """合成样本：键齐全、值都是可辨识的假值（**不含任何真实会话串**）。"""
+    """合成样本：v2.2.0 认识的键齐全、值都是可辨识的假值（**不含任何真实会话串**）。
+
+    v2.3.0 删掉的 22 个键不进样本：当前版本的 `nested_paths()` / `migration_report()`
+    不再认识它们（兼容性登记见 `DROPPED_IN_V230` 的注释）。
+    """
     sample: dict[str, object] = {}
     for index, key in enumerate(LEGACY_KEYS_V210):
+        if key in DROPPED_IN_V230:
+            continue
         sample[key] = f"v{index:03d}" if not key.startswith("_") else ""
     return sample
 
@@ -269,8 +331,8 @@ def _flat_sample() -> dict:
 def test_nested_paths_and_flatten_roundtrip() -> None:
     flat = _flat_sample()
     nested = config_map.nested_paths(flat)
-    assert len(nested) == 8
-    assert sum(len(items) for items in nested.values()) == 82
+    assert len(nested) == 7, "v2.3.0：remediation 组消失后只剩 7 组"
+    assert sum(len(items) for items in nested.values()) == 60
     assert config_map.flatten(nested) == {
         key: value for key, value in flat.items() if key in config_map.LEGACY_TO_PATH
     }

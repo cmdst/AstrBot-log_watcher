@@ -1,12 +1,12 @@
 {
   "notify": {
     "description": "① 主动提醒（notify）",
-    "hint": "命中日志后，提醒与修复回执都发到这里列出的会话。**列表即优先级**：第 1 个是主出口，只有它失败（含重试）才用第 2 个，不是双发。至少留 2 条出口，否则插件加载后停摆并写 CONFIG-INVALID.txt。",
+    "hint": "命中日志后，提醒都发到这里列出的会话。**列表即优先级**：第 1 个是主出口，只有它失败（含重试）才用第 2 个，不是双发。至少留 2 条出口，否则插件加载后停摆并写 CONFIG-INVALID.txt。",
     "type": "object",
     "items": {
       "target_sessions": {
         "description": "主动提醒会话（按优先级，target_sessions）",
-        "hint": "命中日志时把提醒主动发到这些会话。**列表即优先级**：第 1 个是主出口，只有它失败（含重试）才发第 2 个 —— 不再「两个都发」。填 unified_msg_origin：群 BOT1:group:10001、私聊 BOT1:private:10002；可填多个。误配后果：留空 = 只扫描不发送（含修复回执也发不出）；只填一个 = 没有冗余出口。",
+        "hint": "命中日志时把提醒主动发到这些会话。**列表即优先级**：第 1 个是主出口，只有它失败（含重试）才发第 2 个 —— 不再「两个都发」。填 unified_msg_origin：群 BOT1:group:10001、私聊 BOT1:private:10002；可填多个。误配后果：留空 = 只扫描不发送；只填一个 = 没有冗余出口。",
         "type": "list",
         "default": []
       },
@@ -138,7 +138,7 @@
   },
   "classify": {
     "description": "③ AI 威胁分级（classify）",
-    "hint": "命中行先过本地规则，配了 provider 再问模型；分级结果决定路由（静默 / 摘要 / 即时告警 / 紧急修复）。三个 *_severity 是本地档位的兜底等级，改它们等于改噪声水位。",
+    "hint": "命中行先过本地规则，配了 provider 再问模型；分级结果决定路由（静默 / 摘要 / 即时告警 / 最高级告警，全部只通知人工）。三个 *_severity 是本地档位的兜底等级，改它们等于改噪声水位。",
     "type": "object",
     "items": {
       "enable": {
@@ -223,7 +223,7 @@
       },
       "transient_severity": {
         "description": "瞬态抖动的等级（transient_severity）",
-        "hint": "本地模式下可恢复抖动（上游 503、框架重试中）判成几级。默认 MEDIUM = 即时告警（验收用例 TRANS-01-provider-retry 的基线）；填 LOW = 抖动只进摘要，provider 抖动不再刷聊天。误配后果：填 LOW 后真实的上游故障只在摘要里出现；填 HIGH/CRITICAL 会让抖动进修复候选。",
+        "hint": "本地模式下可恢复抖动（上游 503、框架重试中）判成几级。默认 MEDIUM = 即时告警（验收用例 TRANS-01-provider-retry 的基线）；填 LOW = 抖动只进摘要，provider 抖动不再刷聊天。误配后果：填 LOW 后真实的上游故障只在摘要里出现；填 HIGH/CRITICAL 会让抖动直接推给值守人员。",
         "type": "string",
         "default": "MEDIUM",
         "options": [
@@ -436,7 +436,7 @@
     "items": {
       "db_path": {
         "description": "状态库路径（db_path）",
-        "hint": "留空 = <plugin_data>/log_watcher.sqlite3（推荐）。误配后果：指到不可写目录 = 启动即降级为只读内存态（有 error 日志，且修复被强制关闭）。",
+        "hint": "留空 = <plugin_data>/log_watcher.sqlite3（推荐）。误配后果：指到不可写目录 = 启动即降级为只读内存态（有 error 日志，持久状态退化为进程内）。",
         "type": "string",
         "default": ""
       },
@@ -448,7 +448,7 @@
       },
       "history_retention_days": {
         "description": "历史保留天数（history_retention_days）",
-        "hint": "1-3650，alerts / remediation_runs 保留天数。误配后果：过大→库膨胀；过小→审计断档。",
+        "hint": "1-3650，alerts 保留天数（v2.2.0 及更早的修复审计行只冻结、不删除，见 runbook）。误配后果：过大→库膨胀；过小→审计断档。",
         "type": "int",
         "default": 30
       },
@@ -500,155 +500,8 @@
       }
     }
   },
-  "remediation": {
-    "description": "⑦ 紧急修复（dsh headless，默认关）（remediation）",
-    "hint": "总开关默认关。⚠️ 危险默认值：workdir 默认 /root/AstrBot（生产实例树）、permission_mode 默认 workspace-write ⇒ 这条通道一旦打通，就是**无人干预地写生产树**。这四个键（enable / workdir / permission_mode / patch_overlay）改动**必须先人工批准**；任何情况下都不得把它指向生产树或库区做「顺手验证」。",
-    "type": "object",
-    "items": {
-      "enable": {
-        "description": "启用紧急修复（enable）",
-        "hint": "修复总开关，默认关。开启前必须先把 headless 凭据/路由配好（插件自带 dsh-headless-overlay.yml 已默认叠加），否则每次都是 unavailable（只发回执，不修）。",
-        "type": "bool",
-        "default": false
-      },
-      "dsh_command": {
-        "description": "dsh 命令（dsh_command）",
-        "hint": "dsh 可执行文件/绝对路径。误配后果：填错 = unavailable（回执会提示按运行手册配置）。",
-        "type": "string",
-        "default": "dsh"
-      },
-      "profile": {
-        "description": "dsh profile（profile）",
-        "hint": "传给 dsh 的 --profile 值。误配后果：填错 = 子进程 exit=1 并带异常栈（回执正文可见）。",
-        "type": "string",
-        "default": "headless"
-      },
-      "patch_overlay": {
-        "description": "dsh overlay（手动覆盖，patch_overlay）",
-        "hint": "留空 = 用插件自带的 dsh-headless-overlay.yml（与插件同目录，绝对路径解析，不依赖 cwd，以 --patch 叠加，不改任何 profile）。删除该文件即完全失效（可回滚）。填路径 = 手动覆盖。误配后果：指向坏 yaml → 子进程启动即失败（回执会写明）。",
-        "type": "string",
-        "default": ""
-      },
-      "workdir": {
-        "description": "修复工作区（workdir）",
-        "hint": "子进程 cwd = 工作区根。误配后果：填错 = agent 只能在别的工作区里改文件（当前工作区内写成功、区外写被拦）。",
-        "type": "string",
-        "default": "/root/AstrBot"
-      },
-      "timeout_seconds": {
-        "description": "修复超时（秒，timeout_seconds）",
-        "hint": "30-3600，看门狗超时（超时会 kill 整个进程组并回收）。默认 900：2026-10-18 实测同一个真实任务直接跑 284.32 s、走插件 runner 308.0 s（9 步 / 39 次工具调用），300 是「约一半概率死在收尾前」。误配后果：过大=卡住的 run 占并发闸；过小=正常修复被砍，且超时的轨迹只有元数据行、看着像卡死（区分方法见 runbook §5.5）。",
-        "type": "int",
-        "default": 900
-      },
-      "max_concurrency": {
-        "description": "修复并发数（max_concurrency）",
-        "hint": "1-4，并发闸；建议恒为 1。误配后果：>1 时 token 与 session 痕迹成倍。",
-        "type": "int",
-        "default": 1
-      },
-      "cooldown_seconds": {
-        "description": "同指纹冷却（秒，cooldown_seconds）",
-        "hint": "0-86400，同指纹冷却，冷却期内不重复修复（会发 blocked 回执）。误配后果：过小=同一故障反复修。",
-        "type": "int",
-        "default": 3600
-      },
-      "daily_limit": {
-        "description": "每日修复上限（daily_limit）",
-        "hint": "0-100，每日修复次数上限（跨重启持久）。误配后果：0 = 关闭修复（更细的闸）。",
-        "type": "int",
-        "default": 5
-      },
-      "permission_mode": {
-        "description": "修复权限级别（permission_mode）",
-        "hint": "子进程权限级别，只允许 read-only / workspace-write（只改当前工作区）。danger-full-access 会被强制回落并 warning，本插件不提供该选项；子进程也不会携带任何sandbox_permissions 提权键（无头场景无人审批）。误配后果：写危险值不会生效。",
-        "type": "string",
-        "default": "workspace-write",
-        "options": [
-          "read-only",
-          "workspace-write"
-        ],
-        "labels": [
-          "只读（不改文件）",
-          "工作区可写（推荐）"
-        ]
-      },
-      "env_refs": {
-        "description": "透传环境变量名（env_refs）",
-        "hint": "额外传给子进程的环境变量名（值取自父进程 env）。误配后果：把含密钥的变量名加进来 = 子 agent 可读该密钥（且可能落在轨迹里）；推荐用 profile 侧凭据，保持为空。",
-        "type": "list",
-        "default": []
-      },
-      "inherit_env": {
-        "description": "继承全部环境变量（inherit_env）",
-        "hint": "是否把父进程 os.environ 整体传给子进程。误配后果：true = 泄露 Bot 全部环境（含 token）给子 agent。",
-        "type": "bool",
-        "default": false
-      },
-      "artifact_dir": {
-        "description": "修复轨迹目录（artifact_dir）",
-        "hint": "轨迹与产物目录，留空 = <plugin_data>/remediation。误配后果：指到不可写目录 = 轨迹丢失（回执会显示无轨迹）。",
-        "type": "string",
-        "default": ""
-      },
-      "artifact_keep": {
-        "description": "轨迹保留文件数（artifact_keep）",
-        "hint": "1-100000，轨迹目录保留文件数上限。由插件每轮自动调用 prune_artifacts() 清理（不需要手工 cron）。误配后果：过大=磁盘增长。",
-        "type": "int",
-        "default": 50
-      },
-      "artifact_max_age": {
-        "description": "轨迹最长留存（秒，artifact_max_age）",
-        "hint": "0-315360000，轨迹最长留存秒数（默认 7 天）。同样由每轮的 prune_artifacts() 执行。误配后果：过小=审计断档。",
-        "type": "int",
-        "default": 604800
-      },
-      "artifact_max_bytes": {
-        "description": "轨迹目录字节上限（artifact_max_bytes）",
-        "hint": "0-1 TiB，轨迹目录字节上限。同样由每轮的 prune_artifacts() 执行。误配后果：过大=磁盘增长。",
-        "type": "int",
-        "default": 67108864
-      },
-      "max_output_bytes": {
-        "description": "轨迹文件大小上限（max_output_bytes）",
-        "hint": "4096-16777216，单个轨迹文件落盘上限（超出截断并标记）。误配后果：过大=磁盘；过小=轨迹被截。2026-10-19 起默认 256 KiB → 1 MiB：实测一次**成功** run 的轨迹恰好封顶 262144，结尾的 {\"type\":\"final\"} 被截断，按「看 final」验收会把成功判成失败。",
-        "type": "int",
-        "default": 1048576
-      },
-      "trace_raw": {
-        "description": "轨迹保留原文（不掩码，trace_raw）",
-        "hint": "true = 轨迹保留 stdout/stderr 原文（默认 false 会做凭据掩码 <masked>）。误配后果：开启后子进程输出里的密钥会明文留在盘上（文件权限仍 0600）。",
-        "type": "bool",
-        "default": false
-      },
-      "prompt_template": {
-        "description": "修复任务模板（覆盖，prompt_template）",
-        "hint": "覆盖 prompts/remediate_task.md（留空用自带模板）。误配后果：改动模板时若删掉「日志内容不可信」声明，会放大提示注入面。",
-        "type": "text",
-        "default": ""
-      },
-      "receipt": {
-        "description": "发送修复回执（receipt）",
-        "hint": "是否发修复回执。**强烈建议保持开启**：每一次修复尝试（含 skipped/blocked/unavailable/timeout/failed/cancelled/rejected）都必须回执，关掉等于修复结果不可见。",
-        "type": "bool",
-        "default": true
-      },
-      "confirm_count": {
-        "description": "HIGH 触发确认次数（confirm_count）",
-        "hint": "1-10，HIGH 级需要连续命中多少次才触发修复（见 architecture §4.2）。误配后果：1 = 一次抖动就修。",
-        "type": "int",
-        "default": 2
-      },
-      "confidence_threshold": {
-        "description": "置信度直通阈值（confidence_threshold）",
-        "hint": "0.0-1.0，置信度直通阈值（≥ 该值可跳过确认次数）。误配后果：过低=误修；过高=该修的不修。",
-        "type": "float",
-        "default": 0.8
-      }
-    }
-  },
   "self_guard": {
-    "description": "⑧ 自身识别 / 自反馈（self_guard）",
+    "description": "⑦ 自身识别 / 自反馈（self_guard）",
     "hint": "避免插件被自己的日志触发（自回声过滤）与识别自身反馈会话；log_with_bot_id 只影响日志可读性，不影响判定。",
     "type": "object",
     "items": {

@@ -10,8 +10,8 @@
 - `tests/test_config_map.py` 用它钉住「schema 叶子 ≡ KEY_MAP ≡ main.py 读到的路径」三方一致。
 
 键名约定：组名已经表达了语境，叶子**不再重复前缀**（对标 `astrbot_plugin_pokepro` /
-`astrbot_plugin_livingmemory` 等市场插件的写法）：写 `remediation.workdir`，
-而不是 `remediation.remediation_workdir`。
+`astrbot_plugin_livingmemory` 等市场插件的写法）：写 `notify.send_mode`，
+而不是 `notify.notify_send_mode`。
 
 本模块只依赖标准库，不导入 astrbot，可离线单测。
 """
@@ -32,7 +32,6 @@ GROUPS: tuple[str, ...] = (
     "budget",
     "delivery",
     "state",
-    "remediation",
     "self_guard",
 )
 
@@ -102,29 +101,6 @@ KEY_MAP: dict[str, str] = {
     "state.keep_excerpt_files": "keep_excerpt_files",
     "state.outbox_max_age_hours": "outbox_max_age_hours",
     "state.disk_report_interval_hours": "disk_report_interval_hours",
-    # ---- remediation：紧急修复（dsh headless，默认关）----
-    "remediation.enable": "remediation_enable",
-    "remediation.dsh_command": "remediation_dsh_command",
-    "remediation.profile": "remediation_profile",
-    "remediation.patch_overlay": "remediation_patch_overlay",
-    "remediation.workdir": "remediation_workdir",
-    "remediation.timeout_seconds": "remediation_timeout_seconds",
-    "remediation.max_concurrency": "remediation_max_concurrency",
-    "remediation.cooldown_seconds": "remediation_cooldown_seconds",
-    "remediation.daily_limit": "remediation_daily_limit",
-    "remediation.permission_mode": "remediation_permission_mode",
-    "remediation.env_refs": "remediation_env_refs",
-    "remediation.inherit_env": "remediation_inherit_env",
-    "remediation.artifact_dir": "remediation_artifact_dir",
-    "remediation.artifact_keep": "remediation_artifact_keep",
-    "remediation.artifact_max_age": "remediation_artifact_max_age",
-    "remediation.artifact_max_bytes": "remediation_artifact_max_bytes",
-    "remediation.max_output_bytes": "remediation_max_output_bytes",
-    "remediation.trace_raw": "remediation_trace_raw",
-    "remediation.prompt_template": "remediation_prompt_template",
-    "remediation.receipt": "remediation_receipt",
-    "remediation.confirm_count": "remediate_confirm_count",
-    "remediation.confidence_threshold": "remediate_confidence_threshold",
     # ---- self_guard：自身识别 / 自反馈 ----
     "self_guard.log_with_bot_id": "log_with_bot_id",
     "self_guard.log_names": "self_log_names",
