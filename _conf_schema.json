@@ -165,8 +165,9 @@
       },
       "provider_id": {
         "description": "分级用 Provider（provider_id）",
-        "hint": "AstrBot 的 provider id，供 llm_generate 使用。误配后果：留空 = 永不调 LLM（auto 下等同 local）。",
+        "hint": "网页端是下拉，直接选 AstrBot 里已配置的对话模型，不用手抄 id。留空 = 不调 LLM（auto 下等同 local，会显式降级并在报告首段写明）。换模型只改这里，不用改代码。",
         "type": "string",
+        "_special": "select_provider",
         "default": ""
       },
       "timeout_seconds": {

@@ -205,6 +205,21 @@ def test_schema_leaves_match_key_map_exactly() -> None:
     assert len(config_map.KEY_MAP) == 60, "KEY_MAP 仍是 v2.1.0 的迁移契约（只搬旧键）"
 
 
+def test_classify_provider_id_uses_provider_dropdown() -> None:
+    """分级模型必须能从 AstrBot 已配置的 provider 里直接选（对标 media_analysis）。
+
+    为什么钉住：`_special: select_provider` 一旦被删或改名，配置页会悄悄退回「手填 provider id」
+    的输入框 —— 不报错、不告警，只有运营方填错后看到一片降级才发现自己在查一个不存在的 id。
+    这是 UI 契约，不是文档，所以要有断言。
+    """
+    item = _schema()["classify"]["items"]["provider_id"]
+    assert item.get("_special") == "select_provider", (
+        "classify.provider_id 必须保留 select_provider，否则网页端会退回手填 id"
+    )
+    assert item.get("type") == "string"
+    assert item.get("default") == "", "留空语义是「不调 LLM」，默认值不能改"
+
+
 def test_extra_leaves_have_no_legacy_counterpart_and_do_not_pollute_key_map() -> None:
     """v2.3.0 新键没有旧扁平对应键：它们进 EXTRA_LEAVES，不能混进 95 条迁移契约。"""
     extra = set(config_map.EXTRA_LEAVES)

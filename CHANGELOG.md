@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.3.1（2026-10-24）
+
+> 一个小改：**「分级用 Provider」从手填 id 改成下拉选择**（配置面不变，仍是 8 组 / 69 键）。
+
+- `classify.provider_id` 增加 `"_special": "select_provider"` —— AstrBot 的插件配置页会把它渲染成
+  「已配置的对话模型」下拉框，不用再去别处手抄 provider id（对标 `astrbot_plugin_media_analysis` 的做法）。
+- 语义不变：留空仍是「不调 LLM」（`auto` 下等同 `local`，会显式降级并在报告首段写明）；已有配置值
+  原样保留，**无需迁移**。
+- 新增守卫用例：`test_classify_provider_id_uses_provider_dropdown` —— 防止以后有人把 `_special`
+  改掉，UI 悄悄退回手填而没人发现。
+- 上一版 2.3.0 上线时 `initialize` 的启动横幅漏了 `report_cfg` 赋值（测试没覆盖 `initialize`），
+  已由热修 `bc25a2f` 修好；本版随分支一并带上，并新增 F821 静态守卫（`tests/test_static_checks.py`）
+  钉住这一类「静态可判定、运行期才炸」的错误。
+
 ## v2.3.0（2026-10-23）
 
 > 本版收口三件事，**三件都是不兼容变更**：① 指纹缓存强制失效 —— 每条错误都必须由模型重新下结论；

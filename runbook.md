@@ -152,7 +152,7 @@ python3 $PLUG/tools/migrate_config_v3.py --verify --config $CFG --against $CFG.b
 | **③ AI 威胁分级（`classify`）** | | | |
 | `classify.enable` | bool | `true` | 分级总开关；关闭 = 按日志等级直接触发（会噪声直灌） |
 | `classify.mode` | string | `"auto"` | auto = 有 provider 就每条过模型；local = 显式本地（永不调模型）；llm = LLM 优先、失败降级 |
-| `classify.provider_id` | string | `""` | AstrBot provider id；留空 = 每条显式降级（不写库） |
+| `classify.provider_id` | string | `""` | 下拉选 AstrBot 已配置的对话模型（v2.3.1 起走 `select_provider`，不用手抄 id）；留空 = 每条显式降级（不写库） |
 | `classify.timeout_seconds` | int | `20` | 5-300，单次 LLM 判定超时 |
 | `classify.system_prompt` | text | `""` | 覆盖内置提示词（空 = `prompts/classify_system.md`） |
 | `classify.fallback_severity` | string | `"MEDIUM"` | 降级地板：`max(本地判定, 该值)`，且至少 MEDIUM |
