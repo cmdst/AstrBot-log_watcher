@@ -1,7 +1,14 @@
-# log_watcher v2.3.0
+# log_watcher · AstrBot 日志监听
 
-扫描 AstrBot 日志 → **每条错误都过 AI 威胁分级** → **按级路由**（静默 / 摘要 / 即时告警 /
-最高级即时告警，只通知人工）→ **诊断首段 + 原始日志文件**。
+把 AstrBot 的日志变成**能看懂、能定位、能处置**的告警。
+
+它盯着日志目录，发现命中等级的行就交给模型判一次，按严重度决定「忽略 / 摘要 / 即时告警 / 最高级告警」，
+每条告警给出**一份诊断**和**一份原始日志文件**。它不修任何东西——**只通知人**。
+
+- **每条错误都过模型**：历史指纹只作「先验」注入，不做短路；判定与通知去重分离（被去重时判定照做）。
+- **告警不再被聊天软件切碎**：主出口 = 1 条诊断文本 + 1 个 `.log` 附件；其余出口只发文本并给本机路径。
+- **模型不可用要看得出来**：超时 / 预算排队 / 未配 provider 一律显式降级，首段写「未取得模型诊断」。
+- **没有自动修复**：v2.3.0 起整条 `dsh` 修复通道被移除，高危只通知人工。
 
 > 部署、迁移、排障、回滚、未闭合项：见 [`runbook.md`](runbook.md)。
 > 版本与兼容变更：见 [`CHANGELOG.md`](CHANGELOG.md)；发布前脱敏：见 [`SANITIZE.md`](SANITIZE.md)。
@@ -143,8 +150,8 @@ stale 键清掉；工具：`tools/migrate_config_v3.py`）。
 ## 开发与测试
 
 ```bash
-cd /root/workspace/projects/AstrBot-log_watcher
-PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider   # 308 passed
+# 零第三方运行时依赖；任选一个 Python 3.10+ 解释器即可
+PYTHONDONTWRITEBYTECODE=1 python3 -m pytest tests/ -q -p no:cacheprovider   # 315 passed
 ```
 
 测试全部离线：不联网、不 spawn 子进程、不写插件目录。分层：
@@ -158,3 +165,11 @@ PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p 
 | `tests/test_deliver.py` | 通道能力表、诊断首段/报告段、分片、降级、重试退避 |
 | `tests/test_store.py` | SQLite schema v4、迁移、报告文件、保留清理、磁盘治理 |
 | `tests/test_config_map.py` | schema ⇄ `KEY_MAP` ⇄ main 读取点三方一致、旧键契约冻结、迁移 CLI |
+
+## 作者与致谢
+
+- **原作者**：[W-Wolfycz](https://github.com/W-Wolfycz) —— `log_watcher` 最初由他编写。
+- **本 fork 的维护**：[cmdst](https://github.com/cmdst) —— v2.x 的变化（判定必过模型、移除自动修复、
+  告警改成「诊断 + 原始日志文件」、配置分组重构）都在这个 fork 上完成。
+
+许可：[MIT](LICENSE)。

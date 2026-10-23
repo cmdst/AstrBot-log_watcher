@@ -9,7 +9,7 @@ desc: >-
   模型不可用/预算排队/未配 provider 时显式降级并在首段写「未取得模型诊断」，人工覆写标
   「人工覆写（非模型判定）」。采集进度与计数落在 SQLite（WAL，schema v4），日志轮转与截断自动续读。
 version: 2.3.1
-author: Wolfycz
+author: W-Wolfycz
 repo: https://github.com/cmdst/AstrBot-log_watcher
 astrbot_version: ">=4.27,<5"
 tags: ["日志", "监控", "主动消息", "运维", "AI 分级"]

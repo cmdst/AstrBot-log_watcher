@@ -353,7 +353,7 @@ def test_fingerprint_stable_across_time_session_and_line_number() -> None:
     second = make_block(
         [
             "[2026-10-14 18:02:07.001] [Core] [ERRO] [v4.28.2] [core.pipeline.scheduler:412]: 写入状态失败: "
-            "sqlite3.OperationalError: database is locked (session=2060958352)"
+            "sqlite3.OperationalError: database is locked (session=9000000001)"
         ]
     )
     assert fingerprint(first) == fingerprint(second)

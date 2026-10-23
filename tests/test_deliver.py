@@ -360,7 +360,7 @@ def test_aiocqhttp_private_plan_is_one_full_text_plus_one_file():
     plan = deliver.build_send_plan(
         _llm_verdict(),
         deliver.DeliverConfig(),
-        "aiocqhttp:FriendMessage:2060958352",
+        "aiocqhttp:FriendMessage:9000000001",
         block=_block(hits=2),
         report=_spec(),
         allow_attachment=True,
@@ -440,7 +440,7 @@ def test_group_outlet_gets_text_and_path_but_no_file():
     plan = deliver.build_send_plan(
         _llm_verdict(),
         deliver.DeliverConfig(),
-        "aiocqhttp:GroupMessage:744868236",
+        "aiocqhttp:GroupMessage:9000000002",
         block=_block(),
         report=_spec(),
         allow_attachment=False,
@@ -727,8 +727,8 @@ def test_has_redundant_outlets_needs_two_entries():
 
 def test_mask_session_hides_identifier_but_keeps_shape():
     """会话标识不进日志：启动横幅与投递报错都走 mask_session。"""
-    assert deliver.mask_session("哈尼娅:FriendMessage:2060958352") == "哈尼娅:FriendMessage:（ID 已隐）"
-    assert deliver.mask_session("哈尼娅:GroupMessage:744868236") == "哈尼娅:GroupMessage:（ID 已隐）"
+    assert deliver.mask_session("哈尼娅:FriendMessage:9000000001") == "哈尼娅:FriendMessage:（ID 已隐）"
+    assert deliver.mask_session("哈尼娅:GroupMessage:9000000002") == "哈尼娅:GroupMessage:（ID 已隐）"
     # 解析不出三段的原样返回（宁可留着，也别把调试信息弄丢）
     assert deliver.mask_session("weixin_oc:FriendMessage:") == "weixin_oc:FriendMessage:"
     assert deliver.mask_session("no-colon") == "no-colon"
@@ -874,7 +874,7 @@ def test_head_at_report_lower_bound_keeps_report_section_and_path():
         plan = deliver.build_send_plan(
             _llm_verdict(),
             deliver.DeliverConfig(head_max_chars=500),
-            "aiocqhttp:GroupMessage:744868236",
+            "aiocqhttp:GroupMessage:9000000002",
             block=_block(hits=2),
             report=_spec(),
             allow_attachment=allow_attachment,

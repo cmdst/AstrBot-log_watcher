@@ -60,7 +60,7 @@ class SelfLogFilter:
     另有一类真实的自反馈源（findings-recon.md §2）：本插件的发送失败会被平台适配器
     记成**别的组件**的 WARN，例如
     `[Core] [WARN] [weixin_oc.weixin_oc_adapter:915]: weixin_oc(...): sendmessage failed for
-    o9cq…@im.wechat: ret=-2, errmsg=prepare failed`。这类行不含插件名，若 levels 含
+    <openid>@im.wechat: ret=-2, errmsg=prepare failed`。这类行不含插件名，若 levels 含
     WARNING 就会「自己失败 → 再告警一次」。用 `echo_ids`（本插件的目标会话 id）
     + 发送失败特征词做联合判定，只屏蔽指向自己目标的失败回声，不误伤其他用户的平台故障。
     """
