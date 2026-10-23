@@ -1,5 +1,124 @@
 # Changelog
 
+## v2.3.0（2026-10-23）
+
+> 本版收口三件事，**三件都是不兼容变更**：① 指纹缓存强制失效 —— 每条错误都必须由模型重新下结论；
+> ② 从代码与配置中**完整移除自动修复**（`dsh` headless 通道）；③ 告警改成「**1 条诊断首段 + 1 个原始
+> 日志文件**」。配置从 8 组 / 82 键变成 **8 组 / 69 键**，状态库 `SCHEMA_VERSION` 2 → **4**。
+> 分支 `feat/v2.3.0-no-cache-no-remediation`（`591469a →` 本版），未合并 `main`、未部署生产。
+> 门禁 **299 passed / 0 failed**（v2.2.0 基线 340；减少的用例逐条可对账，见文末「测试」）。
+
+### ① 判定：指纹缓存强制失效（每条错误必过模型）
+
+- **知识库命中不再是判决出口**。旧实现命中 `pattern_kb` 就直接返回历史结论（跳过模型、安全闸与预算
+  记账）；运营方实测到「当前错误与库里旧指纹相同，插件把旧结论当成现在的结论报上来，定位被带偏」。
+  v2.3.0 起 KB 条目只作「历史判定（先验，仅供参考，可推翻）」注入提示词，结论必须由模型重新给出。
+  `source=manual` 的人工覆写是**唯一**豁免，且必须可见：`judged=false`、`judge_source=manual`、
+  tags 带 `manual-override`、首段写「人工覆写（非模型判定）」。
+- `classify.noise_shortcut` 默认 `true → **false**`：良性噪声也要过模型；显式开启时结论标
+  `judged=false`（不得伪装成模型判定），保留一版作为逃生阀。
+- **预算只延迟、不取消**：单轮/小时预算用尽时，该指纹进待判队列（下一轮优先），本轮返回
+  `source=degraded` + `degraded:llm-budget`，**不再**用本地结论「看起来像已判」地定案。
+- **未配 provider 不再写库**（真缺陷修复）：需要 LLM 但 provider/context 不可用时显式降级
+  （`degraded:llm-unconfigured`）且**不写 `pattern_kb`** —— 旧实现会把本地结论永久固化，
+  provider 配好后也被旧结论吃掉。
+- **判定与通知去重分离**：通知去重（`budget.dedupe_window_seconds`）只决定「发不发」，判定照做；
+  `repeat_count` 的统计窗口独立为 `classify.repeat_window_seconds`。同一指纹连续三轮只发一条通知，
+  但判定三次（`judged=1` ×3）。
+- **批内复用、跨轮重判**：同一轮内同指纹只判一次（同一次观察，复用结论但重建证据），
+  `begin_round()` 清空备忘录 ⇒ 跨轮必重判；不提供 TTL 复用省钱。
+- 契约：`ThreatVerdict` 增 `judged` / `judge_source`（fail-closed 默认 False；`parse_llm_verdict`
+  是唯一置 True 处）；台账 `alerts` 增 `judged`（1/0/-1=未知）与 `judge_source`；降级标签统一
+  `degraded:*`（llm-timeout / llm-error / llm-invalid-output / guard-error / llm-budget /
+  llm-unconfigured / engine-unavailable / engine-error）。
+
+### ② 自动修复：通道整体移除（能力面清零）
+
+- 删除 `remediate.py`（1772 行）、`prompts/remediate_task.md`、`dsh-headless-overlay.yml`、
+  `tests/test_remediate.py`、`tests/test_defaults_drift.py`、`main.py` 17 个方法（约 440 行）、
+  `models.RemediationRun` / `RemediationGate`、`engine.should_remediate`、`store` 6 个账本 API、
+  投递层两段「已进入修复候选」提示，以及配置里的整个 `remediation` 组（**22 个键**）。
+- 路由：`HIGH → notify`、`CRITICAL → emergency`（仅最高级即时告警），两者都不再进任何修复。
+  `Route.REMEDIATE` 枚举值**保留**，只为解析历史 `alerts.route` 与用户 `route_map`。
+- 兼容面（只停写不删）：`remediation_runs` 表/索引/列全留，启动 `reconcile_runs()` 仍把遗留
+  `running` 对账成 `aborted`；`store.prune` 只保留孤儿 `running → timeout`；磁盘 `remediation/`
+  目录冻结（只读），清理能力迁到离线 CLI `tools/prune_legacy_artifacts.py`（默认干跑、`--apply`
+  才删、`--db` 只读统计、**永不删台账行**）。
+- 配置删除的 22 个键名**冻结**在 `tests/test_config_map.py::DROPPED_IN_V230`；离线迁移工具把它们
+  归为 **dropped**（明示删除），**不是** unknown（见 `tools/migrate_config_v3.py`）。
+
+### ③ 告警报告：诊断首段 + 原始日志文件
+
+- 一条告警 = **1 条诊断文本 + 1 个 `.log` 附件**（主出口且通道支持文件时），不再被 QQ 长度切成
+  2~3 段。首段契约：头（等级/命中/时间/来源/组件/指纹第 N 次）→ 诊断（模型判定 / 「本地规则判定，
+  未取得模型诊断」/「人工覆写（非模型判定）」三选一）→ 可能原因 / 是否建议修复 / 修复建议 →
+  按等级的静态人工处置清单（CRITICAL/HIGH 各 3 条、MEDIUM 1 条；代码常量，不允许模型生成）→「原始日志」段（附件名+体积+口径+
+  保留天数，或本机路径）。
+- 报告文件：`<plugin_data>/outbox/reports/alert-<YYYYmmdd-HHMMSS>-<SEV>-<fp8>.log`（0600/0700），
+  与 `outbox/` 的「成功即删」**生命周期隔离**；按 `report.keep_days` / `report.max_files` 清理。
+  超 `report.max_file_bytes` 保留头尾并写明丢弃字节数；同秒同等级同指纹得 `-2` 后缀。
+- **非主出口不发文件**（代码不变式：`allow_attachment = session == primary_outlet`）：其余出口只发
+  文本 + 「完整日志见 <本机路径>」。weixin_oc 代码级禁用附件（配置也打不开）。
+- **超长不切段**：先压缩诊断再硬截（`…（首段已截断，完整内容见报告文件）`），
+  `split_with_markers` 只留给「报告关闭/低等级」的旧内联路径。
+- 新增 `report` 组 7 键（`enabled` / `min_severity` / `raw_mode` / `max_file_bytes` / `keep_days` /
+  `max_files` / `head_max_chars`）；`notify.max_chars_per_message` 仍可覆盖单条上限。
+- 失败不吞：写报告失败 → WARNING + 回落文本（给本机路径）；附件失败 → `file_ok=False`、
+  `partial=True`、`delivery_partial` 计数 + WARNING，**不整条重试**；待发队列带 `attachments`，
+  重试时能把文件再发一次。
+
+### 配置与状态库
+
+- **8 组 / 69 键**：`notify` 7 + `scan` 9 + `classify` 18 + `budget` 12 + `delivery` 4 +
+  `report` 7 + `state` 9 + `self_guard` 3 = **69**。
+  算术：82 − 22（remediation）= 60；+ 2（`classify.prior_ttl_hours` / `classify.repeat_window_seconds`）
+  = 62；+ 7（report 组）= **69**。`config_map.KEY_MAP` 仍是 60 条 v2.1.0 迁移契约，
+  新增 9 条住在 `config_map.EXTRA_LEAVES`；`test_config_map.py` 的冻结断言未软化。
+- `state.fingerprint_ttl_hours` **键名保留、语义收窄**为「通知去重状态保留期」；判定先验保留期
+  改用 `classify.prior_ttl_hours`（默认 72），`repeat_count` 统计窗口改用
+  `classify.repeat_window_seconds`（默认 900）。
+- **`SCHEMA_VERSION` 2 → 4**：
+  - v2 → v3（判定链）：`pattern_kb.last_judged_at` / `judge_source`，`alerts.judged` /
+    `judge_source`（历史行不回填：`-1` / `''` = 未知）；
+  - v3 → v4（报告）：`pending_delivery.attachments`（JSON，重试能把文件再发一次）、
+    `alerts.report_path`（留存件；`excerpt_path` 仍是临时摘录）。
+  旧库 `open()` 时自动补列（吞 duplicate column）；**回滚必须连库一起回滚**：v2.2.0 代码看到
+  `user_version=4` 会进只读保护（拒绝写入），见 `runbook.md` §8.4。
+
+### 工具
+
+- 新增 `tools/migrate_config_v3.py`：v2.2.0（8 组 / 82 键）→ v2.3.0（8 组 / 69 键），
+  `--dry-run`（默认）/ `--apply` / `--verify --against` / `--from-backup`，幂等、**任何模式都不打印
+  配置值**。干跑会列出将删除的 22 个 remediation 键、将补默认值的 9 个新键、未知键。
+  只支持分组结构；v2.1.0 扁平结构先跑 `tools/migrate_config_v2.py`。
+- `tools/prune_legacy_artifacts.py`（离线清理历史修复轨迹）：默认干跑、`--apply` 才删、
+  `--db` 只读统计台账行、永不删行；`--dir/--keep/--max-age-days/--max-bytes` 可调。
+- `tools/migrate_config_v2.py` 保留（v2.1.0 → v2.2.0 的旧迁移）。
+
+### 升级顺序（**硬的**）
+
+1. 备份插件目录、配置与状态库（`runbook.md` §8.1）；
+2. **先迁移配置**：`python3 tools/migrate_config_v3.py --dry-run --config <配置>` 核对 →
+   `--apply`（写 `bak-pre-v2.3.0-<ts>`）；
+3. **再换插件版本**（核心会删除 schema 外的键，顺序反了值就没了）；
+4. 重载插件，验收启动行（版本 2.3.0、状态 SQLite、`报告 开启（excerpt，≥MEDIUM）`）、
+   无 `Config key removed`（本插件的键）、无 `CONFIG-INVALID.txt`；
+5. `--verify --against <备份>` 逐叶子复核（未打印任何值）。
+
+回滚是**成对的**：配置 + 状态库 + 代码三者一起回（锚点 v2.2.0 = `591469a`），
+只回代码会因 `user_version=4` 进只读保护，见 `runbook.md` §8.4。
+
+### 测试
+
+- 门禁 **299 passed / 0 failed**。数量变化逐段可对账：v2.2.0 **340** →（移除自动修复）**253**
+  →（判定链）**277** →（报告形态）**299**。随能力删除的用例逐条点名在 T5 的
+  `VERIFY-v2.3.0.md`；缓存的旧语义用例是**改写**而不是删除（见 `tests/test_engine.py` 的
+  `test_kb_prior_still_calls_llm` 等）。
+- 关键回归：同一指纹两次分类 → 模型调用 2 次（旧 reason/severity 不复用）；`noise_shortcut`
+  默认 false；未配 provider 不写 `pattern_kb`；预算耗尽排队 + `degraded:llm-budget`；批内复用
+  ×1 / 跨轮重判；报告首段三分支；非主出口无附件；`SCHEMA_VERSION` 迁移 v1/v2/v3 → v4。
+- 未闭合项（aiocqhttp 非主出口附件不变式、`raw_mode=file` 的隐私面等）见 `runbook.md` §10。
+
 ## v2.2.0（2026-10-19）
 
 > 本版只做一件事：**把插件配置从「95 个扁平顶键」整成 8 个分组（`notify` / `scan` / `classify` /

@@ -1,0 +1,105 @@
+﻿{
+  "notify": {
+    "target_sessions": [],
+    "send_mode": "FIXTURE-notify-send_mode",
+    "prefer_forward": false,
+    "min_severity": "FIXTURE-notify-min_severity",
+    "include_excerpt": true,
+    "max_excerpt_chars": 6000,
+    "max_chars_per_message": 0
+  },
+  "scan": {
+    "log_dir": "FIXTURE-scan-log_dir",
+    "file_pattern": "FIXTURE-scan-file_pattern",
+    "levels": [
+      "ERROR",
+      "CRITICAL"
+    ],
+    "exclude_keywords": [],
+    "poll_interval_seconds": 30,
+    "start_from_end": true,
+    "context_before": 5,
+    "context_after": 5,
+    "max_lines_per_poll": 200
+  },
+  "classify": {
+    "enable": true,
+    "mode": "FIXTURE-classify-mode",
+    "provider_id": "FIXTURE-classify-provider_id",
+    "timeout_seconds": 20,
+    "system_prompt": "FIXTURE-classify-system_prompt",
+    "fallback_severity": "FIXTURE-classify-fallback_severity",
+    "unmatched_severity": "FIXTURE-classify-unmatched_severity",
+    "transient_severity": "FIXTURE-classify-transient_severity",
+    "max_block_lines": 80,
+    "max_calls_per_round": 5,
+    "max_calls_per_hour": 60,
+    "noise_shortcut": false,
+    "kb_enabled": true,
+    "kb_max_entries": 500,
+    "new_pattern_escalate": false,
+    "route_map": {}
+  },
+  "budget": {
+    "dedupe_window_seconds": 900,
+    "digest_interval_seconds": 1800,
+    "digest_max_items": 50,
+    "max_alerts_per_round": 5,
+    "max_alerts_per_minute": 12,
+    "max_alerts_per_hour": 80,
+    "max_alerts_per_day": 300,
+    "burst_window_seconds": 60,
+    "burst_threshold": 8,
+    "burst_min_severity": "FIXTURE-budget-burst_min_severity",
+    "silence_ranges": [],
+    "silence_min_severity": "FIXTURE-budget-silence_min_severity"
+  },
+  "delivery": {
+    "max_attempts": 2,
+    "base_delay_seconds": 5,
+    "retry_batch": 5,
+    "channel_overrides": {}
+  },
+  "state": {
+    "db_path": "FIXTURE-state-db_path",
+    "fingerprint_ttl_hours": 72,
+    "history_retention_days": 30,
+    "history_max_rows": 20000,
+    "outbox_max_bytes": 33554432,
+    "excerpt_mode": "FIXTURE-state-excerpt_mode",
+    "keep_excerpt_files": 50,
+    "outbox_max_age_hours": 24,
+    "disk_report_interval_hours": 24
+  },
+  "self_guard": {
+    "log_with_bot_id": false,
+    "log_names": [
+      "log_watcher"
+    ],
+    "feedback_ids": []
+  },
+  "remediation": {
+    "enable": false,
+    "dsh_command": "FIXTURE-remediation-dsh_command",
+    "profile": "FIXTURE-remediation-profile",
+    "patch_overlay": "",
+    "workdir": "FIXTURE-remediation-workdir",
+    "timeout_seconds": 900,
+    "max_concurrency": 1,
+    "cooldown_seconds": 3600,
+    "daily_limit": 5,
+    "permission_mode": "FIXTURE-remediation-permission_mode",
+    "env_refs": [],
+    "inherit_env": false,
+    "artifact_dir": "",
+    "artifact_keep": 50,
+    "artifact_max_age": 604800,
+    "artifact_max_bytes": 67108864,
+    "max_output_bytes": 1048576,
+    "trace_raw": false,
+    "prompt_template": "",
+    "receipt": true,
+    "confirm_count": 2,
+    "confidence_threshold": 0.8
+  }
+}

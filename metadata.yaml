@@ -1,15 +1,15 @@
 name: log_watcher
 display_name: 日志监听
-short_desc: 扫描 AstrBot 日志 → AI 威胁分级 → 按级路由告警 → 可选 dsh headless 紧急修复并回执
+short_desc: 扫描 AstrBot 日志 → 每条错误都过 LLM 分级 → 告警 = 诊断首段 + 原始日志文件（不再自动修复）
 desc: >-
-  定时扫描 AstrBot 日志目录，把命中等级与规则的行交给「本地规则 + 可选 LLM」做威胁分级，
-  再按级路由：静默 / 摘要聚合 / 即时告警 / 调用 dsh headless 紧急修复。修复的每一次尝试
-  （含 skipped/blocked/unavailable/timeout/failed）都会向 target_sessions 推一条七段回执。
-  采集进度与计数落在 SQLite（WAL）里，日志轮转与截断自动续读；修复固定以 workspace-write
-  权限在指定工作区内运行，路由由插件自带的 dsh-headless-overlay.yml 以 --patch 叠加
-  （不改任何 profile，删文件即失效）。
-version: 2.2.0
+  定时扫描 AstrBot 日志目录，把命中等级与规则的行交给「本地规则锚点 + 每次重新调用的 LLM」做威胁分级，
+  再按级路由：静默 / 摘要聚合 / 即时告警 / 最高级即时告警（全部只通知人工，不做任何自动修复）。
+  指纹知识库只记录命中次数并把历史结论作为「先验」注入提示词，判定必须每次由模型重新下结论；
+  判定与通知去重分离（通知被去重时判定照做）。每条告警 = 1 条诊断文本 + 1 个原始日志文件；
+  模型不可用/预算排队/未配 provider 时显式降级并在首段写「未取得模型诊断」，人工覆写标
+  「人工覆写（非模型判定）」。采集进度与计数落在 SQLite（WAL，schema v4），日志轮转与截断自动续读。
+version: 2.3.0
 author: Wolfycz
 repo: https://github.com/cmdst/AstrBot-log_watcher
 astrbot_version: ">=4.27,<5"
-tags: ["日志", "监控", "主动消息", "运维", "AI 分级", "自动修复"]
+tags: ["日志", "监控", "主动消息", "运维", "AI 分级"]
