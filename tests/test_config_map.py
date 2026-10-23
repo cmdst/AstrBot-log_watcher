@@ -241,8 +241,17 @@ def test_report_group_defaults_and_consumers() -> None:
     assert leaves["report.keep_days"]["default"] == 7
     assert leaves["report.max_files"]["default"] == 200
     assert leaves["report.head_max_chars"]["default"] == 1200
-    # main 的读取点断言在报告接线那次提交里补（本提交只做配置面）
-    assert _main_src()
+    main_src = _main_src()
+    for path in (
+        "report.enabled",
+        "report.min_severity",
+        "report.raw_mode",
+        "report.max_file_bytes",
+        "report.keep_days",
+        "report.max_files",
+        "report.head_max_chars",
+    ):
+        assert f'self.cfg.get("{path}"' in main_src, f"main.py 没读 {path}（写了 schema 没人消费）"
 
 
 def test_noise_shortcut_default_is_false_everywhere() -> None:
@@ -348,6 +357,7 @@ def test_main_reads_only_mapped_dotted_paths() -> None:
     # v2.3.0 的新键必须真的被读到（否则就是「写了 schema 但没人消费」）
     assert "classify.prior_ttl_hours" in paths
     assert "classify.repeat_window_seconds" in paths
+    assert "report.raw_mode" in paths and "report.head_max_chars" in paths
     assert "self.cfg = config_map.ConfigView(" in src, "ConfigView 必须挂到 self.cfg"
 
 

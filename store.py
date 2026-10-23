@@ -28,7 +28,7 @@ from pathlib import Path
 
 _WINDOW_MAX_AGE = 7200.0
 _WINDOW_MAX_LEN = 1024
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 """状态库结构版本。
 
 - v1 → v2：补 ``alerts.excerpt_lines`` / ``remediation_runs.task_sha1|argv`` /
@@ -37,6 +37,10 @@ SCHEMA_VERSION = 3
   （某指纹最后一次**真判**的时间与依据），``alerts`` 补 ``judged`` / ``judge_source``
   （台账里能区分「模型判过」与「本地/降级/人工」）。历史行**不回填**：
   ``judge_source=''``、``judged=-1`` 表示「未知」，绝不假装当时判过（假审计）。
+- v3 → v4（v2.3.0 报告文件）：``pending_delivery`` 补 ``attachments``（JSON：
+  ``[{path,name,kind,size}]``，重试时能把文件再发一次），``alerts`` 补 ``report_path``
+  （指向 ``outbox/reports/`` 里**不会被回收**的报告文件；``excerpt_path`` 仍是「临时摘录，
+  可能已被回收」）。历史行默认 ``'[]'`` / ``''``，旧待发条目照旧能发（只是没有附件）。
 """
 _PRUNE_DELETE_CAP = 500
 #: v2.3.0：`remediation_runs` 只做历史保留与对账（不再写入）。孤儿 running 行的宽限秒数
@@ -168,6 +172,17 @@ def _as_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _json_list(raw: object) -> list:
+    """把 JSON 字符串/列表宽松还原成「对象列表」（坏数据一律当空，不影响投递）。"""
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
 
 
 def _strict_int(value: object) -> int | None:
@@ -491,6 +506,8 @@ class PendingItem:
     last_error: str = ""
     state: str = "pending"
     excerpt_path: str = ""
+    #: 待重发的文件附件（v2.3.0：告警报告）。空列表 = 纯文本条目。
+    attachments: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """序列化为可落盘（JSON 迁移 / SQLite 行）的 dict。"""
@@ -509,6 +526,7 @@ class PendingItem:
             "last_error": self.last_error,
             "state": self.state,
             "excerpt_path": self.excerpt_path,
+            "attachments": [dict(item) for item in self.attachments],
         }
 
     @classmethod
@@ -546,6 +564,11 @@ class PendingItem:
             last_error=str(raw.get("last_error") or ""),
             state=state,
             excerpt_path=str(raw.get("excerpt_path") or ""),
+            attachments=[
+                dict(item)
+                for item in (raw.get("attachments") or [])
+                if isinstance(item, dict) and str(item.get("path") or "").strip()
+            ],
         )
 
 
@@ -893,6 +916,176 @@ class DiskGovernor:
         )
 
 
+REPORT_PREFIX = "alert-"
+"""报告文件名前缀：``alert-<YYYYmmdd-HHMMSS>-<SEV>-<fp8>.log``（runbook 按 ls 直接定位）。"""
+
+
+def _clip_utf8(blob: bytes) -> str:
+    """按字节切 UTF-8 片段但**不切碎多字节字符**（errors=ignore 掉边缘的半截）。"""
+    return blob.decode("utf-8", errors="ignore")
+
+
+def clip_report(text: str, max_bytes: int) -> tuple[str, bool, int]:
+    """把报告正文压到 ``max_bytes``：**保留头尾**，中间用一行标记说明截掉了多少字节。
+
+    为什么保留头尾而不是直接砍尾：日志两头都有用 —— 头是异常类型/时间与第一段 traceback，
+    尾是最终报错行与退出码。只砍尾会把「到底怎么死的」砍掉（历史轨迹截断就踩过这个坑）。
+    标记文本本身占字节，所以先给标记预留预算，再按 7:3 分给头尾；上限小到放不下标记时
+    退化成「头部 + 最短提示」。
+
+    Args:
+        text: 完整正文。
+        max_bytes: 上限（``<=0`` 表示不限制）。
+
+    Returns:
+        ``(正文, 是否截断, 被丢弃字节数)``。
+    """
+    raw = str(text or "")
+    limit = max(0, int(max_bytes or 0))
+    if limit <= 0:
+        return raw, False, 0
+    blob = raw.encode("utf-8")
+    if len(blob) <= limit:
+        return raw, False, 0
+
+    template = "\n\n……（中间内容已截断 {dropped} 字节；已保留头尾）……\n\n"
+    reserve = len(template.encode("utf-8")) + 16  # 给 dropped 数字留位
+    budget = limit - reserve
+    if budget < 2:
+        short = "\n……（已截断）……"
+        keep = max(1, limit - len(short.encode("utf-8")))
+        head = _clip_utf8(blob[:keep])
+        dropped = max(0, len(blob) - len(head.encode("utf-8")))
+        return head + short, True, dropped
+
+    head_budget = max(1, int(budget * 0.7))
+    tail_budget = max(1, budget - head_budget)
+    head = _clip_utf8(blob[:head_budget])
+    tail = _clip_utf8(blob[-tail_budget:])
+    dropped = max(0, len(blob) - len(head.encode("utf-8")) - len(tail.encode("utf-8")))
+    mark = template.format(dropped=dropped)
+    while len((head + mark + tail).encode("utf-8")) > limit and len(head) > 1:
+        head = head[:-1]
+    return head + mark + tail, True, dropped
+
+
+class ReportStore:
+    """告警报告文件（``<plugin_data>/outbox/reports/``）：写入 / 截断 / 留存清理 / 占用。
+
+    与 ``outbox/`` 的关系：同一个 root 下的**子目录**，但生命周期完全相反 ——
+    ``outbox/`` 里的摘录是「投递成功即删」的临时件（``DiskGovernor.release``），
+    报告文件是**给人事后对账的留存件**，只按 ``report.keep_days`` / ``report.max_files``
+    清理。两者互不干扰：``DiskGovernor`` 只扫 ``outbox/*.txt``，看不见 ``reports/*.log``。
+
+    文件权限沿用 ``store.atomic_write_text``（文件 0600）+ 目录 0700（F09）。
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        keep_days: int = 7,
+        max_files: int = 200,
+        max_bytes: int = 512 * 1024,
+        prefix: str = REPORT_PREFIX,
+    ):
+        self.root = Path(root)
+        self.reports = self.root / "outbox" / "reports"
+        self.keep_days = int(keep_days)
+        self.max_files = int(max_files)
+        self.max_bytes = int(max_bytes)
+        self.prefix = prefix
+
+    def _ensure(self) -> None:
+        self.reports.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
+        secure_path(self.reports, DIR_MODE)
+
+    def _unique(self, name: str) -> Path:
+        path = self.reports / name
+        stem, suffix = name[: -len(".log")], ".log"
+        index = 2
+        while path.exists():
+            path = self.reports / f"{stem}-{index}{suffix}"
+            index += 1
+        return path
+
+    @staticmethod
+    def report_name(stamp: str, severity: object, fingerprint: object) -> str:
+        """``alert-<stamp>-<SEV>-<fp8>.log``（**只**放等级与指纹前缀，不放会话/主机名）。"""
+        level = str(getattr(severity, "value", severity) or "MEDIUM").strip().upper()
+        tag = str(fingerprint or "")[:8].strip().lower() or "nofp"
+        return f"{REPORT_PREFIX}{stamp}-{level}-{tag}.log"
+
+    def write(
+        self,
+        text: str,
+        *,
+        severity: object,
+        fingerprint: object,
+        stamp: str | None = None,
+        mode: str = "excerpt",
+    ) -> Path:
+        """写一份报告文件，返回路径（内容超 ``max_bytes`` 时保留头尾并写明截断）。"""
+        self._ensure()
+        name = self.report_name(
+            stamp or time.strftime("%Y%m%d-%H%M%S"), severity, fingerprint
+        )
+        path = self._unique(name)
+        payload, _truncated, _dropped = clip_report(text, self.max_bytes)
+        atomic_write_text(path, payload)
+        self.prune()
+        return path
+
+    def _scan(self) -> list[dict]:
+        rows: list[dict] = []
+        try:
+            entries = list(self.reports.glob("*.log"))
+        except OSError:
+            return rows
+        for path in entries:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if path.is_file():
+                rows.append({"path": path, "mtime": stat.st_mtime, "size": stat.st_size})
+        rows.sort(key=lambda row: row["mtime"])
+        return rows
+
+    def prune(self, now: float | None = None) -> dict:
+        """按「条数上限 + 年龄上限」清理报告文件（两条取更严者）。"""
+        moment = time.time() if now is None else float(now)
+        removed = {"files": 0, "bytes": 0}
+        rows = self._scan()
+        while rows and len(rows) > max(0, self.max_files):
+            victim = rows.pop(0)
+            if DiskGovernor._unlink(victim["path"]):
+                removed["files"] += 1
+                removed["bytes"] += victim["size"]
+        keep_seconds = max(0, self.keep_days) * 86400.0
+        if keep_seconds > 0:
+            for row in list(rows):
+                if moment - row["mtime"] > keep_seconds and DiskGovernor._unlink(row["path"]):
+                    removed["files"] += 1
+                    removed["bytes"] += row["size"]
+        return removed
+
+    def usage(self, now: float | None = None) -> dict:
+        """报告目录占用（文件数 / 字节 / 最旧年龄）。"""
+        moment = time.time() if now is None else float(now)
+        rows = self._scan()
+        return {
+            "path": str(self.reports),
+            "files": len(rows),
+            "bytes": sum(row["size"] for row in rows),
+            "oldest_age": (
+                max(0.0, moment - min(row["mtime"] for row in rows)) if rows else 0.0
+            ),
+            "keep_days": self.keep_days,
+            "max_files": self.max_files,
+        }
+
+
 _DDL: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS meta (
@@ -940,7 +1133,8 @@ _DDL: tuple[str, ...] = (
       excerpt_path TEXT NOT NULL DEFAULT '',
       excerpt_lines INTEGER NOT NULL DEFAULT 0,
       judged INTEGER NOT NULL DEFAULT -1,
-      judge_source TEXT NOT NULL DEFAULT ''
+      judge_source TEXT NOT NULL DEFAULT '',
+      report_path TEXT NOT NULL DEFAULT ''
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_alerts_fp_ts ON alerts(fingerprint, ts DESC)",
@@ -956,7 +1150,7 @@ _DDL: tuple[str, ...] = (
       route TEXT NOT NULL DEFAULT 'notify',
       attempts INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, next_at REAL NOT NULL,
       last_error TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'pending',
-      excerpt_path TEXT NOT NULL DEFAULT ''
+      excerpt_path TEXT NOT NULL DEFAULT '', attachments TEXT NOT NULL DEFAULT '[]'
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_pending_state_next ON pending_delivery(state, next_at)",
@@ -992,6 +1186,12 @@ _ALTERS_V2_TO_V3: tuple[str, ...] = (
     "ALTER TABLE alerts ADD COLUMN judge_source TEXT NOT NULL DEFAULT ''",
 )
 
+# v3 → v4 补列（v2.3.0 报告文件；同样吞掉「duplicate column」，旧库自动补）
+_ALTERS_V3_TO_V4: tuple[str, ...] = (
+    "ALTER TABLE pending_delivery ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE alerts ADD COLUMN report_path TEXT NOT NULL DEFAULT ''",
+)
+
 _PENDING_COLUMNS = (
     "item_id",
     "session",
@@ -1007,6 +1207,7 @@ _PENDING_COLUMNS = (
     "last_error",
     "state",
     "excerpt_path",
+    "attachments",
 )
 
 
@@ -1235,8 +1436,12 @@ class SqliteStore:
                     for statement in _ALTERS_V1_TO_V2:
                         with contextlib.suppress(sqlite3.Error):
                             conn.execute(statement)
-                if version < SCHEMA_VERSION:
+                if version < 3:
                     for statement in _ALTERS_V2_TO_V3:
+                        with contextlib.suppress(sqlite3.Error):
+                            conn.execute(statement)
+                if version < SCHEMA_VERSION:
+                    for statement in _ALTERS_V3_TO_V4:
                         with contextlib.suppress(sqlite3.Error):
                             conn.execute(statement)
                     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -1289,8 +1494,8 @@ class SqliteStore:
                 conn.executemany(
                     "INSERT INTO alerts(ts, fingerprint, severity, route, decision, component,"
                     " session, tags, summary, source_file, hit_count, excerpt_path, excerpt_lines,"
-                    " judged, judge_source)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " judged, judge_source, report_path)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     [
                         (
                             float(row.get("ts", 0.0)),
@@ -1309,6 +1514,7 @@ class SqliteStore:
                             # -1 = 未知（调用方没给 = 旧口径）；0/1 = 没判 / 判过
                             int(row.get("judged", -1)),
                             str(row.get("judge_source", "") or ""),
+                            str(row.get("report_path", "") or ""),
                         )
                         for row in rows
                     ],
@@ -1690,6 +1896,7 @@ class SqliteStore:
             item.last_error,
             item.state,
             item.excerpt_path,
+            json.dumps([dict(item_) for item_ in item.attachments], ensure_ascii=False),
         )
 
     @staticmethod
@@ -1713,6 +1920,7 @@ class SqliteStore:
             last_error=str(row[11] or ""),
             state=str(row[12] or "pending"),
             excerpt_path=str(row[13] or ""),
+            attachments=_json_list(row[14] if len(row) > 14 else "[]"),
         )
 
     def pending_due(self, now: float) -> list[PendingItem]:

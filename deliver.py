@@ -8,6 +8,14 @@
 2. 失败不静默：投递失败由调用方落 PendingQueue 重试（退避由本模块计算），重试耗尽
    后走 degrade() 降级成最小文本，再失败才标记放弃并计数；
 3. 历史配置 send_mode=file 不再落到附件形态，映射为通道自适应的文本投递。
+
+v2.3.0 的告警形态（用户诉求）：**1 条完整诊断文本 + 1 个原始日志文件**，不再把正文
+按 QQ 长度切成 2~3 段。分派规则：
+- 通道 ``caps.file`` 且这个出口允许附件（主出口）⇒ ``chunks`` 只有 1 段（保证单条可发完），
+  ``attachments`` 带 1 个 ``.log``；
+- 其余通道 / 群出口 ⇒ 仍是单条文本，但必须写清「完整日志见 <本机路径>」，零附件；
+- 无模型诊断时首行明示「本地规则判定，未取得模型诊断」，**不得**伪装成模型结论。
+分片函数（``split_with_markers``）只留给「不生成报告文件」的旧内联摘录路径与极端兜底。
 """
 
 from __future__ import annotations
@@ -17,8 +25,10 @@ import re
 from dataclasses import dataclass, field
 
 try:  # 包内导入（main.py 走这条）
+    from .classify import neutralize_untrusted
     from .log_reader import block_lines, levels_in, parse_timestamp
     from .models import (
+        Attachment,
         ChannelCaps,
         Route,
         SendPlan,
@@ -26,8 +36,10 @@ try:  # 包内导入（main.py 走这条）
         ThreatVerdict,
     )
 except ImportError:  # 纯逻辑直连导入（pytest / python -c 走这条）
+    from classify import neutralize_untrusted
     from log_reader import block_lines, levels_in, parse_timestamp
     from models import (
+        Attachment,
         ChannelCaps,
         Route,
         SendPlan,
@@ -88,6 +100,32 @@ DEFAULT_CAPS = ChannelCaps(
 _FORWARD_CHUNK_CHARS = 1800
 _DEGRADED_CHARS = 320
 _CONTINUATION = "（续）"
+#: 无模型诊断时诊断段的首行（用户可读的「这句不是模型说的」）。
+NO_MODEL_LOCAL = "本地规则判定，未取得模型诊断"
+#: 人工覆写（知识库 manual 条目）时诊断段的首行 —— 也绝不是模型结论。
+NO_MODEL_MANUAL = "人工覆写（非模型判定）"
+#: 诊断段里「可能原因」的单行上限（超长就压进报告文件，别把首段撑破）。
+DIAGNOSIS_MAX_CHARS = 400
+#: 首段被压到极限时的收尾提示（有报告文件时指向文件）。
+_HEAD_CLIP_NOTE = "…（首段已截断，完整内容见报告文件）"
+
+#: HIGH/CRITICAL 的静态人工处置清单 —— **必须是代码里的常量**，不允许模型生成（防幻觉）。
+#: 按等级给 3 条最通用、最不会错的动作；具体定位仍然靠报告文件里的原始行。
+HANDLING_CHECKLIST: dict[Severity, tuple[str, ...]] = {
+    Severity.CRITICAL: (
+        "先确认进程是否还活着（systemctl status / ps），必要时重启并保留现场",
+        "看磁盘与内存（df -h、free -m）：满了先腾空间，别直接删日志或状态库",
+        "把本报告文件与本机日志一起留档，再动配置",
+    ),
+    Severity.HIGH: (
+        "按首段「可能原因」定位组件，先只读复现一次（合成一行日志探针即可）",
+        "确认影响面：只有该组件降级，还是整条告警链路失效",
+        "改配置前先备份（状态库 + plugin_data），改完按 runbook 的重载步骤生效",
+    ),
+    Severity.MEDIUM: (
+        "先观察是否自愈（多数是可恢复抖动）；同一指纹连续出现再看报告文件",
+    ),
+}
 
 
 @dataclass
@@ -101,6 +139,8 @@ class DeliverConfig:
     max_chars_per_message: int = 0
     node_chars: int = _FORWARD_CHUNK_CHARS
     allow_digest_direct: bool = False
+    #: 首段（诊断文本）的硬上限：与通道 max_chars 取小；超长就压缩诊断而不是切段。
+    head_max_chars: int = 1200
 
 
 @dataclass
@@ -239,6 +279,222 @@ def render_alert_card(
     return "\n".join(header)
 
 
+@dataclass
+class ReportSpec:
+    """本轮告警报告的元信息（文件由 main 写入，这里只描述它，便于渲染与测试）。
+
+    ``mode`` 是**内容口径**，会写进首段与文件名说明里，取证时一眼能看出这份文件装的是
+    「本轮命中段」还是「整份日志」（Q3 裁定=A：默认 excerpt，``report.raw_mode=file`` 才整份）。
+    """
+
+    path: str = ""
+    name: str = ""
+    mode: str = "excerpt"
+    size: int = 0
+    lines: int = 0
+    truncated: bool = False
+    keep_days: int = 7
+
+    @property
+    def mode_text(self) -> str:
+        """人读的口径说明（进首段与文件首行）。"""
+        return "整份日志（raw_mode=file）" if self.mode == "file" else "本轮命中段（含前后文，逐字）"
+
+    def size_text(self) -> str:
+        """把字节数渲染成人读体积。"""
+        size = max(0, int(self.size or 0))
+        if size >= 1024 * 1024:
+            return f"{size / 1024 / 1024:.1f} MiB"
+        if size >= 1024:
+            return f"{size / 1024:.0f} KiB"
+        return f"{size} 字节"
+
+
+def diagnosis_kind(verdict: ThreatVerdict) -> str:
+    """诊断来源分派：``llm`` | ``manual`` | ``degraded`` | ``local``。
+
+    fail-closed：只有 ``judged=True`` **且** ``judge_source="llm"`` 才算「模型判定」；
+    其余一律按未判定处理（宁可写「未取得模型诊断」，也不能把本地规则冒充模型结论）。
+    人工覆写（manual 条目）单独一类：它不是模型说的，也不该被渲染成模型诊断。
+    """
+    source = str(getattr(verdict, "judge_source", "") or "")
+    tags = [str(tag) for tag in (verdict.tags or [])]
+    if source == "manual" or verdict.source == "manual" or "manual-override" in tags:
+        return "manual"
+    if bool(getattr(verdict, "judged", False)) and source == "llm":
+        return "llm"
+    if source == "degraded" or verdict.source == "degraded" or any(
+        tag.startswith("degraded:") for tag in tags
+    ):
+        return "degraded"
+    return "local"
+
+
+def _degraded_reason(verdict: ThreatVerdict) -> str:
+    """降级原因（用 T3 定的 ``degraded:*`` 枚举，不自己编新串）。"""
+    for tag in verdict.tags or []:
+        text = str(tag)
+        if text.startswith("degraded:"):
+            return text
+    return "degraded:unknown"
+
+
+def _one_line(text: object, max_chars: int = DIAGNOSIS_MAX_CHARS) -> str:
+    """单行化 + 中性化 + 截断（模型/日志文本进聊天前的唯一处理，复用 classify 的实现）。"""
+    return neutralize_untrusted(str(text or ""), max_chars=max(0, int(max_chars)), single_line=True)
+
+
+def should_fix_text(severity: Severity) -> str:
+    """「是否建议修复」的固定文案（只看等级，不听模型）。"""
+    level = Severity.parse(severity)
+    if level is Severity.CRITICAL:
+        return "建议立即人工修复（先止损并保留现场）"
+    if level is Severity.HIGH:
+        return "建议尽快人工修复（先只读复现，再改配置）"
+    if level is Severity.MEDIUM:
+        return "建议先观察；确认可复现后再修"
+    return "暂不建议修复（仅存档，供比对）"
+
+
+def advice_text(severity: Severity) -> str:
+    """「修复建议」的第一条（来自静态清单；没有对应等级就给通用建议）。"""
+    items = HANDLING_CHECKLIST.get(Severity.parse(severity)) or ()
+    return items[0] if items else "暂不需要处置；持续出现再按报告文件里的原始行定位"
+
+
+def render_diagnosis(verdict: ThreatVerdict, *, max_chars: int = DIAGNOSIS_MAX_CHARS) -> str:
+    """诊断段（固定三段）：可能原因 / 是否建议修复 / 修复建议。
+
+    首行永远回答「这话是谁说的」：
+    - 模型判定 ⇒ ``—— 诊断（模型判定｜置信度 0.82）——``；
+    - 无模型诊断 ⇒ **首行逐字** ``本地规则判定，未取得模型诊断``（带 ``degraded:*`` 原因）；
+    - 人工覆写 ⇒ 首行 ``人工覆写（非模型判定）``。
+
+    Args:
+        verdict: 分级结论（读 ``judged`` / ``judge_source`` / ``reason`` / ``tags``）。
+        max_chars: 「可能原因」的单行上限（超长压进报告文件，绝不撑破首段）。
+
+    Returns:
+        诊断段文本（不含首段头部；由 :func:`build_send_plan` 拼装）。
+    """
+    level = Severity.parse(verdict.severity)
+    kind = diagnosis_kind(verdict)
+    reason = _one_line(verdict.reason, max_chars)
+    lines: list[str] = []
+    if kind == "llm":
+        lines.append(f"—— 诊断（模型判定｜置信度 {float(verdict.confidence or 0.0):.2f}）——")
+    elif kind == "manual":
+        lines.append(NO_MODEL_MANUAL)
+    elif kind == "degraded":
+        lines.append(f"{NO_MODEL_LOCAL}（{_degraded_reason(verdict)}）")
+    else:
+        lines.append(NO_MODEL_LOCAL)
+    lines.append(f"可能原因：{reason or '（未给出原因，见原始日志）'}")
+    lines.append(f"是否建议修复：{should_fix_text(level)}")
+    lines.append(f"修复建议：{advice_text(level)}")
+    return "\n".join(lines)
+
+
+def render_alert_head(block, verdict: ThreatVerdict, *, repeat_count: int = 0) -> str:
+    """首段的「头」（短，只放可核对的事实；命中行与长理由都进报告文件）。"""
+    if block is None:  # 兜底：没有片段时也要能发出「最小首段」，不许抛异常
+        return "\n".join(
+            [
+                f"【AstrBot 日志告警｜{verdict.severity.value}】",
+                f"指纹：{verdict.fingerprint or '（无）'}",
+            ]
+        )
+    lines_src = block_lines(block)
+    found = levels_in(lines_src) or ["未知等级"]
+    first_hit = block.hit_indices[0] if block.hit_indices else -1
+    last_hit = block.hit_indices[-1] if block.hit_indices else -1
+    start = (
+        parse_timestamp(block.lines[first_hit]) if 0 <= first_hit < len(block.lines) else None
+    )
+    end = parse_timestamp(block.lines[last_hit]) if 0 <= last_hit < len(block.lines) else None
+    header = [
+        f"【AstrBot 日志告警｜{verdict.severity.value}】",
+        f"命中 {block.hit_count} 条 {'/'.join(found)}（本轮 {len(block.lines)} 行）",
+    ]
+    if start:
+        header.append(f"时间：{start}" if start == end or not end else f"时间：{start} ~ {end}")
+    if block.source:
+        header.append(f"来源：{block.source.rsplit('/', 1)[-1]}")
+    facts: list[str] = []
+    if verdict.component:
+        facts.append(f"组件：{verdict.component}")
+    if verdict.fingerprint:
+        times = max(1, int(repeat_count or 0) + 1)
+        facts.append(f"指纹：{verdict.fingerprint[:12]}（第 {times} 次命中）")
+    if facts:
+        header.append(" ｜ ".join(facts))
+    return "\n".join(header)
+
+
+def render_checklist(verdict: ThreatVerdict) -> str:
+    """HIGH/CRITICAL 的静态人工处置清单（空串 = 该等级不需要）。"""
+    items = HANDLING_CHECKLIST.get(Severity.parse(verdict.severity)) or ()
+    if not items:
+        return ""
+    lines = ["—— 人工处置清单（静态表，非模型生成）——"]
+    lines.extend(f"{index}. {item}" for index, item in enumerate(items, start=1))
+    return "\n".join(lines)
+
+
+def render_report_section(spec: ReportSpec | None, *, attached: bool) -> str:
+    """「原始日志」段：附件形态只报文件名，文本兜底必须写清本机路径。"""
+    if spec is None or not str(getattr(spec, "path", "") or ""):
+        return ""
+    tail = f"{spec.mode_text}｜保留 {int(spec.keep_days)} 天"
+    if spec.truncated:
+        tail += "｜超限已截断（保留头尾）"
+    if attached:
+        name = spec.name or str(spec.path).rsplit("/", 1)[-1]
+        return f"—— 原始日志 ——\n{name}（{spec.size_text()}｜{tail}）"
+    return (
+        f"—— 原始日志 ——\n完整日志见 {spec.path}\n"
+        f"（本机路径，该通道不支持文件附件；{tail}）"
+    )
+
+
+def _report_body(
+    verdict: ThreatVerdict,
+    block,
+    spec: ReportSpec,
+    *,
+    attached: bool,
+    extra_note: str,
+    repeat_count: int,
+    max_chars: int,
+) -> str:
+    """拼出一条完整首段（头 + 诊断 + 清单 + 原始日志段 + 附加提示）。"""
+    parts = [render_alert_head(block, verdict, repeat_count=repeat_count)]
+    parts.append(render_diagnosis(verdict, max_chars=max_chars))
+    checklist = render_checklist(verdict)
+    if checklist:
+        parts.append(checklist)
+    section = render_report_section(spec, attached=attached)
+    if section:
+        parts.append(section)
+    if extra_note:
+        parts.append(extra_note)
+    return "\n".join(part for part in parts if part)
+
+
+def _fit_head(build, limit: int) -> str:
+    """把首段压进 ``limit``：先缩诊断，再硬截；**绝不切段**（切了就是用户抱怨的割裂感）。"""
+    cap = max(1, int(limit))
+    for chars in (DIAGNOSIS_MAX_CHARS, 240, 120, 40, 0):
+        text = build(chars)
+        if len(text) <= cap:
+            return text
+    text = build(0)
+    if len(text) <= cap:
+        return text
+    keep = max(0, cap - len(_HEAD_CLIP_NOTE))
+    return text[:keep] + _HEAD_CLIP_NOTE
+
+
 def split_text(text: str, max_chars: int) -> list[str]:
     """按行边界把长文本切成分片；超长单行硬切；不丢字符（除分片标记）。"""
     limit = max(1, int(max_chars))
@@ -300,20 +556,33 @@ def build_send_plan(
     excerpt: str = "",
     caps: ChannelCaps | None = None,
     extra_note: str = "",
+    report: ReportSpec | None = None,
+    allow_attachment: bool = True,
+    repeat_count: int = 0,
 ) -> SendPlan:
-    """按通道能力生成投递计划。
+    """按通道能力生成投递计划（v2.3.0：1 条诊断文本 + 1 个原始日志文件）。
+
+    两种形态：
+    1. **有报告文件**（``report`` 非空）：首段 = 头 + 诊断 + 处置清单 + 原始日志段；
+       ``chunks`` **永远只有 1 段**（超长就压缩诊断/硬截，绝不切段）；``caps.file`` 且
+       ``allow_attachment`` 时才带 1 个附件（Q4=A：只有主出口发文件）。
+    2. **无报告文件**（报告关闭 / 低等级 / 旧调用方）：沿用 v2.2.x 的内联摘录路径，
+       那时才允许 ``split_with_markers`` 分片（带「（i/n）」标记）—— 它是兜底，不是主路径。
 
     Args:
-        verdict: 分级结论（决定等级、指纹与文案）。
+        verdict: 分级结论（决定等级、指纹与诊断文案）。
         cfg: 投递形态配置。
         session: 目标会话（unified_msg_origin）。
-        block: 命中的日志片段（用于渲染告警头）。
-        excerpt: 摘录正文（已渲染好的文本；空串表示不附正文）。
+        block: 命中的日志片段（渲染首段头部）。
+        excerpt: 内联摘录正文（只在无报告文件的旧路径里用）。
         caps: 显式覆盖的通道能力（默认按 session 的平台推断）。
-        extra_note: 追加提示（如「本插件自身日志已屏蔽」或未送达积压说明）。
+        extra_note: 追加提示（未送达积压、自我回声屏蔽等）。
+        report: 报告文件元信息；给定时走新形态。
+        allow_attachment: 这个出口是否允许附件（Q4=A 只给主出口 True）。
+        repeat_count: 同指纹历史命中次数（首段写「第 N 次」）。
 
     Returns:
-        SendPlan；kind 为 `text` / `forward` / `skip`，chunks 为空时调用方不得发送。
+        SendPlan；``kind`` 为 ``text`` / ``forward`` / ``skip``。
     """
     settings = cfg or DeliverConfig()
     target_caps = caps or caps_for(session_platform(session))
@@ -326,6 +595,70 @@ def build_send_plan(
     if verdict.route is Route.DIGEST and not settings.allow_digest_direct:
         return SendPlan(session=session, kind="skip", reason="路由 digest：由摘要聚合发送")
 
+    if not target_caps.plain:
+        return SendPlan(
+            session=session,
+            kind="skip",
+            degradation=notes,
+            reason=f"通道 {target_caps.platform} 不支持纯文本",
+        )
+
+    limit = (
+        int(settings.max_chars_per_message)
+        if int(settings.max_chars_per_message) > 0
+        else int(target_caps.max_chars)
+    )
+    has_report = bool(report is not None and str(getattr(report, "path", "") or ""))
+
+    if has_report:
+        attach_ok = bool(target_caps.file and allow_attachment)
+        if not attach_ok:
+            if not target_caps.file:
+                notes.append(
+                    f"通道 {target_caps.platform} 不支持文件段："
+                    "完整日志改用本机路径提示（不发附件）"
+                )
+            else:
+                notes.append("非主出口不发文件（Q4=A：群/备用出口只发文本）")
+        head_limit = limit
+        if int(settings.head_max_chars) > 0:
+            head_limit = min(limit, int(settings.head_max_chars))
+
+        def build(chars: int) -> str:
+            return _report_body(
+                verdict,
+                block,
+                report,
+                attached=attach_ok,
+                extra_note=extra_note,
+                repeat_count=repeat_count,
+                max_chars=chars,
+            )
+
+        body = _fit_head(build, head_limit)
+        attachments: list[Attachment] = []
+        if attach_ok:
+            name = str(report.name or str(report.path).rsplit("/", 1)[-1])
+            attachments.append(
+                Attachment(path=str(report.path), name=name, size=int(report.size or 0))
+            )
+        if not body and not attachments:
+            return SendPlan(
+                session=session, kind="skip", degradation=notes, reason="没有可发送的内容"
+            )
+        return SendPlan(
+            session=session,
+            kind="text",
+            chunks=[body] if body else [],
+            attachments=attachments,
+            degradation=notes,
+            reason=(
+                f"{target_caps.platform}：诊断文本"
+                + ("+文件" if attachments else "（无附件）")
+            ),
+        )
+
+    # ---------------- 旧内联路径（报告关闭 / 低等级 / 旧调用方） ----------------
     card = ""
     if block is not None:
         card = render_alert_card(block, verdict)
@@ -352,19 +685,6 @@ def build_send_plan(
                 f"通道 {target_caps.platform} 不支持合并转发（会静默丢失），已降级为文本"
             )
 
-    if not target_caps.plain:
-        return SendPlan(
-            session=session,
-            kind="skip",
-            degradation=notes,
-            reason=f"通道 {target_caps.platform} 不支持纯文本",
-        )
-
-    limit = (
-        int(settings.max_chars_per_message)
-        if int(settings.max_chars_per_message) > 0
-        else int(target_caps.max_chars)
-    )
     node_limit = limit if kind == "text" else max(1, int(settings.node_chars))
     chunks = split_with_markers(body, node_limit)
     if not chunks:
@@ -381,18 +701,25 @@ def build_send_plan(
 
 
 def degrade(plan: SendPlan) -> SendPlan:
-    """降级：只发一条最小纯文本摘要（丢掉长摘录与转发形态）。"""
+    """降级：只发一条最小纯文本摘要（丢掉长摘录、转发形态与附件）。
+
+    v2.3.0：**清空 attachments**（重试只发文本，避免"文件重发把失败放大"），但要把
+    「报告文件已经留在本机」写进降级提示 —— 否则运营方只看到摘要，不知道完整内容在哪。
+    """
+    notes = list(plan.degradation)
+    if plan.attachments:
+        name = plan.attachments[0].name or plan.attachments[0].path
+        notes.append(f"降级发送：仅保留摘要；报告文件已保留（{name}），可在本机查看")
+    else:
+        notes.append("降级发送：仅保留摘要，完整日志见 AstrBot 日志目录")
     if not plan.chunks:
         return SendPlan(
             session=plan.session,
             kind="skip",
-            degradation=list(plan.degradation) + ["无可降级内容"],
+            degradation=notes + ["无可降级内容"],
             reason=plan.reason,
         )
     head = plan.chunks[0][: _DEGRADED_CHARS].rstrip()
-    notes = list(plan.degradation) + [
-        "降级发送：仅保留摘要，完整摘录见 AstrBot 日志目录"
-    ]
     return SendPlan(
         session=plan.session,
         kind="text",

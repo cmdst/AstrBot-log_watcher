@@ -258,19 +258,64 @@ class ChannelCaps:
 
 
 @dataclass
+class Attachment:
+    """一个待发送的文件段（v2.3.0：告警报告 = 首段诊断 + 原始日志文件）。
+
+    为什么不直接存 ``Path``：这形状要进待发重试队列（``pending_delivery.attachments``
+    存 JSON），必须可序列化、可跨进程还原；``path`` 用绝对路径，``name`` 是聊天里
+    显示的文件名（也是回执里写给人看的那个名字）。
+    """
+
+    path: str = ""
+    name: str = ""
+    kind: str = "file"
+    size: int = 0
+
+    def to_dict(self) -> dict:
+        """序列化（重试队列用）。"""
+        return {
+            "path": self.path,
+            "name": self.name,
+            "kind": self.kind,
+            "size": int(self.size),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: object) -> Attachment | None:
+        """从 dict 还原；没有 path 的一律丢弃（空附件不许进计划）。"""
+        if not isinstance(raw, dict):
+            return None
+        path = str(raw.get("path") or "").strip()
+        if not path:
+            return None
+        return cls(
+            path=path,
+            name=str(raw.get("name") or "").strip() or path.rsplit("/", 1)[-1],
+            kind=str(raw.get("kind") or "file"),
+            size=int(raw.get("size") or 0),
+        )
+
+
+@dataclass
 class SendPlan:
-    """一次投递计划：由通道能力决定段型，失败后可降级重发。"""
+    """一次投递计划：由通道能力决定段型，失败后可降级重发。
+
+    v2.3.0：除文本分片外还可带**文件附件**（``attachments``）。``empty`` 必须同时看
+    两者 —— 只有附件没有文本的计划也是有效计划（反过来则沿用旧语义）。
+    """
 
     session: str = ""
     kind: str = "text"
     chunks: list[str] = field(default_factory=list)
     degradation: list[str] = field(default_factory=list)
     reason: str = ""
+    #: 附件段（顺序即发送顺序，文本之后）。只有 ``caps.file`` 且允许附件的出口才会非空。
+    attachments: list[Attachment] = field(default_factory=list)
 
     @property
     def empty(self) -> bool:
-        """没有任何可分发的段时为 True（不允许产生空节点）。"""
-        return not self.chunks
+        """没有任何可分发的段（文本与附件都空）时为 True。"""
+        return not self.chunks and not self.attachments
 
 
 @dataclass
@@ -282,3 +327,7 @@ class DeliveryOutcome:
     attempts: int = 0
     degraded: bool = False
     error: str = ""
+    #: 附件（文件段）的结果：``None`` = 本计划没有附件；``True/False`` = 发成功/发失败。
+    file_ok: bool | None = None
+    #: 文本已送达、附件失败 ⇒ ``partial=True``（算送达，但要记一笔；不整条重试）。
+    partial: bool = False

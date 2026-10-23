@@ -339,10 +339,10 @@ def _run_status(db, run_id: str) -> str | None:
     return None if row is None else str(row[0])
 
 
-def test_sqlite_open_creates_schema_v3(tmp_path):
+def test_sqlite_open_creates_schema_v4(tmp_path):
     db = _sqlite(tmp_path)
     assert db.available and db.writable
-    assert db.schema_version == store.SCHEMA_VERSION == 3
+    assert db.schema_version == store.SCHEMA_VERSION == 4
     assert db.path.exists()
     # v2.3.0：`remediation_runs` 仍在建（历史审计证据，只留不写）
     for table in ("meta", "file_progress", "pattern_kb", "alerts", "rate_windows",
@@ -354,11 +354,11 @@ def test_sqlite_open_creates_schema_v3(tmp_path):
 def test_sqlite_migrate_is_idempotent(tmp_path):
     path = tmp_path / "log_watcher.sqlite3"
     first = store.SqliteStore(path).open()
-    assert first.migrate() == 3
-    assert first.migrate() == 3
+    assert first.migrate() == 4
+    assert first.migrate() == 4
     first.close()
     second = store.SqliteStore(path).open()
-    assert second.schema_version == 3 and second.writable
+    assert second.schema_version == 4 and second.writable
     second.close()
 
 
@@ -692,7 +692,12 @@ def test_sqlite_exposes_contract_api_surface():
     ]
     still_there = [name for name in removed if hasattr(store.SqliteStore, name)]
     assert not still_there, f"v2.3.0 应已移除的账本方法仍在: {still_there}"
-    assert store.SqliteStore.SCHEMA_VERSION == 3
+    assert store.SqliteStore.SCHEMA_VERSION == 4
+    # v2.3.0 报告面：写入/截断/清理/占用的纯函数与类，都必须可调用
+    for name in ("clip_report",):
+        assert callable(getattr(store, name, None)), f"store 缺 {name}"
+    for name in ("write", "prune", "usage", "report_name"):
+        assert callable(getattr(store.ReportStore, name, None)), f"ReportStore 缺 {name}"
     assert isinstance(store.SqliteStore.schema_version, property)
 
 
@@ -847,7 +852,7 @@ def test_sqlite_migrates_v2_db_and_adds_judge_columns(tmp_path):
     conn.close()
 
     db = store.SqliteStore(path).open()
-    assert db.schema_version == 3 and db.writable
+    assert db.schema_version == 4 and db.writable
     assert db.kb_lookup("fp-old")["judge_source"] == ""
     assert db.kb_lookup("fp-old")["last_judged_at"] == 0.0
     conn = sqlite3.connect(path)
@@ -856,6 +861,13 @@ def test_sqlite_migrates_v2_db_and_adds_judge_columns(tmp_path):
     finally:
         conn.close()
     db.close()
+    # v3 → v4：报告面两列（attachments / report_path）必须补上且默认空
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("SELECT report_path FROM alerts").fetchone() == ("",)
+        assert conn.execute("SELECT attachments FROM pending_delivery LIMIT 1").fetchall() == []
+    finally:
+        conn.close()
 
 
 def test_sqlite_prune_uses_prior_ttl_for_kb(tmp_path):
@@ -879,3 +891,133 @@ def test_sqlite_prune_uses_prior_ttl_for_kb(tmp_path):
     assert removed == 1
     assert db.kb_lookup("fp-stale") is None and db.kb_lookup("fp-recent") is not None
     db.close()
+
+
+# ---------- v2.3.0 报告面：附件队列 / 报告文件 ----------
+
+
+def test_pending_roundtrip_keeps_attachments(tmp_path):
+    """重试队列必须能把报告文件再发一次（attachments 跨进程可还原）。"""
+    db = _sqlite(tmp_path)
+    now = time.time()
+    item = store.PendingItem(
+        session="aiocqhttp:FriendMessage:1",
+        item_id="i1",
+        chunks=["首段诊断"],
+        text="首段诊断",
+        fingerprint="fp",
+        severity="HIGH",
+        created_at=now,
+        next_at=now,
+        attachments=[
+            {"path": "/tmp/alert-20261023-060112-HIGH-deadbeef.log",
+             "name": "alert-20261023-060112-HIGH-deadbeef.log", "kind": "file", "size": 12}
+        ],
+    )
+    db.pending_add(item)
+    due = db.pending_due(now + 1)
+    assert len(due) == 1
+    assert due[0].attachments[0]["name"] == "alert-20261023-060112-HIGH-deadbeef.log"
+    db.pending_update("i1", state="sent")
+    assert db.pending_due(now + 1) == []
+    db.close()
+
+
+def test_pending_item_without_attachments_defaults_to_empty_list(tmp_path):
+    """老库/老条目（v4 之前）读出来必须是空列表，而不是 None（调用方直接遍历）。"""
+    db = _sqlite(tmp_path)
+    now = time.time()
+    db.pending_add(
+        store.PendingItem(
+            session="aiocqhttp:FriendMessage:1",
+            item_id="old",
+            chunks=["x"],
+            text="x",
+            fingerprint="fp-old",
+            created_at=now,
+            next_at=now,
+        )
+    )
+    due = db.pending_due(now + 1)
+    assert due and due[0].attachments == []
+    db.close()
+
+
+def test_record_alerts_persists_report_path(tmp_path):
+    db = _sqlite(tmp_path)
+    db.record_alerts(
+        [{"ts": 1.0, "fingerprint": "fp", "report_path": "/x/reports/alert-a.log"}]
+    )
+    conn = sqlite3.connect(db.path)
+    try:
+        row = conn.execute("SELECT report_path FROM alerts").fetchone()
+    finally:
+        conn.close()
+    assert row == ("/x/reports/alert-a.log",)
+    db.close()
+
+
+def test_report_store_naming_collision_and_truncation(tmp_path):
+    """验收 5：命名可追溯（时间/等级/指纹 8 位）、同秒冲突加后缀、超限保留头尾并写明截断。"""
+    reports = store.ReportStore(tmp_path, keep_days=7, max_files=5, max_bytes=256)
+    path = reports.write(
+        "HEAD-ERROR\n" + ("x" * 5000) + "\nTAIL-EXIT-1",
+        severity="HIGH",
+        fingerprint="deadbeefcafebabe",
+        stamp="20261023-060112",
+    )
+    assert path.name == "alert-20261023-060112-HIGH-deadbeef.log"
+    assert path.parent.name == "reports"
+    body = path.read_text(encoding="utf-8")
+    assert len(body.encode("utf-8")) <= 256
+    assert body.startswith("HEAD-ERROR"), "截断必须保留头部（异常类型/首个 traceback）"
+    assert body.endswith("TAIL-EXIT-1"), "截断必须保留尾部（最终报错/退出码）"
+    assert "已截断" in body and "字节" in body
+    again = reports.write(
+        "second", severity="HIGH", fingerprint="deadbeefcafebabe", stamp="20261023-060112"
+    )
+    assert again.name == "alert-20261023-060112-HIGH-deadbeef-2.log"
+    assert path.read_text(encoding="utf-8") == body, "同名冲突不得覆盖已有报告"
+
+
+def test_report_store_name_carries_only_level_and_fingerprint(tmp_path):
+    """文件名里不得出现会话串/主机名（它随附件进聊天）。"""
+    name = store.ReportStore.report_name("20261023-060112", "CRITICAL", "abcdef012345")
+    assert name == "alert-20261023-060112-CRITICAL-abcdef01.log"
+    assert store.ReportStore.report_name("20261023-060112", "HIGH", "") == (
+        "alert-20261023-060112-HIGH-nofp.log"
+    )
+
+
+def test_report_store_prunes_by_count_and_age(tmp_path):
+    reports = store.ReportStore(tmp_path, keep_days=1, max_files=3, max_bytes=1024)
+    for index in range(6):
+        reports.write("z", severity="LOW", fingerprint=f"fp{index}", stamp=f"2026102{index}-010101")
+    assert len(list((tmp_path / "outbox" / "reports").glob("*.log"))) == 3
+    # 年龄：把一条的 mtime 拨到 3 天前，再剪一次必须被删
+    victim = sorted((tmp_path / "outbox" / "reports").glob("*.log"))[0]
+    old = time.time() - 3 * 86400
+    os.utime(victim, (old, old))
+    removed = reports.prune(now=time.time())
+    assert removed["files"] >= 1 and not victim.exists()
+    assert reports.usage()["files"] <= 3
+
+
+def test_clip_report_keeps_head_and_tail_with_marker():
+    out, truncated, dropped = store.clip_report("A" * 4000 + "Z" * 10, 300)
+    assert truncated and dropped > 0
+    assert len(out.encode("utf-8")) <= 300
+    assert out.startswith("A") and out.endswith("Z")
+    assert "已截断" in out
+    assert store.clip_report("small", 1024) == ("small", False, 0)
+    assert store.clip_report("x" * 10, 0) == ("x" * 10, False, 0)
+
+
+def test_report_store_write_failure_raises_oserror(tmp_path):
+    """写不出来必须抛 OSError（main 捕获后打 WARNING 并回落文本），不许静默吞掉。"""
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "outbox").write_text("占位成文件，让 mkdir 必然失败", encoding="utf-8")
+    reports = store.ReportStore(blocked)
+    with pytest.raises(OSError):
+        reports.write("body", severity="HIGH", fingerprint="fp")

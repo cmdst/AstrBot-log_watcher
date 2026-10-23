@@ -23,12 +23,13 @@ from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import Node, Nodes, Plain
+from astrbot.api.message_components import File, Node, Nodes, Plain
 from astrbot.api.star import Context, Star, StarTools
 
 from . import config_map, deliver, detect, store
 from .log_reader import block_lines, new_lines, normalize_levels, render_lines
 from .models import (
+    Attachment,
     DeliveryOutcome,
     LogBlock,
     Route,
@@ -115,6 +116,13 @@ class LogWatcherPlugin(Star):
                 1024 * 1024 * 1024,
             ),
         )
+        report_cfg = self._report_config()
+        self.reports = store.ReportStore(
+            self.data_dir,
+            keep_days=report_cfg["keep_days"],
+            max_files=report_cfg["max_files"],
+            max_bytes=report_cfg["max_file_bytes"],
+        )
         self.gate = detect.NotifyGate(self.counters, self._gate_config())
         self.retry_policy = deliver.RetryPolicy(
             max_attempts=_as_int(self.cfg.get("delivery.max_attempts", 4), 4, 1, 20),
@@ -174,7 +182,10 @@ class LogWatcherPlugin(Star):
             f"（{'/'.join(sorted({str(item) for item in caps.values()})) or '未配置'}）；"
             f"状态 {state}，分级 {self._classify_mode()}"
             f"（provider {'已配置' if self._classify_provider_id() else '未配置'}），"
-            f"知识库 {kb_state}；{self.disk.report()}"
+            f"知识库 {kb_state}；报告 "
+            f"{'开启' if report_cfg['enabled'] else '关闭'}"
+            f"（{report_cfg['raw_mode']}，≥{report_cfg['min_severity']}）；"
+            f"{self.disk.report()}"
         )
         if backlog.get("active") or backlog.get("abandoned"):
             logger.info(
@@ -698,6 +709,7 @@ class LogWatcherPlugin(Star):
         now: float,
         excerpt_path: str,
         excerpt_lines: int,
+        report_path: str = "",
     ) -> None:
         """R6：每一条被抑制/聚合/放行的命中都留痕（计数器 + 入库）。"""
         self._round_alerts.append(
@@ -719,6 +731,7 @@ class LogWatcherPlugin(Star):
                 # 不再靠 tags 里混写的 llm / local:* 反推（AGENTS.md §4 的误读教训）。
                 "judged": 1 if verdict.judged else 0,
                 "judge_source": verdict.judge_source or "",
+                "report_path": report_path,
             }
         )
 
@@ -742,6 +755,144 @@ class LogWatcherPlugin(Star):
             self._round_excerpt = None
             logger.warning(f"{self._plat()}写摘录存档失败（不影响发送）: {exc!r}")
         return text
+
+    # ---------- 告警报告（v2.3.0：首段诊断 + 原始日志文件） ----------
+
+    def _report_config(self) -> dict:
+        """`report.*` 七键的内部形状（R4 白名单：插件键 → 模块可用的值）。"""
+        mode = str(self.cfg.get("report.raw_mode") or "excerpt").strip().lower()
+        if mode not in {"excerpt", "file"}:
+            logger.warning(
+                f"{self._plat()}report.raw_mode={mode!r} 非法（只认 excerpt/file），"
+                "已回落 excerpt"
+            )
+            mode = "excerpt"
+        return {
+            "enabled": bool(self.cfg.get("report.enabled", True)),
+            "min_severity": str(self.cfg.get("report.min_severity") or "MEDIUM"),
+            "raw_mode": mode,
+            "max_file_bytes": _as_int(
+                self.cfg.get("report.max_file_bytes", 512 * 1024),
+                512 * 1024,
+                4096,
+                16 * 1024 * 1024,
+            ),
+            "keep_days": _as_int(self.cfg.get("report.keep_days", 7), 7, 1, 3650),
+            "max_files": _as_int(self.cfg.get("report.max_files", 200), 200, 1, 100000),
+            "head_max_chars": _as_int(
+                self.cfg.get("report.head_max_chars", 1200), 1200, 300, 4000
+            ),
+        }
+
+    def _report_enabled_for(self, verdict: ThreatVerdict) -> bool:
+        """这个等级要不要生成报告文件（低于 `report.min_severity` 走旧的内联摘录）。"""
+        cfg = self._report_config()
+        if not cfg["enabled"]:
+            return False
+        floor = _as_int(detect.severity_rank(cfg["min_severity"]), 2, 0, 4)
+        return detect.severity_rank(verdict.severity) >= floor
+
+    def _read_log_tail(self, path: str, cap: int) -> str:
+        """读整份日志（`raw_mode=file`）：文件过大时只取末尾并在正文里写明。"""
+        try:
+            file = Path(path)
+            size = file.stat().st_size
+        except OSError as exc:
+            return f"（读取失败：{type(exc).__name__}: {exc}）"
+        read_bytes = max(1024, int(cap) * 3)
+        head = ""
+        try:
+            with file.open("rb") as handle:
+                if size > read_bytes:
+                    handle.seek(size - read_bytes)
+                    head = (
+                        f"……（文件共 {size} 字节，仅取末尾 {read_bytes} 字节；"
+                        "需要全文请直接看本机文件）……\n"
+                    )
+                text = handle.read(read_bytes).decode("utf-8", errors="ignore")
+        except OSError as exc:
+            return f"（读取失败：{type(exc).__name__}: {exc}）"
+        return head + text
+
+    def _report_text(self, blocks: list[LogBlock], verdict: ThreatVerdict, now: float) -> str:
+        """拼报告正文：口径写在**首行**（Q3=A：默认本轮命中段，`raw_mode=file` 才是整份）。"""
+        cfg = self._report_config()
+        mode = cfg["raw_mode"]
+        moment = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        hits = sum(block.hit_count for block in blocks)
+        lines = sum(len(block.lines) for block in blocks)
+        sources = sorted({block.source for block in blocks if block.source})
+        head = [
+            f"# 告警报告｜{verdict.severity.value}｜指纹 {verdict.fingerprint or '（无）'}",
+            "# 内容："
+            + ("整份日志（report.raw_mode=file）" if mode == "file"
+               else "本轮命中段（含前后文，逐字；report.raw_mode=excerpt）"),
+            f"# 生成：{moment}｜命中 {hits} 条（本轮 {lines} 行）"
+            f"｜判定：{verdict.judge_source or 'local'}"
+            f"｜judged={'是' if verdict.judged else '否'}",
+            f"# 来源：{', '.join(sources) or '（未知）'}",
+        ]
+        body: list[str] = []
+        if mode == "file":
+            for path in sources or [""]:
+                body.append(f"# ── 文件 {path or '（无路径）'}（整份）──")
+                body.append(self._read_log_tail(path, cfg["max_file_bytes"]) if path else "（无路径）")
+        else:
+            for block in blocks:
+                body.append(
+                    f"# ── 片段 {block.source or '（未知文件）'}:{block.start_line or '?'}"
+                    f"（命中 {block.hit_count} 条｜逐字，不作字符截断）──"
+                )
+                body.extend(text for text, _level in block_lines(block))
+        tail = [
+            "",
+            f"# 说明：本文件由 {PLUGIN_NAME} 生成并保留 {cfg['keep_days']} 天；"
+            "文件名含时间/等级/指纹前 8 位，可按 ls 直接定位。",
+        ]
+        return "\n".join([*head, "", *body, *tail, ""])
+
+    def _write_report(
+        self, blocks: list[LogBlock], verdict: ThreatVerdict, now: float
+    ) -> deliver.ReportSpec | None:
+        """写本轮报告文件；失败**不抛异常**（打 WARNING 并回落文本兜底）。"""
+        cfg = self._report_config()
+        try:
+            text = self._report_text(blocks, verdict, now)
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+            path = self.reports.write(
+                text,
+                severity=verdict.severity,
+                fingerprint=verdict.fingerprint,
+                stamp=stamp,
+                mode=cfg["raw_mode"],
+            )
+            size = path.stat().st_size
+        except OSError as exc:
+            logger.warning(
+                f"{self._plat()}写告警报告失败（改发文本并给出本机路径）："
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+        _clipped, truncated, dropped = store.clip_report(text, cfg["max_file_bytes"])
+        if truncated:
+            logger.info(
+                f"{self._plat()}报告超上限已截断：{path.name}（丢弃 {dropped} 字节，保留头尾）"
+            )
+        return deliver.ReportSpec(
+            path=str(path),
+            name=path.name,
+            mode=cfg["raw_mode"],
+            size=size,
+            lines=text.count("\n") + 1,
+            truncated=truncated,
+            keep_days=cfg["keep_days"],
+        )
+
+    def _stamp_report_path(self, verdict: ThreatVerdict, spec: deliver.ReportSpec) -> None:
+        """把报告路径写回本轮台账行（`alerts.report_path`），便于事后按台账取证。"""
+        for row in self._round_alerts:
+            if row.get("fingerprint") == verdict.fingerprint and not row.get("report_path"):
+                row["report_path"] = spec.path
 
     async def _deliver_round(
         self, sendable: list[tuple[LogBlock, ThreatVerdict]], excerpt: str, now: float
@@ -774,15 +925,30 @@ class LogWatcherPlugin(Star):
                 f"最近 {backlog.get('window_hours', 24):g} 小时未送达："
                 f"{'、'.join(counts)}{tail}（见 plugin_data/{PLUGIN_NAME}）"
             )
+        # v2.3.0：先落报告文件，再发「首段诊断 + 附件」；写失败就退回文本 + 本机路径
+        spec = None
+        if self._report_enabled_for(verdict):
+            spec = self._write_report([item[0] for item in sendable], verdict, now)
+            if spec is not None:
+                self._stamp_report_path(verdict, spec)
+        chain = deliver.outlet_order(self._sessions())
+        primary_outlet = chain[0] if chain else ""
+        repeat_count = int(
+            (self._fingerprint_stats.get(verdict.fingerprint) or {}).get("repeat_count", 0)
+        )
         all_ok, outcomes, planned = await self._deliver_outlets(
             lambda session: deliver.build_send_plan(
                 verdict,
                 self._deliver_config(),
                 session,
                 block=block,
-                excerpt=excerpt,
+                excerpt="" if spec is not None else excerpt,
                 caps=self._caps_for(session),
                 extra_note=note,
+                report=spec,
+                # Q4=A：只有主出口发文件；群/备用出口只发文本（群文件上传未实测）
+                allow_attachment=bool(primary_outlet) and session == primary_outlet,
+                repeat_count=repeat_count,
             ),
             "日志提醒",
         )
@@ -805,10 +971,21 @@ class LogWatcherPlugin(Star):
             self._bump_delta("delivery_failed")
             session, plan = planned[0]
             await self._enqueue_failure(session, plan, verdict, outcomes[-1], now)
+        partials = [item for item in outcomes if getattr(item, "partial", False)]
+        for item in partials:
+            # 文本到了、文件没到：算送达但要留痕（运维看到这条就知道附件该去本机找）
+            logger.warning(
+                f"{self._plat(item.session)}报告文件未送达（首段文本已发）：{item.error}"
+            )
+        if partials:
+            self.counters.bump("delivery_partial")
+            self._bump_delta("delivery_partial")
         logger.info(
             f"{self._plat()}命中 {hits} 条日志（{len(sendable)} 段），"
             f"出口 {len(self._sessions())} 个（尝试 {len(outcomes)} 次），"
             f"成功：{'是' if all_ok else '否'}"
+            + (f"，报告 {spec.name}（{spec.size_text()}）" if spec is not None else "")
+            + (f"，附件部分失败 {len(partials)} 条" if partials else "")
         )
         if all_ok and self._round_excerpt is not None and self._excerpt_mode() != "file":
             # ledger_only：成功即回收（成功残留不留垃圾）；file 模式保留给人工取证
@@ -816,14 +993,19 @@ class LogWatcherPlugin(Star):
             self._round_excerpt = None
 
     async def _send_plan(self, session: str, plan: SendPlan) -> DeliveryOutcome:
-        """按计划投递：文本分片逐条发，转发形态组装一条 Nodes；返回结果不抛异常。"""
+        """按计划投递：先文本分片，再附件（v2.3.0 的报告文件）；返回结果不抛异常。
+
+        附件失败**不**把整条判成失败：文本已经到手，再整条重试只会重复打扰；此时
+        ``file_ok=False`` + ``partial=True`` + 一行 WARNING，让运维知道「附件该去本机找」。
+        """
         outcome = DeliveryOutcome(session=session, attempts=1)
         chunks = [chunk for chunk in plan.chunks if str(chunk).strip()]
-        if not chunks:
+        attachments = [item for item in (plan.attachments or []) if item.path]
+        if not chunks and not attachments:
             outcome.error = "没有非空片段，放弃发送（避免空节点）"
             return outcome
         try:
-            if plan.kind == "forward" and len(chunks) <= _MAX_FORWARD_NODES:
+            if chunks and plan.kind == "forward" and len(chunks) <= _MAX_FORWARD_NODES:
                 chain = MessageChain(
                     chain=[
                         Nodes(
@@ -842,7 +1024,7 @@ class LogWatcherPlugin(Star):
                     outcome.error = f"找不到会话 {deliver.mask_session(session)} 对应的平台"
                     return outcome
             else:
-                if plan.kind == "forward":
+                if chunks and plan.kind == "forward":
                     logger.warning(
                         f"{self._plat(session)}合并转发节点数 {len(chunks)} 超限，"
                         "退回文本分片发送"
@@ -858,6 +1040,25 @@ class LogWatcherPlugin(Star):
             outcome.error = f"{type(exc).__name__}: {exc}"
             return outcome
         outcome.ok = True
+        if not attachments:
+            return outcome
+        outcome.file_ok = True
+        for item in attachments:
+            name = item.name or str(item.path).rsplit("/", 1)[-1]
+            try:
+                sent = await self.context.send_message(
+                    session, MessageChain(chain=[File(name=name, file=item.path)])
+                )
+            except Exception as exc:
+                outcome.file_ok = False
+                outcome.partial = True
+                outcome.error = f"附件 {name} 发送失败: {type(exc).__name__}: {exc}"
+                return outcome
+            if not sent:
+                outcome.file_ok = False
+                outcome.partial = True
+                outcome.error = f"附件 {name} 发送失败：找不到会话/平台"
+                return outcome
         return outcome
 
     async def _deliver_outlets(self, build_plan, label: str):
@@ -939,6 +1140,7 @@ class LogWatcherPlugin(Star):
             created_at=now,
             next_at=now + deliver.next_delay(1, self.retry_policy),
             last_error=outcome.error,
+            attachments=[item.to_dict() for item in (plan.attachments or [])],
         )
         stored = await self._pending_add(item)
         self.counters.bump("delivery_failed")
@@ -960,8 +1162,16 @@ class LogWatcherPlugin(Star):
             text = item.text or _degraded_text("\n\n".join(item.chunks))
             if not degraded:
                 text = "\n\n".join(item.chunks) or item.text
+            restored: list[Attachment] = []
+            for raw_item in getattr(item, "attachments", []) or []:
+                attachment = Attachment.from_dict(raw_item)
+                if attachment is not None and Path(attachment.path).exists():
+                    restored.append(attachment)
             plan = SendPlan(
-                session=item.session, kind=item.kind or "text", chunks=[text or "（空内容）"]
+                session=item.session,
+                kind=item.kind or "text",
+                chunks=[text or "（空内容）"],
+                attachments=restored,
             )
             outcome = await self._send_plan(item.session, plan)
             if outcome.ok:
@@ -1201,6 +1411,7 @@ class LogWatcherPlugin(Star):
             max_chars_per_message=_as_int(
                 self.cfg.get("notify.max_chars_per_message", 0), 0, 0, _MAX_CHARS_PER_MESSAGE
             ),
+            head_max_chars=self._report_config()["head_max_chars"],
         )
 
     def _gate_config(self) -> detect.GateConfig:
@@ -1505,14 +1716,19 @@ class LogWatcherPlugin(Star):
             return
         self._disk_report_at = now
         removed = self.disk.prune(now)
+        pruned_reports = self.reports.prune(now)
         logger.info(
             f"{self._plat()}{self.disk.report(now)}；本轮清理 "
-            f"{removed['outbox'] + removed['failed']} 个文件"
+            f"{removed['outbox'] + removed['failed']} 个临时文件"
+            f"、{pruned_reports['files']} 个过期报告"
+            f"（报告目录 {self.reports.usage(now)['files']} 个 / 保留 "
+            f"{self._report_config()['keep_days']} 天）"
         )
 
     def disk_report(self) -> dict:
-        """当前占用报告（磁盘 + 状态库），供集成方与运行手册使用。"""
+        """当前占用报告（磁盘 + 报告目录 + 状态库），供集成方与运行手册使用。"""
         report = self.disk.usage()
+        report["reports"] = self.reports.usage()
         report["db"] = self.sqlite.usage() if self.sqlite is not None else {"available": False}
         return report
 

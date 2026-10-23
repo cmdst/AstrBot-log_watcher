@@ -300,19 +300,277 @@ def test_render_digest_and_burst():
     assert "12 条" in burst
 
 
-# ---------- 结构约束：不再存在 File 段构造点 ----------
+# ---------- 结构约束：File 段只允许在一个地方构造 ----------
 
 
-def test_no_file_segment_construction_in_runtime_modules():
+def test_file_segment_is_constructed_only_in_the_attachment_branch():
+    """v2.3.0：不再“所有通道都禁发文件”，改成“只有主出口的附件分支才构造 File 段”。
+
+    旧用例断言 main.py / deliver.py 里出现 `File(` 就红 —— 那是 weixin 时代的一刀切；
+    现在报告形态必须发文件，所以收窄成三条可核对的约束：
+    ① `File(` 在 main.py 里**只有 1 处**，且落在 `_send_plan` 的附件分支内；
+    ② deliver.py 一行都不许有（投递层只描述附件，不构造段）；
+    ③ 不支持文件的通道（weixin / qq_official）永远拿不到 attachments（见报告形态用例）。
+    """
     root = Path(__file__).resolve().parent.parent
-    for name in ("main.py", "deliver.py"):
-        source = (root / name).read_text(encoding="utf-8")
-        assert "File(" not in source, f"{name} 不得再构造 File 段"
-        assert not re.search(r"message_components\s+import[^\n]*\bFile\b", source), (
-            f"{name} 不得导入 File 段"
-        )
     main_source = (root / "main.py").read_text(encoding="utf-8")
-    assert "from astrbot.api.message_components import Node, Nodes, Plain" in main_source
+    assert "from astrbot.api.message_components import File, Node, Nodes, Plain" in main_source
+    assert main_source.count("File(") == 1, "main.py 只允许在附件分支构造一次 File 段"
+    send_plan = main_source.split("    async def _send_plan(", 1)[1].split("\n    async def ", 1)[0]
+    assert "File(" in send_plan, "File 段必须落在 _send_plan 里（唯一发送者）"
+    assert "item.path" in send_plan, "附件必须用绝对路径（File(file=…)）"
+    deliver_source = (root / "deliver.py").read_text(encoding="utf-8")
+    assert "File(" not in deliver_source, "deliver.py 不得构造 File 段"
+    assert not re.search(r"message_components\s+import[^\n]*\bFile\b", deliver_source)
+
+
+# ---------- v2.3.0 告警形态：1 条诊断文本 + 1 个原始日志文件 ----------
+
+REPORT_PATH = "/app/data/plugin_data/log_watcher/outbox/reports/alert-20261023-060112-HIGH-deadbeef.log"
+
+
+def _spec(**overrides) -> deliver.ReportSpec:
+    base = dict(
+        path=REPORT_PATH,
+        name="alert-20261023-060112-HIGH-deadbeef.log",
+        mode="excerpt",
+        size=38912,
+        lines=211,
+        truncated=False,
+        keep_days=7,
+    )
+    base.update(overrides)
+    return deliver.ReportSpec(**base)
+
+
+def _llm_verdict(
+    severity: models.Severity = models.Severity.HIGH, **overrides
+) -> models.ThreatVerdict:
+    verdict = _verdict(severity)
+    verdict.judged = True
+    verdict.judge_source = "llm"
+    verdict.reason = "数据库连接被占满：写入状态失败（sqlite3.OperationalError）"
+    for key, value in overrides.items():
+        setattr(verdict, key, value)
+    return verdict
+
+
+def test_aiocqhttp_private_plan_is_one_full_text_plus_one_file():
+    """验收 1：aiocqhttp 私聊 = 1 条诊断文本（不切段、无 1/N）+ 1 个文件段。"""
+    plan = deliver.build_send_plan(
+        _llm_verdict(),
+        deliver.DeliverConfig(),
+        "aiocqhttp:FriendMessage:2060958352",
+        block=_block(hits=2),
+        report=_spec(),
+        allow_attachment=True,
+        repeat_count=2,
+    )
+    assert plan.kind == "text"
+    assert len(plan.chunks) == 1, "首段必须单条发完，不允许再裂成 2~3 段"
+    cap = min(deliver.caps_for("aiocqhttp").max_chars, deliver.DeliverConfig().head_max_chars)
+    assert len(plan.chunks[0]) <= cap
+    assert not re.search(r"（\d+/\d+）", plan.chunks[0]), "主路径不得出现分片标记"
+    assert len(plan.attachments) == 1
+    attachment = plan.attachments[0]
+    assert attachment.path == REPORT_PATH and attachment.name.endswith(".log")
+    assert attachment.size == 38912
+    body = plan.chunks[0]
+    for token in (
+        "【AstrBot 日志告警｜HIGH】",
+        "第 3 次命中",
+        "可能原因：",
+        "是否建议修复：",
+        "修复建议：",
+        "—— 人工处置清单（静态表，非模型生成）——",
+        "—— 原始日志 ——",
+        "alert-20261023-060112-HIGH-deadbeef.log",
+        "本轮命中段",
+    ):
+        assert token in body, f"首段缺 {token}"
+
+
+def test_no_model_diagnosis_first_line_is_explicit():
+    """验收 2：无模型诊断时首行明示「本地规则判定，未取得模型诊断」，且不得伪装成模型结论。"""
+    verdict = _verdict()
+    verdict.source = "degraded"
+    verdict.judged = False
+    verdict.judge_source = "degraded"
+    verdict.tags = ["degraded:llm-budget"]
+    verdict.reason = "本地规则：database is locked"
+    diagnosis = deliver.render_diagnosis(verdict)
+    assert diagnosis.splitlines()[0].startswith(deliver.NO_MODEL_LOCAL)
+    assert "degraded:llm-budget" in diagnosis, "要用 T3 定的 degraded:* 枚举，不自造字符串"
+    assert "模型判定" not in diagnosis
+    plan = deliver.build_send_plan(
+        verdict,
+        deliver.DeliverConfig(),
+        "aiocqhttp:FriendMessage:1",
+        block=_block(),
+        report=_spec(),
+    )
+    assert deliver.NO_MODEL_LOCAL in plan.chunks[0]
+
+
+def test_manual_override_is_not_rendered_as_model_diagnosis():
+    verdict = _verdict()
+    verdict.source = "manual"
+    verdict.judged = False
+    verdict.judge_source = "manual"
+    verdict.tags = ["manual-override"]
+    diagnosis = deliver.render_diagnosis(verdict)
+    assert diagnosis.splitlines()[0] == deliver.NO_MODEL_MANUAL
+    assert "（模型判定｜" not in diagnosis, "人工覆写不得渲染成模型诊断"
+
+
+def test_diagnosis_structure_is_fixed_for_every_source():
+    """验收 2：三种来源都必须是「可能原因 / 是否建议修复 / 修复建议」三段。"""
+    degraded = _verdict()
+    degraded.source = "degraded"
+    degraded.judge_source = "degraded"
+    degraded.tags = ["degraded:llm-timeout"]
+    for verdict in (_llm_verdict(), degraded, _verdict()):
+        diagnosis = deliver.render_diagnosis(verdict)
+        for token in ("可能原因：", "是否建议修复：", "修复建议："):
+            assert token in diagnosis, f"{verdict.source} 缺固定段 {token}"
+
+
+def test_group_outlet_gets_text_and_path_but_no_file():
+    """验收 4（Q4=A）：文件只发主出口；群出口只发文本 + 本机路径。"""
+    plan = deliver.build_send_plan(
+        _llm_verdict(),
+        deliver.DeliverConfig(),
+        "aiocqhttp:GroupMessage:744868236",
+        block=_block(),
+        report=_spec(),
+        allow_attachment=False,
+    )
+    assert plan.attachments == [], "群出口不得发文件（群文件上传未实测）"
+    assert len(plan.chunks) == 1 and not re.search(r"（\d+/\d+）", plan.chunks[0])
+    assert "完整日志见 " + REPORT_PATH in plan.chunks[0]
+    assert any("非主出口不发文件" in note for note in plan.degradation)
+
+
+def test_channels_without_file_capability_never_get_attachments():
+    """验收 6：weixin/qq_official 零附件，单条文本 + 明确本机路径。"""
+    for session in (
+        "weixin_personal_demo:FriendMessage:x@im.wechat",
+        "qq_official:FriendMessage:1",
+    ):
+        plan = deliver.build_send_plan(
+            _llm_verdict(),
+            deliver.DeliverConfig(),
+            session,
+            block=_block(hits=2),
+            report=_spec(),
+            allow_attachment=True,
+        )
+        assert plan.attachments == [], f"{session} 不得出现 attachments"
+        assert len(plan.chunks) == 1, "无文件能力的通道也必须单条发完"
+        cap = deliver.caps_for(deliver.session_platform(session)).max_chars
+        assert len(plan.chunks[0]) <= cap
+        assert "完整日志见 " + REPORT_PATH in plan.chunks[0]
+        assert any("不支持文件段" in note for note in plan.degradation)
+
+
+def test_report_modes_are_stated_in_first_line_and_section():
+    """验收 3（Q3=A）：excerpt / file 两种口径都要在首行或段落里说清。"""
+    excerpt = deliver.build_send_plan(
+        _llm_verdict(), None, "aiocqhttp:FriendMessage:1", block=_block(), report=_spec()
+    )
+    assert "本轮命中段" in excerpt.chunks[0]
+    raw = deliver.build_send_plan(
+        _llm_verdict(),
+        None,
+        "aiocqhttp:FriendMessage:1",
+        block=_block(),
+        report=_spec(mode="file"),
+    )
+    assert "整份日志（raw_mode=file）" in raw.chunks[0]
+    assert "整份日志（raw_mode=file）" in deliver.render_report_section(_spec(mode="file"), attached=True)
+
+
+def test_head_long_diagnosis_is_compressed_not_split():
+    """首段超长时压缩诊断，绝不切段（这正是用户抱怨的割裂感来源）。"""
+    verdict = _llm_verdict(reason="证据" * 500)
+    plan = deliver.build_send_plan(
+        verdict,
+        deliver.DeliverConfig(head_max_chars=600),
+        "aiocqhttp:FriendMessage:1",
+        block=_block(hits=3),
+        report=_spec(),
+    )
+    assert len(plan.chunks) == 1
+    assert len(plan.chunks[0]) <= 600
+    assert not re.search(r"（\d+/\d+）", plan.chunks[0])
+    assert "可能原因：" in plan.chunks[0]
+
+
+def test_degrade_drops_attachments_but_keeps_report_hint():
+    plan = deliver.build_send_plan(
+        _llm_verdict(), None, "aiocqhttp:FriendMessage:1", block=_block(), report=_spec()
+    )
+    degraded = deliver.degrade(plan)
+    assert degraded.attachments == [], "降级重试只发文本，避免文件重发把失败放大"
+    assert any("报告文件已保留" in note for note in degraded.degradation)
+
+
+def test_report_disabled_falls_back_to_inline_excerpt():
+    """报告关闭（或写文件失败）时回到旧的内联摘录形态：零附件，绝不静默什么都不发。"""
+    plan = deliver.build_send_plan(
+        _llm_verdict(),
+        deliver.DeliverConfig(include_excerpt=True),
+        "aiocqhttp:FriendMessage:1",
+        block=_block(),
+        excerpt="line-1\nline-2",
+        report=None,
+    )
+    assert plan.attachments == []
+    assert "—— 摘录 ——" in plan.chunks[0]
+    assert "line-1" in plan.chunks[0]
+
+
+def test_partial_delivery_counts_as_delivered_and_stops_chain():
+    """验收 7：附件失败（文本成功）= partial，但**算送达**，不整条重试、不再走备用出口。"""
+    async def scenario():
+        async def send(session, plan):
+            return models.DeliveryOutcome(
+                session=session, ok=True, partial=True, file_ok=False, error="附件发送失败"
+            )
+
+        return await deliver.deliver_over_outlets(
+            ["main", "backup"], _plan_for, send, attempts=2
+        )
+
+    ok, outcomes, planned = asyncio.run(scenario())
+    assert ok is True
+    assert len(outcomes) == 1, "附件失败不触发整条重试"
+    assert outcomes[0].partial is True and outcomes[0].file_ok is False
+
+
+def test_main_report_pipeline_is_observable():
+    """验收 7：main 侧的三处可观测点（写失败/附件未送达/计数）必须在源码里，不许吞异常。"""
+    source = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding="utf-8")
+    assert "写告警报告失败（改发文本并给出本机路径）" in source
+    assert "报告文件未送达（首段文本已发）" in source
+    assert 'self.counters.bump("delivery_partial")' in source
+    assert "报告超上限已截断" in source
+    # 报告正文首行必须写明口径（Q3=A：两种模式都要能一眼看出来）
+    assert "整份日志（report.raw_mode=file）" in source
+    assert "本轮命中段（含前后文，逐字；report.raw_mode=excerpt）" in source
+    # 文件名规则只在 store.ReportStore.report_name 一处（main 不自己拼）
+    assert "alert-" in (Path(__file__).resolve().parent.parent / "store.py").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_attachment_roundtrip_shape():
+    attachment = models.Attachment(path=REPORT_PATH, name="a.log", size=12)
+    restored = models.Attachment.from_dict(attachment.to_dict())
+    assert restored is not None and restored.path == REPORT_PATH and restored.size == 12
+    assert models.Attachment.from_dict({"name": "no-path"}) is None
+    plan = models.SendPlan(session="s", chunks=[], attachments=[attachment])
+    assert plan.empty is False, "只有附件也算有效计划"
 
 
 if __name__ == "__main__":  # pragma: no cover - 便于手工单跑
