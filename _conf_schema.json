@@ -441,8 +441,57 @@
       }
     }
   },
+  "report": {
+    "description": "⑥ 告警报告（报告文件 + 首段长度，report）",
+    "hint": "v2.3.0 起一条告警 = **1 条诊断文本 + 1 个原始日志文件**，不再被 QQ 长度切成 2~3 段。报告文件落在 <plugin_data>/outbox/reports/，命名 alert-<时间>-<等级>-<指纹8>.log；首段超长时压缩诊断而不是切段。raw_mode=file 才算「整份日志」（体积大，谨慎开启）。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用报告文件（enabled）",
+        "hint": "关闭 = 回到「正文内联摘录」的旧形态（正文可能被通道长度切成多段）。默认开启：主出口发文件，其余出口只发文本。误配后果：关闭后长日志又会裂成多段。",
+        "type": "bool",
+        "default": true
+      },
+      "min_severity": {
+        "description": "生成报告的最低等级（min_severity）",
+        "hint": "低于该等级不生成文件（LOW 走摘要，摘要不附文件）。误配后果：设成 LOW = 连低危也落文件（磁盘增长）；设成 CRITICAL = 大多数告警没有报告文件。",
+        "type": "string",
+        "default": "MEDIUM"
+      },
+      "raw_mode": {
+        "description": "报告内容口径（raw_mode）",
+        "hint": "excerpt = 本轮命中段（含前后文、逐字，默认）；file = 直接装整份日志文件（体积大、含他人会话串，仅排障时临时开启）。两种口径都会写在报告首行与首段里。误配后果：长期用 file = 磁盘与隐私面同时放大。",
+        "type": "string",
+        "default": "excerpt"
+      },
+      "max_file_bytes": {
+        "description": "单个报告文件字节上限（max_file_bytes）",
+        "hint": "4096-16777216，单文件硬上限（默认 512 KiB）。超限时保留头尾并在中间写明截断了多少字节。误配后果：过小=关键 traceback 被截；过大=单文件过大导致平台拒收附件。",
+        "type": "int",
+        "default": 524288
+      },
+      "keep_days": {
+        "description": "报告保留天数（keep_days）",
+        "hint": "1-3650，报告文件保留天数（默认 7）。与 outbox 的「成功即删」完全分开：报告是给人事后对账的留存件。误配后果：过小=事后无法取证；过大=磁盘增长。",
+        "type": "int",
+        "default": 7
+      },
+      "max_files": {
+        "description": "报告文件数上限（max_files）",
+        "hint": "1-100000，报告目录最多留几个文件（默认 200，与保留天数取更严者）。误配后果：过大=磁盘增长；过小=近期报告被挤掉。",
+        "type": "int",
+        "default": 200
+      },
+      "head_max_chars": {
+        "description": "首段最大字数（head_max_chars）",
+        "hint": "300-4000，首段（诊断文本）的硬上限，与通道单条上限取小（默认 1200）。超长时压缩诊断 + 指向报告文件，不切段。误配后果：过大=首段被通道切成两段（正是 v2.3.0 要消灭的现象）。",
+        "type": "int",
+        "default": 1200
+      }
+    }
+  },
   "state": {
-    "description": "⑥ 状态 / 磁盘 / 留存（state）",
+    "description": "⑦ 状态 / 磁盘 / 留存（state）",
     "hint": "状态库路径与落盘留存的保留策略；超出上限时由插件自己的清理钩子按更严者裁剪，不需要外部 cron。",
     "type": "object",
     "items": {
@@ -513,7 +562,7 @@
     }
   },
   "self_guard": {
-    "description": "⑦ 自身识别 / 自反馈（self_guard）",
+    "description": "⑧ 自身识别 / 自反馈（self_guard）",
     "hint": "避免插件被自己的日志触发（自回声过滤）与识别自身反馈会话；log_with_bot_id 只影响日志可读性，不影响判定。",
     "type": "object",
     "items": {

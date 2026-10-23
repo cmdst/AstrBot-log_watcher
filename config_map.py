@@ -31,6 +31,7 @@ GROUPS: tuple[str, ...] = (
     "classify",
     "budget",
     "delivery",
+    "report",
     "state",
     "self_guard",
 )
@@ -135,6 +136,14 @@ EXTRA_LEAVES: tuple[str, ...] = (
     "classify.prior_ttl_hours",
     # repeat_count 的统计窗口（只喂判定上下文；通知去重窗口是 budget.dedupe_window_seconds）
     "classify.repeat_window_seconds",
+    # ---- report：告警报告（v2.3.0 新增整组，旧版没有这些键）----
+    "report.enabled",
+    "report.min_severity",
+    "report.raw_mode",
+    "report.max_file_bytes",
+    "report.keep_days",
+    "report.max_files",
+    "report.head_max_chars",
 )
 
 

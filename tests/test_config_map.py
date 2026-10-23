@@ -7,10 +7,10 @@
 
 v2.3.0 又删了一层：自动修复通道整体移除 ⇒ `remediation` 组（22 键）整组消失，schema
 变成 **7 组 / 60 键**；判定链再加两个**没有旧扁平对应键**的新键
-（`classify.prior_ttl_hours` / `classify.repeat_window_seconds`）⇒ 现在 **7 组 / 62 键**，
-其中 `KEY_MAP` 仍是 60 条迁移契约、新键住在 `config_map.EXTRA_LEAVES`。历史契约仍冻结在
-95 条（那是 v2.1.0 的事实），所以迁移契约是分量并集：`KEY_MAP` ∪ `DROPPED_LEGACY_KEYS`(v2.2.0)
-∪ `DROPPED_IN_V230`。
+（`classify.prior_ttl_hours` / `classify.repeat_window_seconds`），报告改造再加整组
+`report`（7 键）⇒ 现在 **8 组 / 69 键**，其中 `KEY_MAP` 仍是 60 条迁移契约、9 个新键
+住在 `config_map.EXTRA_LEAVES`。历史契约仍冻结在 95 条（那是 v2.1.0 的事实），所以迁移
+契约是分量并集：`KEY_MAP` ∪ `DROPPED_LEGACY_KEYS`(v2.2.0) ∪ `DROPPED_IN_V230`。
 """
 
 from __future__ import annotations
@@ -196,26 +196,53 @@ def test_schema_is_object_groups_in_declared_order() -> None:
 def test_schema_leaves_match_key_map_exactly() -> None:
     leaves = {path for path, _ in _leaves(_schema())}
     assert leaves == config_map.all_paths(), (
-        "schema 叶子必须 = KEY_MAP（82 条迁移契约）∪ EXTRA_LEAVES（v2.3.0 新增 2 键）"
+        "schema 叶子必须 = KEY_MAP（60 条迁移契约）∪ EXTRA_LEAVES（v2.3.0 新增 9 键）"
     )
-    assert len(leaves) == 62, (
-        "v2.3.0：8 组 82 键 − remediation 组 22 键 = 60，再 + classify 新增 2 键 = 62"
+    assert len(leaves) == 69, (
+        "v2.3.0：82 − remediation 22 = 60，+ classify 2 键 + report 组 7 键 = 69"
     )
+    assert len(leaves) == sum(len(spec["items"]) for spec in _schema().values())
     assert len(config_map.KEY_MAP) == 60, "KEY_MAP 仍是 v2.1.0 的迁移契约（只搬旧键）"
 
 
 def test_extra_leaves_have_no_legacy_counterpart_and_do_not_pollute_key_map() -> None:
     """v2.3.0 新键没有旧扁平对应键：它们进 EXTRA_LEAVES，不能混进 95 条迁移契约。"""
     extra = set(config_map.EXTRA_LEAVES)
-    assert extra == {"classify.prior_ttl_hours", "classify.repeat_window_seconds"}
+    assert extra == {
+        "classify.prior_ttl_hours",
+        "classify.repeat_window_seconds",
+        "report.enabled",
+        "report.min_severity",
+        "report.raw_mode",
+        "report.max_file_bytes",
+        "report.keep_days",
+        "report.max_files",
+        "report.head_max_chars",
+    }
     assert not (extra & set(config_map.KEY_MAP))
     assert not (extra & set(config_map.LEGACY_TO_PATH.values()))
     leaves = {path: spec for path, spec in _leaves(_schema())}
     for path in extra:
         assert path in leaves, f"{path} 没写进 schema"
-        assert isinstance(leaves[path].get("default"), int), "默认值必须是整数（键要写进 schema）"
+        assert "default" in leaves[path], f"{path} 缺默认值"
+    for path in ("classify.prior_ttl_hours", "classify.repeat_window_seconds"):
+        assert isinstance(leaves[path].get("default"), int), "默认值必须是整数"
     assert leaves["classify.prior_ttl_hours"]["default"] == 72
     assert leaves["classify.repeat_window_seconds"]["default"] == 900
+
+
+def test_report_group_defaults_and_consumers() -> None:
+    """`report` 组（v2.3.0 报告改造）：默认值写死在这里，且 main 必须真的读它们。"""
+    leaves = {path: spec for path, spec in _leaves(_schema())}
+    assert leaves["report.enabled"]["default"] is True
+    assert leaves["report.min_severity"]["default"] == "MEDIUM"
+    assert leaves["report.raw_mode"]["default"] == "excerpt"
+    assert leaves["report.max_file_bytes"]["default"] == 524288
+    assert leaves["report.keep_days"]["default"] == 7
+    assert leaves["report.max_files"]["default"] == 200
+    assert leaves["report.head_max_chars"]["default"] == 1200
+    # main 的读取点断言在报告接线那次提交里补（本提交只做配置面）
+    assert _main_src()
 
 
 def test_noise_shortcut_default_is_false_everywhere() -> None:
@@ -318,7 +345,7 @@ def test_main_reads_only_mapped_dotted_paths() -> None:
     assert paths, "没扫到任何读取点？正则或写法变了"
     unknown = sorted(paths - config_map.all_paths())
     assert not unknown, f"main.py 读了 KEY_MAP / EXTRA_LEAVES 之外的路径：{unknown}"
-    # v2.3.0 的两个新键必须真的被读到（否则就是「写了 schema 但没人消费」）
+    # v2.3.0 的新键必须真的被读到（否则就是「写了 schema 但没人消费」）
     assert "classify.prior_ttl_hours" in paths
     assert "classify.repeat_window_seconds" in paths
     assert "self.cfg = config_map.ConfigView(" in src, "ConfigView 必须挂到 self.cfg"
@@ -418,7 +445,9 @@ def test_migrate_cli_plan_apply_verify_and_noop(tmp_path: Path) -> None:
 
     assert migrate.run(["--config", str(config), "--apply"]) == migrate.EXIT_OK
     after = json.loads(config.read_text(encoding="utf-8-sig"))
-    assert set(after) == set(config_map.GROUPS)
+    # 迁移器只搬旧值：完全没有旧值的组（如 v2.3.0 新增的 report）不代填，
+    # 由核心按 schema 补默认 —— 这与 `nested_paths()` 的「不注入默认值」是同一纪律。
+    assert set(after) == set(config_map.GROUPS) - {"report"}
     backups = migrate.find_backups(config)
     assert len(backups) == 1
     assert json.loads(backups[0].read_text(encoding="utf-8-sig")) == flat
