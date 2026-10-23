@@ -176,6 +176,8 @@ class LogWatcherPlugin(Star):
         if self.sqlite is not None and self.sqlite.last_error:
             logger.error(f"{self._plat()}状态库异常：{self.sqlite.last_error}")
         self._check_outlet_policy()
+        # 启动横幅要读报告配置（本方法作用域独立；__init__ 的同名局部变量不可见）
+        report_cfg = self._report_config()
         logger.info(
             f"{self._plat()}日志监听启动：目录 {self._log_dir()}，匹配 {self._pattern()}，"
             f"等级 {list(self._levels()) or '未配置'}，形态 {self._send_mode()}，"
