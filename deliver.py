@@ -442,7 +442,7 @@ def render_checklist(verdict: ThreatVerdict) -> str:
 
 
 def render_report_section(spec: ReportSpec | None, *, attached: bool) -> str:
-    """「原始日志」段：附件形态只报文件名，文本兜底必须写清本机路径。"""
+    """「原始日志」段：附件形态同时给出文件名与本机留存路径；文本兜底写清本机路径。"""
     if spec is None or not str(getattr(spec, "path", "") or ""):
         return ""
     tail = f"{spec.mode_text}｜保留 {int(spec.keep_days)} 天"
@@ -484,8 +484,20 @@ def _report_body(
     return "\n".join(part for part in parts if part)
 
 
-def _fit_head(build, limit: int) -> str:
-    """把首段压进 ``limit``：先缩诊断，再硬截；**绝不切段**（切了就是用户抱怨的割裂感）。"""
+def _fit_head(build, limit: int, *, tail: str = "") -> str:
+    """把首段压进 ``limit``：先缩诊断，再硬截；**绝不切段**；``tail``（报告段）必须保留。
+
+    Args:
+        build: ``chars -> 完整首段`` 的构造函数。
+        limit: 首段硬上限（字符数）。
+        tail: 尾部必须保留的段（v2.3.0 的「—— 原始日志 ——」+ 本机路径）。硬截时先把它
+            从正文里摘掉，再按 ``limit - len(tail) - len(截断提示)`` 截正文，最后原样附回；
+            这样即使 ``report.head_max_chars`` 取到 schema 下界，非文件出口也不会既无附件
+            又无路径（R2）。
+
+    Returns:
+        不超过 ``limit`` 的首段（``tail`` 本身长于上限时只能超限，但路径不会被截断）。
+    """
     cap = max(1, int(limit))
     for chars in (DIAGNOSIS_MAX_CHARS, 240, 120, 40, 0):
         text = build(chars)
@@ -494,8 +506,18 @@ def _fit_head(build, limit: int) -> str:
     text = build(0)
     if len(text) <= cap:
         return text
-    keep = max(0, cap - len(_HEAD_CLIP_NOTE))
-    return text[:keep] + _HEAD_CLIP_NOTE
+    body = text
+    if tail:
+        index = text.rfind(tail)
+        if index >= 0:
+            body = (text[:index] + text[index + len(tail) :]).rstrip()
+    # 两个 "\n" 分隔符（正文+提示、提示+tail）也要计入预算。
+    keep = max(0, cap - len(_HEAD_CLIP_NOTE) - (len(tail) + 1 if tail else 0) - 1)
+    pieces = [body[:keep].rstrip()] if body[:keep].strip() else []
+    pieces.append(_HEAD_CLIP_NOTE)
+    if tail:
+        pieces.append(tail)
+    return "\n".join(pieces)
 
 
 def split_text(text: str, max_chars: int) -> list[str]:
@@ -631,6 +653,10 @@ def build_send_plan(
         if int(settings.head_max_chars) > 0:
             head_limit = min(limit, int(settings.head_max_chars))
 
+        # R2：报告段（含「—— 原始日志 ——」与本机路径）是首段必须保留的尾巴；
+        # _fit_head 只压诊断/正文，报告段预留预算后原样附回，不再被硬截掉。
+        section = render_report_section(report, attached=attach_ok)
+
         def build(chars: int) -> str:
             return _report_body(
                 verdict,
@@ -642,7 +668,7 @@ def build_send_plan(
                 max_chars=chars,
             )
 
-        body = _fit_head(build, head_limit)
+        body = _fit_head(build, head_limit, tail=section)
         attachments: list[Attachment] = []
         if attach_ok:
             name = str(report.name or str(report.path).rsplit("/", 1)[-1])

@@ -785,6 +785,12 @@ def test_main_uses_the_pure_attachment_gate():
         assert isinstance(value, ast.Call), "allow_attachment 必须是函数调用，不能是常量/比较式"
         assert isinstance(value.func, ast.Attribute)
         assert value.func.attr == "attachment_allowed"
+        # R1：实参级守卫 —— 只查被调名挡不住「把 backup 出口当主出口」的实参改动。
+        assert len(value.args) >= 2, "attachment_allowed 至少要有 session, outlets 两个实参"
+        assert isinstance(value.args[0], ast.Name) and value.args[0].id == "session"
+        assert isinstance(value.args[1], ast.Name) and value.args[1].id == "chain", (
+            "第 2 个实参必须是完整出口链 chain；传 [session] 等于把每个出口都当主出口"
+        )
 
 
 def test_report_form_ignores_forward_request_but_says_so():
@@ -860,3 +866,26 @@ def test_v230_dropped_keys_have_single_source_guard_and_fixture_runs(capsys):
     assert "将删除  ：22 / 22" in out
     assert "将补默认值：9" in out
     assert "FIXTURE-" not in out, "迁移工具不得打印配置值"
+
+
+def test_head_at_report_lower_bound_keeps_report_section_and_path():
+    """R2：head_max_chars=500（schema 允许附近）时，报告段与本机路径不得被硬截掉。"""
+    for allow_attachment in (True, False):
+        plan = deliver.build_send_plan(
+            _llm_verdict(),
+            deliver.DeliverConfig(head_max_chars=500),
+            "aiocqhttp:GroupMessage:744868236",
+            block=_block(hits=2),
+            report=_spec(),
+            allow_attachment=allow_attachment,
+            extra_note="最近 24 小时未送达：待重试 2 条",
+        )
+        body = plan.chunks[0]
+        assert len(body) <= 500, "首段仍必须守住 head_max_chars 上限"
+        assert body.count(REPORT_PATH) == 1, "报告段只能出现一次（不能截一半再补一遍）"
+        assert "—— 原始日志 ——" in body, "报告段不能被截掉"
+        assert REPORT_PATH in body, "本机路径不能被截掉（非文件出口的唯一兜底）"
+        if allow_attachment:
+            assert "（本机留存：" + REPORT_PATH + "）" in body
+        else:
+            assert "完整日志见 " + REPORT_PATH in body

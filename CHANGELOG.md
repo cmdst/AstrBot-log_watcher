@@ -53,12 +53,12 @@
   2~3 段。首段契约：头（等级/命中/时间/来源/组件/指纹第 N 次）→ 诊断（模型判定 / 「本地规则判定，
   未取得模型诊断」/「人工覆写（非模型判定）」三选一）→ 可能原因 / 是否建议修复 / 修复建议 →
   按等级的静态人工处置清单（CRITICAL/HIGH 各 3 条、MEDIUM 1 条；代码常量，不允许模型生成）→「原始日志」段（附件名+体积+口径+
-  保留天数，或本机路径）。
+  保留天数，并且本机路径）。
 - 报告文件：`<plugin_data>/outbox/reports/alert-<YYYYmmdd-HHMMSS>-<SEV>-<fp8>.log`（0600/0700），
   与 `outbox/` 的「成功即删」**生命周期隔离**；按 `report.keep_days` / `report.max_files` 清理。
   超 `report.max_file_bytes` 保留头尾并写明丢弃字节数；同秒同等级同指纹得 `-2` 后缀。
-- **非主出口不发文件**（代码不变式：`allow_attachment = session == primary_outlet`）：其余出口只发
-  文本 + 「完整日志见 <本机路径>」。weixin_oc 代码级禁用附件（配置也打不开）。
+- **非主出口不发文件**（代码不变式：`deliver.attachment_allowed(...)`：仅主出口且通道支持文件）：
+  其余出口只发文本 + 「完整日志见 <本机路径>」。weixin_oc 代码级禁用附件（配置也打不开）。
 - **超长不切段**：先压缩诊断再硬截（`…（首段已截断，完整内容见报告文件）`），
   `split_with_markers` 只留给「报告关闭/低等级」的旧内联路径。
 - 新增 `report` 组 7 键（`enabled` / `min_severity` / `raw_mode` / `max_file_bytes` / `keep_days` /
