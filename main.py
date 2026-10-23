@@ -184,7 +184,7 @@ class LogWatcherPlugin(Star):
             f"间隔 {self._interval()}s，会话 {len(self._sessions())} 条"
             f"（{'/'.join(sorted({str(item) for item in caps.values()})) or '未配置'}）；"
             f"状态 {state}，分级 {self._classify_mode()}"
-            f"（provider {'已配置' if self._classify_provider_id() else '未配置'}），"
+            f"（provider {self._classify_provider_id() or '未配置→回落当前对话模型'}），"
             f"知识库 {kb_state}；报告 "
             f"{'开启' if report_cfg['enabled'] else '关闭'}"
             f"（{report_cfg['raw_mode']}，≥{report_cfg['min_severity']}）；"

@@ -821,6 +821,12 @@ class ThreatEngine:
 
         mode = self._mode()
         provider_id = self._provider_id()
+        provider_is_default = False
+        if not provider_id:
+            # v2.3.1：留空 = 回落到 AstrBot 当前的对话模型（与 media_analysis 同口径）。
+            # 每轮现取、不缓存 —— 运营方在 WebUI 换默认模型后，下一轮就跟着换。
+            provider_id = self._default_provider_id()
+            provider_is_default = bool(provider_id)
 
         if not self._llm_wanted(mode):
             # 显式 local 模式：用户选择不调模型。结论是本地判定（judged=False）。
@@ -841,7 +847,11 @@ class ThreatEngine:
             # 否则这条本地结论会被永久固化成历史先验，等 provider 配好也不会被重判。
             self._stats["degraded"] += 1
             self._stats["llm_skipped"] += 1
-            missing = "未配置 provider_id" if not provider_id else "没有可用的 Context"
+            missing = (
+                "未配置 provider_id，且取不到 AstrBot 当前的对话模型"
+                if self._context is not None
+                else "没有可用的 Context"
+            )
             _log.warning(
                 "模式 %s 需要 LLM，但%s；本块降级且不写知识库（指纹 %s）",
                 mode,
@@ -975,6 +985,11 @@ class ThreatEngine:
                 tag="guard-error",
                 local=local,
             )
+        if provider_is_default:
+            # 让台账与报告能看出「这次用的不是运营方手选的模型」，换默认模型时便于回溯。
+            guarded = replace(
+                guarded, tags=[*guarded.tags, "provider:default-fallback"]
+            )
         if guarded is not verdict:
             self._stats["guarded"] += 1
             _log.warning(
@@ -1031,6 +1046,37 @@ class ThreatEngine:
             default="",
         )
         return str(raw).strip()
+
+    def _default_provider_id(self) -> str:
+        """回落：取 AstrBot 当前对话 provider 的 id（``classify.provider_id`` 留空时用）。
+
+        与 ``astrbot_plugin_media_analysis`` 同口径：只问核心「现在用哪个对话模型」，
+        不猜、不缓存、不写配置 —— 运营方在 WebUI 换默认模型后，下一轮自动跟随。
+
+        Returns:
+            provider id；取不到（无 context / 未设置 / 类型不符 / 无 id）时返回空串，
+            由调用方按「未配置」显式降级。
+        """
+        if self._context is None:
+            return ""
+        getter = getattr(self._context, "get_using_provider", None)
+        if not callable(getter):
+            return ""
+        try:
+            provider = getter()
+        except Exception as exc:  # 核心对类型不符会抛 ValueError；一律按取不到处理
+            _log.warning(
+                "读取 AstrBot 当前对话模型失败，按未配置处理：%s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return ""
+        config = getattr(provider, "provider_config", None)
+        if isinstance(config, dict):
+            value = config.get("id")
+            if isinstance(value, str):
+                return value.strip()
+        return ""
 
     def _timeout(self) -> float:
         """取 LLM 超时秒数（默认 30s，夹在 [0.05, 600] 内）。"""

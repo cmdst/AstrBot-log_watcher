@@ -62,16 +62,29 @@ class FakeContext:
         exc: BaseException | None = None,
         delay: float = 0.0,
         raw: object | None = None,
+        using_provider: object | None = None,
+        using_provider_error: BaseException | None = None,
     ):
         self.text = text
         self.exc = exc
         self.delay = delay
         self.raw = raw
+        self.using_provider = using_provider
+        self.using_provider_error = using_provider_error
         self.calls: list[dict[str, object]] = []
+        self.using_provider_calls = 0
 
     @property
     def call_count(self) -> int:
         return len(self.calls)
+
+    def get_using_provider(self):  # noqa: ANN201
+        """``Context.get_using_provider`` 的替身（同步，不要 await）。"""
+
+        self.using_provider_calls += 1
+        if self.using_provider_error is not None:
+            raise self.using_provider_error
+        return self.using_provider
 
     async def llm_generate(
         self, *, chat_provider_id, prompt=None, system_prompt=None, **kwargs
@@ -120,6 +133,77 @@ def test_llm_call_uses_llm_generate_with_explicit_provider_id() -> None:
     assert verdict.is_new_pattern is True
     assert "llm" in verdict.tags
     assert engine.stats()["llm_calls"] == 1
+
+
+def test_empty_provider_id_falls_back_to_current_chat_model() -> None:
+    """v2.3.1：provider_id 留空 = 用 AstrBot 当前的对话模型（不猜、每轮现取）。"""
+
+    context = FakeContext(
+        text=_llm_text("MEDIUM"),
+        using_provider=SimpleNamespace(provider_config={"id": "default-chat"}),
+    )
+    cfg = dict(BASE_CFG)
+    cfg["llm_provider_id"] = ""
+    engine = ThreatEngine(context, cfg=cfg)
+
+    verdict = asyncio.run(engine.classify(samples.provider_retry_block()))
+
+    assert context.call_count == 1
+    assert context.calls[0]["chat_provider_id"] == "default-chat"
+    assert verdict.judged is True
+    assert verdict.judge_source == "llm"
+    assert "provider:default-fallback" in verdict.tags
+
+
+def test_empty_provider_id_without_default_degrades_and_stays_unconfigured() -> None:
+    """回落也拿不到模型时，仍是显式降级且不写知识库（C4 的语义不能被回落悄悄绕过）。"""
+
+    context = FakeContext(text=_llm_text("MEDIUM"))  # using_provider=None
+    cfg = dict(BASE_CFG)
+    cfg["llm_provider_id"] = ""
+    engine = ThreatEngine(context, cfg=cfg)
+
+    verdict = asyncio.run(engine.classify(samples.provider_retry_block()))
+
+    assert context.call_count == 0, "取不到模型时不得发起调用"
+    assert verdict.source == "degraded"
+    assert "degraded:llm-unconfigured" in verdict.tags
+    assert verdict.judged is False
+    assert engine.kb.has(verdict.fingerprint) is False, "降级结论不得写进知识库"
+
+
+def test_explicit_provider_id_does_not_consult_default_model() -> None:
+    """显式配置优先：配了 provider_id 就不去问默认模型，避免「悄悄用了另一个模型」。"""
+
+    context = FakeContext(
+        text=_llm_text("MEDIUM"),
+        using_provider=SimpleNamespace(provider_config={"id": "default-chat"}),
+    )
+    engine = ThreatEngine(context, cfg=dict(BASE_CFG))
+
+    verdict = asyncio.run(engine.classify(samples.provider_retry_block()))
+
+    assert context.calls[0]["chat_provider_id"] == "test-provider"
+    assert context.using_provider_calls == 0
+    assert "provider:default-fallback" not in verdict.tags
+
+
+def test_default_provider_lookup_error_is_treated_as_unconfigured() -> None:
+    """核心对「类型不符」会抛 ValueError：必须吞掉并降级，不能打穿主循环。"""
+
+    context = FakeContext(
+        text=_llm_text("MEDIUM"),
+        using_provider_error=ValueError("该会话来源的对话模型类型不正确"),
+    )
+    cfg = dict(BASE_CFG)
+    cfg["llm_provider_id"] = ""
+    engine = ThreatEngine(context, cfg=cfg)
+
+    verdict = asyncio.run(engine.classify(samples.provider_retry_block()))
+
+    assert context.call_count == 0
+    assert verdict.source == "degraded"
+    assert "degraded:llm-unconfigured" in verdict.tags
 
 
 def test_llm_response_without_completion_text_attribute_is_tolerated() -> None:

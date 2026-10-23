@@ -50,7 +50,8 @@
 2. 全局 `log_level` 决定哪些等级会写进文件：全局是 `INFO` 时不会有 `DEBUG` 行。
 3. 想用 LLM 分级（推荐）：在 `classify.provider_id` 的**下拉里选**一个 AstrBot 已配置的对话模型
    （不用手抄 provider id，v2.3.1 起）；
-   留空也能工作 —— `auto` 模式会显式降级为「本地规则判定，未取得模型诊断」且**不写知识库**，
+   留空也行 —— 会**回落到 AstrBot 当前的对话模型**（每轮现取，换了默认模型就跟着换）；
+   只有连默认模型都取不到时，才显式降级为「本地规则判定，未取得模型诊断」且**不写知识库**，
    不会静默失效、也不会把本地结论冒充成模型结论。
 4. 不再需要 `dsh` / headless 路由 / 任何修复前置条件（v2.3.0 已移除自动修复通道）。
 
@@ -83,7 +84,7 @@ stale 键清掉；工具：`tools/migrate_config_v3.py`）。
 | `notify.send_mode` | `auto` | 不动 | 按通道能力选段型（主出口可带文件）；报告形态恒为单条文本，`forward` 只影响旧内联路径 |
 | `notify.min_severity` | `MEDIUM` | 不动 | 低于它的判定只进摘要或静默 |
 | `scan.levels` | `["ERROR","CRITICAL"]` | 不动 | 加 `WARNING` 会引入每天上千条噪声 |
-| `classify.provider_id` | `""` | 下拉里选一个 | 留空 = 每条都显式降级（`degraded:llm-unconfigured`） |
+| `classify.provider_id` | `""` | 下拉里选一个 | 留空 = 回落 AstrBot 当前对话模型；取不到才降级（`degraded:llm-unconfigured`） |
 | `classify.noise_shortcut` | **`false`** | 保持 false | true = 良性噪声零 token 短路，但结论标 `judged=false`（偏离「每条必过模型」） |
 | `classify.prior_ttl_hours` | `72` | 不动 | 历史先验保留期（过期不再注入提示词；人工覆写永不过期） |
 | `classify.repeat_window_seconds` | `900` | 不动 | `repeat_count` 统计窗口；不影响判不判、也不影响发不发 |

@@ -2,14 +2,20 @@
 
 ## v2.3.1（2026-10-24）
 
-> 一个小改：**「分级用 Provider」从手填 id 改成下拉选择**（配置面不变，仍是 8 组 / 69 键）。
+> 两处小改：**「分级用 Provider」从手填 id 改成下拉选择**，并且**留空时回落到当前对话模型**
+> （配置面不变，仍是 8 组 / 69 键）。
 
 - `classify.provider_id` 增加 `"_special": "select_provider"` —— AstrBot 的插件配置页会把它渲染成
   「已配置的对话模型」下拉框，不用再去别处手抄 provider id（对标 `astrbot_plugin_media_analysis` 的做法）。
-- 语义不变：留空仍是「不调 LLM」（`auto` 下等同 `local`，会显式降级并在报告首段写明）；已有配置值
-  原样保留，**无需迁移**。
+- **留空语义变了**：不再「永不调 LLM」，而是**回落到 AstrBot 当前的对话模型**
+  （`Context.get_using_provider()`，**每轮现取、不缓存** —— 在 WebUI 换了默认模型，下一轮就跟随）。
+  只有连默认模型都取不到（未设置 / 类型不符 / 无 id）时才显式降级为
+  `degraded:llm-unconfigured` 且**不写知识库**（C4 语义没有被回落绕过）。
+  回落命中的判定会带 `provider:default-fallback` 标签，台账与报告都能看出「这次不是手选的模型」。
+- 已有配置值原样保留，**无需迁移**。
 - 新增守卫用例：`test_classify_provider_id_uses_provider_dropdown` —— 防止以后有人把 `_special`
-  改掉，UI 悄悄退回手填而没人发现。
+  改掉，UI 悄悄退回手填而没人发现；另有 4 条回落路径用例（命中 / 无默认 / 显式优先 / 核心抛
+  ValueError）。
 - 上一版 2.3.0 上线时 `initialize` 的启动横幅漏了 `report_cfg` 赋值（测试没覆盖 `initialize`），
   已由热修 `bc25a2f` 修好；本版随分支一并带上，并新增 F821 静态守卫（`tests/test_static_checks.py`）
   钉住这一类「静态可判定、运行期才炸」的错误。
