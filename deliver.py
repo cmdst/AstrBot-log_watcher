@@ -450,7 +450,10 @@ def render_report_section(spec: ReportSpec | None, *, attached: bool) -> str:
         tail += "｜超限已截断（保留头尾）"
     if attached:
         name = spec.name or str(spec.path).rsplit("/", 1)[-1]
-        return f"—— 原始日志 ——\n{name}（{spec.size_text()}｜{tail}）"
+        return (
+            f"—— 原始日志 ——\n{name}（{spec.size_text()}｜{tail}）\n"
+            f"（本机留存：{spec.path}）"
+        )
     return (
         f"—— 原始日志 ——\n完整日志见 {spec.path}\n"
         f"（本机路径，该通道不支持文件附件；{tail}）"
@@ -611,6 +614,10 @@ def build_send_plan(
     has_report = bool(report is not None and str(getattr(report, "path", "") or ""))
 
     if has_report:
+        if str(settings.send_mode or "").strip().lower() == "forward" or bool(
+            settings.prefer_forward
+        ):
+            notes.append("报告形态恒为单条文本：send_mode/prefer_forward 只影响旧内联路径")
         attach_ok = bool(target_caps.file and allow_attachment)
         if not attach_ok:
             if not target_caps.file:
@@ -619,7 +626,7 @@ def build_send_plan(
                     "完整日志改用本机路径提示（不发附件）"
                 )
             else:
-                notes.append("非主出口不发文件（Q4=A：群/备用出口只发文本）")
+                notes.append("备用出口只发文本；群只有做主出口时才会尝试发文件")
         head_limit = limit
         if int(settings.head_max_chars) > 0:
             head_limit = min(limit, int(settings.head_max_chars))
@@ -703,8 +710,9 @@ def build_send_plan(
 def degrade(plan: SendPlan) -> SendPlan:
     """降级：只发一条最小纯文本摘要（丢掉长摘录、转发形态与附件）。
 
-    v2.3.0：**清空 attachments**（重试只发文本，避免"文件重发把失败放大"），但要把
-    「报告文件已经留在本机」写进降级提示 —— 否则运营方只看到摘要，不知道完整内容在哪。
+    v2.3.0：降级文本**自身**不带附件（避免这一次再放大失败）；但调用方的待发队列
+    （``PendingItem.attachments``）仍保留原附件，**整条重试时会再发一次附件**（见
+    ``main._retry_pending``）。降级提示要同时写清「报告文件已留在本机」与重试口径。
     """
     notes = list(plan.degradation)
     if plan.attachments:
@@ -802,6 +810,32 @@ def outlet_order(sessions) -> list[str]:
         if text and text not in chain:
             chain.append(text)
     return chain
+
+
+def attachment_allowed(
+    session: str, outlets, caps: ChannelCaps | None = None
+) -> bool:
+    """Q4=A 的**唯一**门控实现：只有主出口（列表第 1 个）才允许尝试附件。
+
+    这是「非主出口不发文件」的纯函数版本 —— main 只负责调用它，不再自己写比较式，
+    这样门控可以被单测直接钉住（F1：旧写法在测试里零判别力）。
+
+    Args:
+        session: 当前出口（unified_msg_origin）。
+        outlets: ``notify.target_sessions``（列表即优先级，第 1 个是主出口）。
+        caps: 该出口的通道能力；给定时还要求 ``caps.file`` 为真（weixin 恒 False）。
+
+    Returns:
+        True = 这个出口可以尝试发附件；空列表/空 session/非主出口/通道不支持都返回 False。
+    """
+    chain = outlet_order(outlets)
+    if not chain or not str(session or "").strip():
+        return False
+    if str(session).strip() != chain[0]:
+        return False
+    if caps is not None and not bool(getattr(caps, "file", False)):
+        return False
+    return True
 
 
 async def deliver_over_outlets(

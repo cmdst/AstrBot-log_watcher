@@ -448,7 +448,7 @@ def test_group_outlet_gets_text_and_path_but_no_file():
     assert plan.attachments == [], "群出口不得发文件（群文件上传未实测）"
     assert len(plan.chunks) == 1 and not re.search(r"（\d+/\d+）", plan.chunks[0])
     assert "完整日志见 " + REPORT_PATH in plan.chunks[0]
-    assert any("非主出口不发文件" in note for note in plan.degradation)
+    assert any("备用出口只发文本；群只有做主出口时才会尝试发文件" in note for note in plan.degradation)
 
 
 def test_channels_without_file_capability_never_get_attachments():
@@ -511,7 +511,7 @@ def test_degrade_drops_attachments_but_keeps_report_hint():
         _llm_verdict(), None, "aiocqhttp:FriendMessage:1", block=_block(), report=_spec()
     )
     degraded = deliver.degrade(plan)
-    assert degraded.attachments == [], "降级重试只发文本，避免文件重发把失败放大"
+    assert degraded.attachments == [], "降级文本自身不带附件（重试由待发队列决定）"
     assert any("报告文件已保留" in note for note in degraded.degradation)
 
 
@@ -733,3 +733,129 @@ def test_mask_session_hides_identifier_but_keeps_shape():
     assert deliver.mask_session("no-colon") == "no-colon"
     assert deliver.mask_session("") == ""
     assert deliver.mask_session(None) == ""
+
+
+# ---------- v2.3.0 修复轮：门控纯函数与文档一致性守卫 ----------
+
+_PLUGIN_DIR = Path(__file__).resolve().parent.parent
+
+
+def test_attachment_allowed_only_for_first_outlet():
+    """F1：只有 outlets[0] 为 True（旧写法在测试里零判别力）。"""
+    assert deliver.attachment_allowed("a", ["a", "b"]) is True
+    assert deliver.attachment_allowed("b", ["a", "b"]) is False, "备用出口不得发文件"
+    assert deliver.attachment_allowed("", ["a"]) is False
+    assert deliver.attachment_allowed("a", ["a"], deliver.caps_for("aiocqhttp")) is True
+
+
+def test_attachment_allowed_false_for_empty_outlets():
+    """F1：空出口列表 = 没有主出口。"""
+    assert deliver.attachment_allowed("a", []) is False
+    assert deliver.attachment_allowed("a", None) is False
+
+
+def test_attachment_allowed_false_when_primary_lacks_file_caps():
+    """F1：主出口通道不支持文件（weixin_oc）时必须为 False。"""
+    caps = deliver.caps_for("weixin_oc")
+    assert caps.file is False
+    assert deliver.attachment_allowed("weixin:x", ["weixin:x"], caps) is False
+
+
+def test_main_uses_the_pure_attachment_gate():
+    """F1 变异防线：main 的 allow_attachment 必须是 attachment_allowed(...) 调用。
+
+    把 main.py 改成 ``allow_attachment=True`` 或 ``session != primary_outlet`` 时这条会红。
+    """
+    import ast
+
+    source = (_PLUGIN_DIR / "main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    values = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "build_send_plan":
+            for keyword in node.keywords:
+                if keyword.arg == "allow_attachment":
+                    values.append(keyword.value)
+    assert values, "main.py 里没找到 build_send_plan(allow_attachment=…)"
+    for value in values:
+        assert isinstance(value, ast.Call), "allow_attachment 必须是函数调用，不能是常量/比较式"
+        assert isinstance(value.func, ast.Attribute)
+        assert value.func.attr == "attachment_allowed"
+
+
+def test_report_form_ignores_forward_request_but_says_so():
+    """F4：报告形态恒为单条文本；send_mode=forward / prefer_forward 只影响旧内联路径。"""
+    cfg = deliver.DeliverConfig(send_mode="forward", prefer_forward=True)
+    plan = deliver.build_send_plan(
+        _llm_verdict(),
+        cfg,
+        "aiocqhttp:FriendMessage:1",
+        block=_block(),
+        report=_spec(),
+    )
+    assert plan.kind == "text"
+    assert len(plan.chunks) == 1 and len(plan.attachments) == 1
+    assert any("报告形态恒为单条文本" in note for note in plan.degradation)
+    # 旧内联路径仍尊重 forward（不能顺手把旧行为改掉）
+    inline = deliver.build_send_plan(
+        _llm_verdict(),
+        cfg,
+        "aiocqhttp:FriendMessage:1",
+        block=_block(),
+        excerpt="line",
+        report=None,
+    )
+    assert inline.kind == "forward"
+
+
+def test_attached_report_also_gives_local_path():
+    """F5：附件形态也要给本机留存路径（群做主出口/File 段静默失败时的兜底）。"""
+    section = deliver.render_report_section(_spec(), attached=True)
+    assert "（本机留存：" + REPORT_PATH + "）" in section
+    plan = deliver.build_send_plan(
+        _llm_verdict(),
+        deliver.DeliverConfig(),
+        "aiocqhttp:FriendMessage:1",
+        block=_block(),
+        report=_spec(),
+    )
+    assert "（本机留存：" + REPORT_PATH + "）" in plan.chunks[0]
+
+
+def test_report_path_is_stamped_for_every_fingerprint_in_report():
+    """F7：report 是轮级工件，本轮写进报告的指纹行都要有 report_path（源码级守卫）。"""
+    source = (_PLUGIN_DIR / "main.py").read_text(encoding="utf-8")
+    body = source.split("def _stamp_report_path(", 1)[1].split("\n    async def ", 1)[0]
+    assert "fingerprints" in body.split("\n", 1)[0] or "fingerprints" in body[:120]
+    assert "in wanted" in body, "盖章必须按指纹集合判断，不能只比单个 verdict"
+    call = source.split("self._stamp_report_path(", 1)[1][:260]
+    assert "{item[1].fingerprint for item in sendable" in call, "盖章集合必须来自本轮 sendable"
+
+
+def test_retry_attachment_wording_is_explicit():
+    """F10 选①：重试携带附件时，文案必须写「重试会再发一次附件」。"""
+    source = (_PLUGIN_DIR / "main.py").read_text(encoding="utf-8")
+    body = source.split("def _enqueue_failure(", 1)[1].split("\n    async def ", 1)[0]
+    assert "重试会再发一次附件" in body
+    assert "plan.attachments" in body, "只有带附件时才追加这句"
+
+
+def test_v230_dropped_keys_have_single_source_guard_and_fixture_runs(capsys):
+    """F8：22 键在测试与迁移工具之间必须有交叉断言；fixture 干跑可复现。"""
+    sys.path.insert(0, str(_PLUGIN_DIR / "tools"))
+    import migrate_config_v3 as migrate
+    import test_config_map
+
+    assert set(migrate.REMOVED_V230_FLAT) == set(test_config_map.DROPPED_IN_V230)
+    assert len(migrate.REMOVED_V230_FLAT) == 22
+    fixture = _PLUGIN_DIR / "tools" / "fixtures" / "log_watcher_config_v2.2.0.sample.json"
+    assert fixture.is_file(), "仓库自带的 v2.2.0 fixture 丢了"
+    code = migrate.run(["--dry-run", "--config", str(fixture)])
+    out = capsys.readouterr().out
+    assert code == migrate.EXIT_OK
+    assert "将删除  ：22 / 22" in out
+    assert "将补默认值：9" in out
+    assert "FIXTURE-" not in out, "迁移工具不得打印配置值"

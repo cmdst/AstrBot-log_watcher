@@ -12,7 +12,7 @@
       },
       "send_mode": {
         "description": "提醒形态（send_mode）",
-        "hint": "auto = 按通道能力选（默认）；text = 只发纯文本分片；forward = 优先合并转发（通道不支持时自动退回文本）。注意：旧配置里的 file/txt 会被映射成 text —— weixin_oc 通道只有 Plain 文本能送达，File 会被服务端 prepare 失败、Node/Nodes 会被静默丢弃。误配后果：在 weixin_oc 上强指 forward 只会退化为文本（有 degradation 日志）。",
+        "hint": "auto = 按通道能力选（默认）；text = 只发纯文本分片；forward = 优先合并转发（通道不支持时自动退回文本）。**报告形态（report.enabled=true，默认）恒为单条诊断文本 + 附件**：send_mode/prefer_forward 只影响「旧内联路径」（报告关闭、低等级或无报告文件时）。注意：旧配置里的 file/txt 会被映射成 text —— weixin_oc 通道只有 Plain 文本能送达，File 会被服务端 prepare 失败、Node/Nodes 会被静默丢弃。误配后果：在 weixin_oc 上强指 forward 只会退化为文本（有 degradation 日志）。",
         "type": "string",
         "default": "auto",
         "options": [
@@ -28,7 +28,7 @@
       },
       "prefer_forward": {
         "description": "优先合并转发（prefer_forward）",
-        "hint": "通道同时支持文本与转发时优先用合并转发。误配后果：在 weixin_oc 上无效果（自动降级为文本）。",
+        "hint": "通道同时支持文本与转发时优先用合并转发（**只影响旧内联路径**；报告形态恒为单条文本）。误配后果：在 weixin_oc 上无效果（自动降级为文本）；在报告形态下无效但会打一条 degradation 提示。",
         "type": "bool",
         "default": false
       },

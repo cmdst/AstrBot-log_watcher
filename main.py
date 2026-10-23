@@ -141,7 +141,6 @@ class LogWatcherPlugin(Star):
         self._round_excerpt_text = ""
         self._round_alerts: list[dict] = []
         self._round_progress: list[dict] = []
-        self._round_rates: list[tuple[str, float]] = []
         self._round_deltas: dict[str, int] = {}
         self._fingerprint_stats: dict[str, dict] = {}
         self._pending_stats: dict = {}
@@ -383,7 +382,6 @@ class LogWatcherPlugin(Star):
         self._notice_store_error()
         self._round_alerts.clear()
         self._round_progress.clear()
-        self._round_rates.clear()
         self._round_excerpt = None
         self._round_excerpt_text = ""
 
@@ -892,10 +890,20 @@ class LogWatcherPlugin(Star):
             keep_days=cfg["keep_days"],
         )
 
-    def _stamp_report_path(self, verdict: ThreatVerdict, spec: deliver.ReportSpec) -> None:
-        """把报告路径写回本轮台账行（`alerts.report_path`），便于事后按台账取证。"""
+    def _stamp_report_path(
+        self, spec: deliver.ReportSpec, fingerprints: set[str]
+    ) -> None:
+        """把报告路径写回本轮**所有写进该报告的指纹**台账行（`alerts.report_path`）。
+
+        报告是轮级工件（`_write_report` 收本轮全部 sendable 段），所以不能只挂最高等级
+        那一行：否则同轮其它指纹的 `excerpt_path` 在成功后随 outbox 回收，按台账找文件
+        只对一行有效（F7）。盖章范围 = 实际写进报告的指纹集合。
+        """
+        wanted = {str(fingerprint) for fingerprint in fingerprints if fingerprint}
+        if not wanted:
+            return
         for row in self._round_alerts:
-            if row.get("fingerprint") == verdict.fingerprint and not row.get("report_path"):
+            if row.get("fingerprint") in wanted and not row.get("report_path"):
                 row["report_path"] = spec.path
 
     async def _deliver_round(
@@ -934,9 +942,11 @@ class LogWatcherPlugin(Star):
         if self._report_enabled_for(verdict):
             spec = self._write_report([item[0] for item in sendable], verdict, now)
             if spec is not None:
-                self._stamp_report_path(verdict, spec)
+                self._stamp_report_path(
+                    spec,
+                    {item[1].fingerprint for item in sendable if item[1].fingerprint},
+                )
         chain = deliver.outlet_order(self._sessions())
-        primary_outlet = chain[0] if chain else ""
         repeat_count = int(
             (self._fingerprint_stats.get(verdict.fingerprint) or {}).get("repeat_count", 0)
         )
@@ -950,8 +960,10 @@ class LogWatcherPlugin(Star):
                 caps=self._caps_for(session),
                 extra_note=note,
                 report=spec,
-                # Q4=A：只有主出口发文件；群/备用出口只发文本（群文件上传未实测）
-                allow_attachment=bool(primary_outlet) and session == primary_outlet,
+                # Q4=A：只有主出口发文件（纯函数门控，单测直接钉；群做主出口时会尝试）
+                allow_attachment=deliver.attachment_allowed(
+                    session, chain, self._caps_for(session)
+                ),
                 repeat_count=repeat_count,
             ),
             "日志提醒",
@@ -1131,11 +1143,12 @@ class LogWatcherPlugin(Star):
         head = (
             degraded_plan.chunks[0] if degraded_plan.chunks else _degraded_text(text)
         )[:200].rstrip()
+        retry_note = "；重试会再发一次附件" if plan.attachments else ""
         item = store.PendingItem(
             session=session,
             kind=plan.kind if plan.kind in {"text", "forward"} else "text",
             chunks=list(plan.chunks),
-            text=f"{head}\n…（降级重试：完整摘录见日志目录）",
+            text=f"{head}\n…（降级重试：完整摘录见日志目录{retry_note}）",
             fingerprint=verdict.fingerprint,
             severity=verdict.severity.value,
             route=verdict.route.value,
@@ -1261,12 +1274,10 @@ class LogWatcherPlugin(Star):
         """每轮一次批量事务（§9.4 第 1 条）；库不可用时退回 JSON 内存态落盘。"""
         alerts = list(self._round_alerts)
         progress = list(self._round_progress)
-        rates = list(self._round_rates)
         deltas = dict(self._round_deltas)
         counters_state = self.counters.export_state()
         self._round_alerts.clear()
         self._round_progress.clear()
-        self._round_rates.clear()
         self._round_deltas.clear()
 
         if not self._store_ready():
@@ -1288,8 +1299,8 @@ class LogWatcherPlugin(Star):
                 self.sqlite.record_alerts(alerts)
             if progress:
                 self.sqlite.upsert_progress(progress)
-            if rates:
-                self.sqlite.push_rates(rates)
+            # v2.3.0：历史 scopes 只读保留、运行期不再产生新行
+            # （原 _record_rate 的唯一调用方随修复通道删除，main 不再 push_rates）
             if deltas:
                 self.sqlite.bump_counters(deltas)
             self.sqlite.meta_set("counters_state", counters_state)
@@ -1317,10 +1328,6 @@ class LogWatcherPlugin(Star):
     def _bump_delta(self, name: str, delta: int = 1) -> None:
         """记录本轮的计数增量（每轮一次性 bump 到 SQLite）。"""
         self._round_deltas[name] = self._round_deltas.get(name, 0) + int(delta)
-
-    def _record_rate(self, scope: str, now: float) -> None:
-        self.counters.window_push(scope, now)
-        self._round_rates.append((scope, float(now)))
 
     # ---------- 聚合 ----------
 

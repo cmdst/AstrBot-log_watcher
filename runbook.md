@@ -54,33 +54,41 @@ grep -a "日志监听启动" $LOG | tail -1
 - 若状态库版本高于本实现，启动行会显示「状态 只读（状态库拒绝写入）」—— 见 §8.4，不要忽略。
 - 另外确认：日志里没有本插件的 `Config key removed`、插件数据目录没有 `CONFIG-INVALID.txt`。
 
-### 1.3 v2.3.0 的配置迁移（**必须按这个顺序**，否则值会丢）
+### 1.3 v2.3.0 的配置迁移（**先迁移、再换代码**）
 
 v2.2.0 → v2.3.0 的配置变化：**删除 `remediation` 整组 22 个键**、**新增 `report` 组 7 个键**与
 两个判定键（`classify.prior_ttl_hours` / `classify.repeat_window_seconds`），
 结构从 8 组 / 82 键变成 **8 组 / 69 键**。
 
+**本版没有需要搬运的值**：60 个既有叶子的键名与语义都没变，变化只有「删 22 + 加 9」。
+顺序纪律的理由不是「值会丢」，而是：旧 schema 会在窗口内把 9 个新键当 stale 键删掉；
+先迁移能让窗口里的配置**已经是新结构**（新键缺了只回落默认值，删掉的旧键本来就是本版不要的）。
+另一个可执行性理由：**换版前 `$PLUG` 里还是 v2.2.0，没有 `migrate_config_v3.py`** ——
+第 1、2 步必须用**库目录**里的工具（它按 `__file__` 读库里的新 schema，不碰生产配置）。
+
 ```bash
 CFG=/root/AstrBot/data/config/log_watcher_config.json
 PLUG=/root/AstrBot/data/plugins/log_watcher
+LIB=/root/workspace/projects/AstrBot-log_watcher     # 库目录：迁移前唯一有 v3 工具/新 schema 的地方
 # 0) 先备份插件目录、配置与状态库（§8.1）
 # 1) 干跑体检：应列出「将删除 22 个 remediation 键、将补默认值 9 个新键、未知键 0」
-python3 $PLUG/tools/migrate_config_v3.py --dry-run --config $CFG
+python3 $LIB/tools/migrate_config_v3.py --dry-run --config $CFG
 # 2) 迁移：写 $CFG.bak-pre-v2.3.0-<ts> 后原子替换
-python3 $PLUG/tools/migrate_config_v3.py --apply --config $CFG
+python3 $LIB/tools/migrate_config_v3.py --apply --config $CFG
 # 3) 换版：用 v2.3.0 覆盖插件目录（排除 .git / __pycache__ / .pytest_cache / *.bak-*）
-# 4) 复核（只回键名，不打印配置值）
+# 4) 复核（换版后 $PLUG 里也有新工具；只回键名，不打印配置值）
 python3 $PLUG/tools/migrate_config_v3.py --verify --config $CFG --against $CFG.bak-pre-v2.3.0-*
-#    仅在「换版窗口被旧 schema 清过」时，从备份重建：
-#    python3 $PLUG/tools/migrate_config_v3.py --from-backup $CFG.bak-pre-v2.3.0-* --config $CFG
+#    仅在「换版窗口被旧 schema 清过」时，从备份重建（库目录或 $PLUG 均可）：
+#    python3 $LIB/tools/migrate_config_v3.py --from-backup $CFG.bak-pre-v2.3.0-* --config $CFG
 # 5) 重载插件，按 §1.2 验收
 ```
 
 - **只支持 v2.2.0（分组结构）→ v2.3.0**。若部署还停在 v2.1.0 的 95 键扁平结构，先跑
-  `tools/migrate_config_v2.py`（v2.1.0 → v2.2.0），再跑 v3；v3 工具会明确拒绝扁平结构。
+  `$LIB/tools/migrate_config_v2.py`（v2.1.0 → v2.2.0，同样在换版前用库目录），再跑 v3；
+  v3 工具会明确拒绝扁平结构。
 - 窗口纪律：第 2–5 步之间不要在 WebUI 上碰 log_watcher 的配置页（旧 schema 会抢先清理）。
 - 工具**任何模式都不打印配置值**；先拿一份配置副本到 `/tmp` 干跑最稳（不触碰生产配置）。
-  仓库自带一份合成假值的 v2.2.0 样本（`tools/fixtures/log_watcher_config_v2.2.0.sample.json`，
+  仓库自带一份合成假值的 v2.2.0 样本（`$LIB/tools/fixtures/log_watcher_config_v2.2.0.sample.json`，
   82 键、无生产值），可直接拿它练干跑/落盘/复核。
 - 旧 22 键的语义：它们在 v2.2.0 里真实存在、在 v2.3.0 被**明示删除**（dropped，不是 unknown），
   键名冻结在 `tests/test_config_map.py::DROPPED_IN_V230`；核心加载 v2.3.0 时也会把它们当 stale 键删掉。
@@ -127,8 +135,8 @@ python3 $PLUG/tools/migrate_config_v3.py --verify --config $CFG --against $CFG.b
 | `self_guard.log_with_bot_id` | bool | `false` | 插件日志带 [platform:平台ID]，多 Bot 环境便于定位 |
 | **① 主动提醒（`notify`）** | | | |
 | `notify.target_sessions` | list | `[]` | 告警会话。**列表即优先级**：第 1 个是主出口（只有它能带附件），失败才用第 2 个 |
-| `notify.send_mode` | string | `"auto"` | auto 按通道能力选；text 只发文本；forward 优先合并转发（不支持则退回文本） |
-| `notify.prefer_forward` | bool | `false` | 通道同时支持文本与转发时优先合并转发 |
+| `notify.send_mode` | string | `"auto"` | auto 按通道能力选；text 只发文本；forward 优先合并转发（不支持则退回文本）。**报告形态（默认开）恒为单条文本：forward 只影响旧内联路径** |
+| `notify.prefer_forward` | bool | `false` | 只影响旧内联路径；报告形态下无效，但会打一条 degradation 提示 |
 | `notify.min_severity` | string | `"MEDIUM"` | 即时告警最低等级；低于它只进摘要或静默 |
 | `notify.include_excerpt` | bool | `true` | 旧内联路径（报告关闭/低等级）是否附摘录正文 |
 | `notify.max_excerpt_chars` | int | `6000` | 旧内联路径的单条摘录字符上限（200-20000） |
@@ -267,6 +275,8 @@ sqlite3 log_watcher.sqlite3 "select run_id,status,exit_code,started_at from reme
   `-1` = 未知（升级前的历史行，**不回填**）。`alerts.judge_source`：`llm|degraded|local|manual`，`''` = 未知。
 - `report_path` 指向留存件（`outbox/reports/*.log`）；`excerpt_path` 仍是临时摘录（可能已被回收）。
 - `remediation_runs` 只读（v2.3.0 不再写入）；启动时 `reconcile_runs()` 把遗留 `running` 对账成 `aborted`。
+- `rate_windows` 是**历史 scopes 只读表**（v2.3.0 起运行期不再产生新行；`store.push_rates` 仅作
+  历史/测试保留，main 已不再调用）——别把「表里有旧行」当成限流仍在生效。
 
 没有 `sqlite3` CLI 时用 `$PY -c "import sqlite3;print(sqlite3.connect('log_watcher.sqlite3').execute('pragma user_version').fetchone())"`。
 
@@ -359,7 +369,8 @@ sleep 35; grep -a "\[log_watcher\]" /root/AstrBot/data/logs/astrbot.log | tail -
 `【AstrBot 日志告警｜SEV】` + 命中条数/等级 + 时间 + 来源 + `组件 ｜ 指纹（第 N 次）`
 → 诊断段（首行三选一）→ `可能原因` / `是否建议修复` / `修复建议`（静态表）
 → 人工处置清单（静态代码常量：CRITICAL / HIGH 各 3 条，MEDIUM 1 条；IGNORE/LOW 无）
-→ `—— 原始日志 ——`（附件：文件名 + 体积 + 口径 + 保留天数；无附件：`完整日志见 <本机路径>`）。
+→ `—— 原始日志 ——`（附件：文件名 + 体积 + 口径 + 保留天数 + **本机留存路径**；
+  无附件：`完整日志见 <本机路径>`）。
 
 - 诊断首行：模型判定 = `—— 诊断（模型判定｜置信度 0.xx）——`；
   降级/本地 = `本地规则判定，未取得模型诊断（degraded:*）`；人工覆写 = `人工覆写（非模型判定）`。
@@ -378,12 +389,12 @@ sleep 35; grep -a "\[log_watcher\]" /root/AstrBot/data/logs/astrbot.log | tail -
 ### 6.3 投递与失败
 
 - 出口顺序 = `notify.target_sessions` 列表顺序；第 1 个是**主出口**。
-- **非主出口不发文件**（代码不变式 `allow_attachment = session == primary_outlet`）：
-  备用出口只发文本 + 本机路径；weixin_oc 代码级禁用附件（配置也打不开）。
+- **非主出口不发文件**（代码不变式 `deliver.attachment_allowed(session, outlets, caps)`：
+  只有 `outlets[0]` 且通道支持文件才为真）：备用出口只发文本 + 本机路径；weixin_oc 代码级禁用附件。
 - 超长：先压缩诊断（400 → 240 → 120 → 40 → 0 字）再硬截，**绝不切成多段**；
   `split_with_markers` 只用于「报告关闭/低等级」的旧内联路径。
 - 附件失败：`file_ok=False` / `partial=True`、`delivery_partial` 计数、日志一行 WARNING，
-  **不整条重试**（文本已送达）；重试队列带 `attachments`，整条重试时文件会再发一次。
+  **不整条重试**（文本已送达）；重试队列带 `attachments`，**重试会再发一次附件**（降级文案会写明）。
 - 写报告失败：WARNING + 回落文本（给本机路径），绝不静默；不会产生空附件。
 
 ---
@@ -460,7 +471,7 @@ ls -l $BK
 ```bash
 cd /root/workspace/projects/AstrBot-log_watcher
 PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider
-# 期望：299 passed / 0 failed
+# 期望：308 passed / 0 failed
 
 python3 - <<'PY'
 import json
@@ -472,8 +483,14 @@ grep -n 'SCHEMA_VERSION = ' store.py        # 4
 grep -n 'noise_shortcut' _conf_schema.json  # default: false
 python3 tools/migrate_config_v3.py --dry-run --config /tmp/logwatch-v22-fixture.json | head -30
 # 期望：列出 22 个 remediation 键 + 9 个补默认值键
-grep -rn 'remediat\|Remediation' --include='*.py' main.py engine.py deliver.py models.py | wc -l
-# 期望：只剩历史兼容（store 表名/Route 枚举/注释），能力面 0
+# 能力面（收紧正则）：必须 0
+grep -rnE 'remediate\(|remediation\.|RemediationGate' --include='*.py' \
+  main.py engine.py deliver.py models.py classify.py | wc -l          # 期望 0
+# 宽口径：允许且仅允许以下 2 行历史字面残留（逐行点名；多一行即失败）
+grep -rn 'remediat\|Remediation' --include='*.py' main.py engine.py deliver.py models.py classify.py
+#   期望：models.py 的 Route.REMEDIATE 枚举值（历史 alerts.route / route_map 解析）
+#         classify.py 的 1 行历史注释
+# 其它允许的字面：store.py 的 remediation_runs 表名（只读保留）、tools/prune_legacy_artifacts.py（离线 CLI）
 ```
 
 > 探针纪律（合成日志）：往被监听目录**先建空文件再追加**一行合成 `ERROR`（首次见到的文件会
@@ -485,14 +502,15 @@ grep -rn 'remediat\|Remediation' --include='*.py' main.py engine.py deliver.py m
 
 ### 10.1 aiocqhttp「非主出口不发文件」与群文件上传未实测
 
-代码里的不变式是 **`allow_attachment = (session == primary_outlet)`**（`main.py` 传给
-`deliver.build_send_plan`），**没有**「群出口」这个判断。含义：
+代码里的不变式是 **`deliver.attachment_allowed(session, outlets, caps)`**（`main.py` 调用；
+只有 `outlets[0]` 且 `caps.file` 为真才返回 True），**没有**「群出口」这个判断。含义：
 
 - 运营方把**私聊**设为第 1 个会话（主出口）时：主出口发「文本 + `.log`」，其余出口（含群）只发文本；
 - 若运营方把**群**设为第 1 个（主出口）且通道 `caps.file=True`（如 aiocqhttp/NapCat），
   代码**会尝试**发 `File` 段；而 NapCat/OneBot 的群文件通常需要 `upload_group_file`，
-  **本插件从未实测过群文件上传**。失败时：文件静默不发（或平台报错），
-  首段仍显示附件名（因为它按主出口渲染），本机路径**不会**出现在这种情况下。
+  **本插件从未实测过群文件上传**。失败时：文件静默不发（或平台报错）；
+  首段仍显示附件名，但 **v2.3.0 起也会写「本机留存：<path>」**，可按路径去本机取
+  （F5 的兜底；仍建议在实测通过前把私聊设为第 1 个会话）。
 - 缓解：在实测通过前，**把私聊设为第 1 个会话**；或把 `report.enabled=false` 强制只发文本；
   观察日志 `附件部分失败` / `delivery_partial` 计数。
 
@@ -500,7 +518,9 @@ grep -rn 'remediat\|Remediation' --include='*.py' main.py engine.py deliver.py m
 
 `file` 口径会把**整份日志**装进报告文件（含其他会话的 UMO 等标识），且文件超过
 `max_file_bytes` 时**只取末尾**并在正文写明丢弃字节数。默认 `excerpt`；只在排障时临时开，
-用完改回。出站文本与报告文件都**不做凭据掩码**（§10.4）。
+用完改回。**注意默认 `excerpt` 也会把命中段逐字保留 `keep_days` 天**（默认 7）：
+敏感部署可 `report.enabled=false`（回到「成功即删」的旧内联路径）或调小 `keep_days`。
+出站文本与报告文件都**不做凭据掩码**（§10.4）。
 
 ### 10.3 报告文件命名与同秒后缀
 
@@ -560,7 +580,7 @@ grep -rn 'remediat\|Remediation' --include='*.py' main.py engine.py deliver.py m
 | `tools/migrate_config_v2.py` | v2.1.0 扁平 → v2.2.0 分组（保留） |
 | `tools/migrate_config_v3.py` | v2.2.0 → v2.3.0（本版新增；删 22 / 补 9） |
 | `tools/prune_legacy_artifacts.py` | 历史修复轨迹离线清理（默认干跑） |
-| `tests/` | 299 passed；缓存语义按新契约改写、报告/迁移/降级守卫 |
+| `tests/` | 308 passed；缓存语义按新契约改写、报告/迁移/降级/门控守卫 |
 | `metadata.yaml` | 版本 2.3.0、能力描述（无自动修复） |
 
 ### 12.1 复验一句话
@@ -568,5 +588,5 @@ grep -rn 'remediat\|Remediation' --include='*.py' main.py engine.py deliver.py m
 ```bash
 cd /root/workspace/projects/AstrBot-log_watcher && \
 PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider
-# 299 passed
+# 308 passed
 ```

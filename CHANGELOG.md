@@ -6,7 +6,7 @@
 > ② 从代码与配置中**完整移除自动修复**（`dsh` headless 通道）；③ 告警改成「**1 条诊断首段 + 1 个原始
 > 日志文件**」。配置从 8 组 / 82 键变成 **8 组 / 69 键**，状态库 `SCHEMA_VERSION` 2 → **4**。
 > 分支 `feat/v2.3.0-no-cache-no-remediation`（`591469a →` 本版），未合并 `main`、未部署生产。
-> 门禁 **299 passed / 0 failed**（v2.2.0 基线 340；减少的用例逐条可对账，见文末「测试」）。
+> 门禁 **308 passed / 0 failed**（v2.2.0 基线 340；变化逐段可对账，见文末「测试」）。
 
 ### ① 判定：指纹缓存强制失效（每条错误必过模型）
 
@@ -63,9 +63,12 @@
   `split_with_markers` 只留给「报告关闭/低等级」的旧内联路径。
 - 新增 `report` 组 7 键（`enabled` / `min_severity` / `raw_mode` / `max_file_bytes` / `keep_days` /
   `max_files` / `head_max_chars`）；`notify.max_chars_per_message` 仍可覆盖单条上限。
+- **报告形态恒为单条文本**：`notify.send_mode=forward` / `prefer_forward=true` 只影响「旧内联路径」
+  （报告关闭、低等级或无报告文件时），并会打一条 degradation 提示（不再静默失效）。
+  「原始日志」段在**附件形态**下也写本机留存路径（群做主出口 / File 段静默失败时能去本机找）。
 - 失败不吞：写报告失败 → WARNING + 回落文本（给本机路径）；附件失败 → `file_ok=False`、
   `partial=True`、`delivery_partial` 计数 + WARNING，**不整条重试**；待发队列带 `attachments`，
-  重试时能把文件再发一次。
+  **重试会再发一次附件**。
 
 ### 配置与状态库
 
@@ -80,7 +83,7 @@
 - **`SCHEMA_VERSION` 2 → 4**：
   - v2 → v3（判定链）：`pattern_kb.last_judged_at` / `judge_source`，`alerts.judged` /
     `judge_source`（历史行不回填：`-1` / `''` = 未知）；
-  - v3 → v4（报告）：`pending_delivery.attachments`（JSON，重试能把文件再发一次）、
+  - v3 → v4（报告）：`pending_delivery.attachments`（JSON，**重试会再发一次附件**）、
     `alerts.report_path`（留存件；`excerpt_path` 仍是临时摘录）。
   旧库 `open()` 时自动补列（吞 duplicate column）；**回滚必须连库一起回滚**：v2.2.0 代码看到
   `user_version=4` 会进只读保护（拒绝写入），见 `runbook.md` §8.4。
@@ -110,8 +113,8 @@
 
 ### 测试
 
-- 门禁 **299 passed / 0 failed**。数量变化逐段可对账：v2.2.0 **340** →（移除自动修复）**253**
-  →（判定链）**277** →（报告形态）**299**。随能力删除的用例逐条点名在 T5 的
+- 门禁 **308 passed / 0 failed**。数量变化逐段可对账：v2.2.0 **340** →（移除自动修复）**253**
+  →（判定链）**277** →（报告形态）**299** →（交付评审修复轮）**308**。随能力删除的用例逐条点名在 T5 的
   `VERIFY-v2.3.0.md`；缓存的旧语义用例是**改写**而不是删除（见 `tests/test_engine.py` 的
   `test_kb_prior_still_calls_llm` 等）。
 - 关键回归：同一指纹两次分类 → 模型调用 2 次（旧 reason/severity 不复用）；`noise_shortcut`

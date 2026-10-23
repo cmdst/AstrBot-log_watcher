@@ -35,10 +35,10 @@
 | 诊断 | 首行回答「这话是谁说的」：`—— 诊断（模型判定｜置信度 0.xx）——` / `本地规则判定，未取得模型诊断（degraded:*）` / `人工覆写（非模型判定）` |
 | 原因/建议 | `可能原因` / `是否建议修复` / `修复建议`（来自代码里的静态表，不允许模型生成） |
 | 处置清单 | 静态代码常量：CRITICAL / HIGH 各 3 条、MEDIUM 1 条（IGNORE/LOW 无），只读、可验证 |
-| 原始日志 | 附件名 + 体积 + 口径 + 保留天数；非文件出口写完整本机路径 |
+| 原始日志 | 附件名 + 体积 + 口径 + 保留天数 + **本机留存路径**；非文件出口只写本机路径 |
 
-- **非主出口不发文件**（代码不变式 `allow_attachment = session == primary_outlet`）；其余出口只发
-  文本 + 本机路径。weixin_oc 代码级禁用附件（配置也打不开）。
+- **非主出口不发文件**（代码不变式 `deliver.attachment_allowed(session, outlets, caps)`：只有
+  `outlets[0]` 且通道支持文件时才为真）；其余出口只发文本 + 本机路径。weixin_oc 代码级禁用附件。
 - 超长时**压缩诊断再截断**（`…（首段已截断，完整内容见报告文件）`），**绝不切段**。
 - 写报告失败 → WARNING + 回落文本（给本机路径），不会静默；附件失败 → `partial=True` +
   `delivery_partial` 计数，不整条重试。
@@ -79,7 +79,7 @@ stale 键清掉；工具：`tools/migrate_config_v3.py`）。
 | 配置项 | 默认 | 推荐 | 说明 |
 |---|---|---|---|
 | `notify.target_sessions` | `[]` | 填 1 个主出口（QQ 私聊）+ 1 个备用 | 告警发到这里；**列表即优先级**，第 1 个是主出口；留空 = 只扫描 |
-| `notify.send_mode` | `auto` | 不动 | 按通道能力选段型（主出口可带文件） |
+| `notify.send_mode` | `auto` | 不动 | 按通道能力选段型（主出口可带文件）；报告形态恒为单条文本，`forward` 只影响旧内联路径 |
 | `notify.min_severity` | `MEDIUM` | 不动 | 低于它的判定只进摘要或静默 |
 | `scan.levels` | `["ERROR","CRITICAL"]` | 不动 | 加 `WARNING` 会引入每天上千条噪声 |
 | `classify.provider_id` | `""` | 有 provider 就填 | 留空 = 每条都显式降级（`degraded:llm-unconfigured`） |
@@ -99,6 +99,8 @@ stale 键清掉；工具：`tools/migrate_config_v3.py`）。
   `state.outbox_max_bytes` + `state.keep_excerpt_files` + `state.outbox_max_age_hours` 三条上限取更严者约束。
 - **报告文件**：`outbox/reports/`（`report.*` 三条：`keep_days` / `max_files` / `max_file_bytes`），
   与 `outbox/` 的临时摘录**生命周期隔离**（报告是留存件，供人事后对账）。
+  **默认 `excerpt` 也会把命中段逐字保留 `keep_days` 天（默认 7）**：敏感部署可
+  `report.enabled=false`（回到成功即删的内联路径）或调小 `keep_days`。
 - 失败残留：`failed/`（发送失败的摘录文本，供人工取证）。
 - 历史修复轨迹：`remediation/`（若有）**冻结只读**，v2.3.0 不再写入、不再自动清理；
   需要腾空间时跑 `python3 tools/prune_legacy_artifacts.py`（默认干跑，`--apply` 才删）。
@@ -140,7 +142,7 @@ stale 键清掉；工具：`tools/migrate_config_v3.py`）。
 
 ```bash
 cd /root/workspace/projects/AstrBot-log_watcher
-PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider   # 299 passed
+PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider   # 308 passed
 ```
 
 测试全部离线：不联网、不 spawn 子进程、不写插件目录。分层：
