@@ -147,6 +147,8 @@ class LogWatcherPlugin(Star):
         self._pending_stats: dict = {}
         #: 出口策略不合格时的停摆原因（空串＝正常）；见 _check_outlet_policy（Q8=b / Q15=b）
         self._config_blocked = ""
+        #: report.raw_mode 非法只提示一次（_report_config 每轮会被调很多次）
+        self._report_mode_warned = False
         self._missing_notice_at = 0.0
         self._disk_report_at = 0.0
         self._checkpoint_at = 0.0
@@ -762,10 +764,12 @@ class LogWatcherPlugin(Star):
         """`report.*` 七键的内部形状（R4 白名单：插件键 → 模块可用的值）。"""
         mode = str(self.cfg.get("report.raw_mode") or "excerpt").strip().lower()
         if mode not in {"excerpt", "file"}:
-            logger.warning(
-                f"{self._plat()}report.raw_mode={mode!r} 非法（只认 excerpt/file），"
-                "已回落 excerpt"
-            )
+            if not getattr(self, "_report_mode_warned", False):
+                self._report_mode_warned = True
+                logger.warning(
+                    f"{self._plat()}report.raw_mode={mode!r} 非法（只认 excerpt/file），"
+                    "已回落 excerpt（本进程只提示一次）"
+                )
             mode = "excerpt"
         return {
             "enabled": bool(self.cfg.get("report.enabled", True)),
