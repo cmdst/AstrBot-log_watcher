@@ -518,8 +518,9 @@ grep -rn 'remediat\|Remediation' --include='*.py' main.py engine.py deliver.py m
 
 `file` 口径会把**整份日志**装进报告文件（含其他会话的 UMO 等标识），且文件超过
 `max_file_bytes` 时**只取末尾**并在正文写明丢弃字节数。默认 `excerpt`；只在排障时临时开，
-用完改回。**注意默认 `excerpt` 也会把命中段逐字保留 `keep_days` 天**（默认 7）：
-敏感部署可 `report.enabled=false`（回到「成功即删」的旧内联路径）或调小 `keep_days`。
+用完改回。**注意默认 `excerpt` 也会把命中段逐字保留 `keep_days` 天**（默认 7，
+含日志里出现的会话串）：敏感部署可 `report.enabled=false`（回到「成功即删」的旧内联路径）
+或调小 `keep_days`。
 出站文本与报告文件都**不做凭据掩码**（§10.4）。
 
 ### 10.3 报告文件命名与同秒后缀

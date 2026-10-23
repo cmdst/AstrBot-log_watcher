@@ -614,7 +614,7 @@ def build_send_plan(
     has_report = bool(report is not None and str(getattr(report, "path", "") or ""))
 
     if has_report:
-        if str(settings.send_mode or "").strip().lower() == "forward" or bool(
+        if "forward" in str(settings.send_mode or "").strip().lower() or bool(
             settings.prefer_forward
         ):
             notes.append("报告形态恒为单条文本：send_mode/prefer_forward 只影响旧内联路径")
@@ -717,7 +717,10 @@ def degrade(plan: SendPlan) -> SendPlan:
     notes = list(plan.degradation)
     if plan.attachments:
         name = plan.attachments[0].name or plan.attachments[0].path
-        notes.append(f"降级发送：仅保留摘要；报告文件已保留（{name}），可在本机查看")
+        notes.append(
+            f"降级发送：仅保留摘要；报告文件已保留（{name}），可在本机查看；"
+            "重试会再发一次附件"
+        )
     else:
         notes.append("降级发送：仅保留摘要，完整日志见 AstrBot 日志目录")
     if not plan.chunks:

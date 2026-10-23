@@ -99,8 +99,8 @@ stale 键清掉；工具：`tools/migrate_config_v3.py`）。
   `state.outbox_max_bytes` + `state.keep_excerpt_files` + `state.outbox_max_age_hours` 三条上限取更严者约束。
 - **报告文件**：`outbox/reports/`（`report.*` 三条：`keep_days` / `max_files` / `max_file_bytes`），
   与 `outbox/` 的临时摘录**生命周期隔离**（报告是留存件，供人事后对账）。
-  **默认 `excerpt` 也会把命中段逐字保留 `keep_days` 天（默认 7）**：敏感部署可
-  `report.enabled=false`（回到成功即删的内联路径）或调小 `keep_days`。
+  **默认 `excerpt` 也会把命中段逐字保留 `keep_days` 天（默认 7，含日志里出现的会话串）**：
+  敏感部署可 `report.enabled=false`（回到成功即删的内联路径）或调小 `keep_days`。
 - 失败残留：`failed/`（发送失败的摘录文本，供人工取证）。
 - 历史修复轨迹：`remediation/`（若有）**冻结只读**，v2.3.0 不再写入、不再自动清理；
   需要腾空间时跑 `python3 tools/prune_legacy_artifacts.py`（默认干跑，`--apply` 才删）。

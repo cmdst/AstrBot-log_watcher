@@ -513,6 +513,7 @@ def test_degrade_drops_attachments_but_keeps_report_hint():
     degraded = deliver.degrade(plan)
     assert degraded.attachments == [], "降级文本自身不带附件（重试由待发队列决定）"
     assert any("报告文件已保留" in note for note in degraded.degradation)
+    assert any("重试会再发一次附件" in note for note in degraded.degradation)
 
 
 def test_report_disabled_falls_back_to_inline_excerpt():
